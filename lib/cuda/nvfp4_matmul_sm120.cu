@@ -62,6 +62,10 @@ __global__ void nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A,
 #pragma unroll
     for (int idx = 0; idx < a_tile.REGISTERS_PER_THREAD; ++idx) {
       int row = a_tile.get_row_with_reg(tid, idx);
+      if (block_row + row >= M) {
+        continue;
+      }
+
       int col = a_tile.get_col_with_reg(tid, idx);
       const NVFP4x2 *A_tile =
           A + ((block_row + row) * K + col + k) / ELES_PER_NVFP4x2;
@@ -148,6 +152,9 @@ __global__ void nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A,
 #pragma unroll
   for (int idx = 0; idx < c_tile.REGISTERS_PER_THREAD; ++idx) {
     int row = c_tile.get_row_with_reg(tid, idx);
+    if (block_row + row >= M) {
+      continue;
+    }
     int col = c_tile.get_col_with_reg(tid, idx);
     D[(block_row + row) * N + block_col + col] =
         __float2bfloat16_rn(c_tile.data[idx]);
@@ -192,7 +199,6 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
 
   /// Check scale_a operand
   TORCH_CHECK(A_sf.dim() == 2, "scale_a must be a matrix");
-  TORCH_CHECK(A_sf.sizes()[0] == M, "scale_a shape[0] must be ", M);
   TORCH_CHECK(A_sf.sizes()[1] == K / 16, "scale_a shape[1] must be ", K / 16);
   TORCH_CHECK(A_sf.stride(0) == K / 16, "scale_a stride[0] must be ", K / 16);
   TORCH_CHECK(A_sf.stride(1) == 1, "scale_a stride[1] must be 1");
@@ -205,6 +211,13 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   TORCH_CHECK(B_sf.stride(1) == 1, "scale_b stride[1] must be 1");
 
   /// Check alighment
+  int64_t M_ALIGN = 128;
+  int64_t N_ALIGN = 128;
+  int64_t K_ALIGN = 64;
+  auto M_PAD = (M + M_ALIGN - 1) / M_ALIGN * M_ALIGN;
+  TORCH_CHECK(A_sf.sizes()[0] == M_PAD, "scale_a shape[0] must be ", M_PAD);
+  TORCH_CHECK(N % N_ALIGN == 0, "N must be aligned with ", N_ALIGN);
+  TORCH_CHECK(K % K_ALIGN == 0, "K must be aligned with ", K_ALIGN);
 
   /// Check bias
   if (bias.has_value()) {
@@ -224,7 +237,8 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
-  nvfp4_matmul_sm120_kernel<<<dim3(N / 8, M / 16), dim3(32), 0, stream>>>(
+  nvfp4_matmul_sm120_kernel<<<dim3(N / 8, (M + 16 - 1) / 16), dim3(32), 0,
+                              stream>>>(
       reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),

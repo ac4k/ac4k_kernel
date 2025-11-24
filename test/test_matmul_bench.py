@@ -164,3 +164,5 @@ def test_nvfp4_gemm(
 if __name__ == "__main__":
     torch.manual_seed(345)
     test_nvfp4_gemm(torch.bfloat16, (128, 512, 128))
+    test_nvfp4_gemm(torch.bfloat16, (10, 512, 128))
+    test_nvfp4_gemm(torch.bfloat16, (20, 128, 32))
