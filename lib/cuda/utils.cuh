@@ -184,4 +184,23 @@ fma(float &d0, float &d1, float &d2, float &d3, uint32_t const &a0,
                  "r"(sfb0), "h"(bidB), "h"(tidB));
 }
 
+//===----------------------------------------------------------------------===//
+// Math
+//===----------------------------------------------------------------------===//
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType ceil_div(intType x, intType2 y) {
+  return (x + y - 1) / y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_up(intType x, intType2 y) {
+  return ceil_div(x, y) * y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_down(intType x, intType2 y) {
+  return (x / y) * y;
+}
+
 } // namespace ac4k

@@ -51,12 +51,12 @@ setup(name='ac4k_kernel',
                   'cxx': ['-O3', '-std=c++17', '-fPIC'],
                   'nvcc': [
                       '-O3', '-std=c++17', '-arch=sm_120a', '--use_fast_math',
-                      '--compiler-options', '-lcuda', '-lcudart'
+                      '--compiler-options'
                   ]
               },
               extra_link_args=[
-                  "-lc10", "-lc10_cuda", "-ltorch", "-ltorch_cpu",
-                  "-ltorch_cuda", f"-L{torch_lib_dir}",
+                  "-lc10", "-lc10_cuda", "-ltorch", "-ltorch_cpu", "-lcuda",
+                  "-lcudart", "-ltorch_cuda", f"-L{torch_lib_dir}",
                   f"-Wl,-rpath={torch_lib_dir}"
               ],
           )
