@@ -365,16 +365,17 @@ __global__ void nvfp4_matmul_sm120_kernel(
              idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
              ++idx) {
           int thread_m =
-              atomic_m_cnt * TILE_ATOMIC_M +
+              atomic_m +
               c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, idx);
           int m = block_m + warp_m + thread_m;
-          if (m >= M) {
-            continue;
-          }
           int thread_n =
-              atomic_n_cnt * TILE_ATOMIC_N +
+              atomic_n +
               c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, idx);
           int n = block_n + warp_n + thread_n;
+          if (m >= M || n >= N) {
+            continue;
+          }
+
           D[m * N + n] =
               __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
         } // end loop idx
@@ -427,18 +428,18 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
 
   /// Check scale_b operand
   TORCH_CHECK(B_sf.dim() == 2, "scale_b must be a matrix");
-  TORCH_CHECK(B_sf.sizes()[0] == N, "scale_b shape[0] must be ", N);
   TORCH_CHECK(B_sf.sizes()[1] == K / 16, "scale_b shape[1] must be ", K / 16);
   TORCH_CHECK(B_sf.stride(0) == K / 16, "scale_b stride[0] must be ", K / 16);
   TORCH_CHECK(B_sf.stride(1) == 1, "scale_b stride[1] must be 1");
 
   /// Check alighment
   int64_t M_ALIGN = 128;
-  int64_t N_ALIGN = TILE_BLOCK_N;
+  int64_t N_ALIGN = 128;
   int64_t K_ALIGN = TILE_BLOCK_K;
-  auto M_PAD = (M + M_ALIGN - 1) / M_ALIGN * M_ALIGN;
+  auto M_PAD = align_up(M, M_ALIGN);
+  auto N_PAD = align_up(N, N_ALIGN);
   TORCH_CHECK(A_sf.sizes()[0] == M_PAD, "scale_a shape[0] must be ", M_PAD);
-  TORCH_CHECK(N % N_ALIGN == 0, "N must be aligned with ", N_ALIGN);
+  TORCH_CHECK(B_sf.sizes()[0] == N_PAD, "scale_b shape[0] must be ", N_PAD);
   TORCH_CHECK(K % K_ALIGN == 0, "K must be aligned with ", K_ALIGN);
 
   /// Check bias

@@ -168,4 +168,6 @@ if __name__ == "__main__":
     test_nvfp4_gemm(torch.bfloat16, (1024, 1024, 384))
     test_nvfp4_gemm(torch.bfloat16, (130, 384, 256))
     test_nvfp4_gemm(torch.bfloat16, (666, 768, 512))
+    test_nvfp4_gemm(torch.bfloat16, (123, 321, 256))
+    test_nvfp4_gemm(torch.bfloat16, (10, 15, 512))
     # test_nvfp4_gemm(torch.bfloat16, (8192, 8192, 8192))
