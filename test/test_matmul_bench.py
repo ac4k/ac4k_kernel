@@ -15,6 +15,14 @@ kE2M1ToFloatArray = [
     3.0,
     4.0,
     6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 ]
 
 
@@ -46,8 +54,11 @@ def break_fp4_bytes(a, dtype):
     highHalfByte = (a & 0xF0) >> 4
     # Get lower 4 bits
     lowHalfByte = a & 0x0F
-    fH = torch.tensor([e2m1_to_fp32(x) for x in highHalfByte]).to(a.device)
-    fL = torch.tensor([e2m1_to_fp32(x) for x in lowHalfByte]).to(a.device)
+    map_tensor = torch.tensor(kE2M1ToFloatArray,
+                              dtype=torch.float32,
+                              device=a.device)
+    fH = map_tensor[highHalfByte.long()].to(a.device)
+    fL = map_tensor[lowHalfByte.long()].to(a.device)
     # [0xAB, 0xCD] -> [0xB, 0xA, 0xD, 0xC]
     out = torch.stack((fL, fH), dim=-1).reshape(m, n * 2)
     return out
@@ -170,4 +181,4 @@ if __name__ == "__main__":
     test_nvfp4_gemm(torch.bfloat16, (666, 768, 512))
     test_nvfp4_gemm(torch.bfloat16, (123, 321, 256))
     test_nvfp4_gemm(torch.bfloat16, (10, 15, 512))
-    # test_nvfp4_gemm(torch.bfloat16, (8192, 8192, 8192))
+    test_nvfp4_gemm(torch.bfloat16, (8192, 8192, 8192))
