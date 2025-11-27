@@ -14,10 +14,12 @@ def _load_cuda_nvfp4_matmul():
         ) from e
 
 
-def nvfp4_matmul(a, b, scales_a, scales_b, alpha, bias=None):
+def nvfp4_matmul(a, b, scales_a, scales_b, alpha, bias=None, out=None):
     _nvfp4_matmul_sm120 = _load_cuda_nvfp4_matmul()
 
-    m, n = a.shape[0], b.shape[0]
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    if out is None:
+        m, n = a.shape[0], b.shape[0]
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
     _nvfp4_matmul_sm120(out, a, b, scales_a, scales_b, alpha, bias)
+
     return out
