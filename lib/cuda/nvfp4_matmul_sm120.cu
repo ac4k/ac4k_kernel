@@ -92,7 +92,7 @@ __forceinline__ CUtensorMap create_tensor_map(const NVFP4x2 *gmem_ptr,
 // C shape:MxN stride:Nx1 matrix, row major
 //===----------------------------------------------------------------------===//
 
-__global__ void nvfp4_matmul_sm120_kernel(
+__global__ static void nvfp4_matmul_sm120_kernel(
     __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
     const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
     int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
@@ -196,6 +196,7 @@ __global__ void nvfp4_matmul_sm120_kernel(
             /// Layout
             /// [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)] x u8
             /// dim0,       dim1,      dim2,       dim3,      dim4
+            /// TODO(jian.wu): need handle K padding
             /// SF A
             uint32_t sfa0 = 0;
             if (lane_id % 4 < 2) {
@@ -298,8 +299,10 @@ __global__ void nvfp4_matmul_sm120_kernel(
               atomic_n_cnt * TILE_ATOMIC_N +
               c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, idx);
           int n = block_n + warp_n + thread_n;
-          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
-              __bfloat162float(bias[n]);
+          if (n < N) {
+            c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
+                __bfloat162float(bias[n]);
+          }
         } // end loop idx
       } // end loop atomic_n_cnt
     } // end loop atomic_m_cnt
