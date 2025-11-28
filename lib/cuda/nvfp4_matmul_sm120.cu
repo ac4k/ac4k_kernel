@@ -77,7 +77,8 @@ const int PRODUCER_THREAD_NUM = 32;
 // Create tma tensor map
 //===----------------------------------------------------------------------===//
 
-template <int BlockMajorSize, int BlockMinorSize>
+template <int BlockMajorSize, int BlockMinorSize,
+          CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
 __host__ static __forceinline__ CUtensorMap create_tensor_map(
     const NVFP4x2 *gmem_ptr, int global_major_size, int global_minor_size) {
   CUtensorMap template_tensor_map{};
@@ -95,11 +96,61 @@ __host__ static __forceinline__ CUtensorMap create_tensor_map(
   cuTensorMapEncodeTiled(
       &template_tensor_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, gmem_address,
       gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape, smem_box_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   return template_tensor_map;
 }
+
+//===----------------------------------------------------------------------===//
+// Swizzle
+//===----------------------------------------------------------------------===//
+
+template <CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+struct SwizzleIndexMap {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    return col;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_128B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    int int4_row = row;
+    int int4_col = col * bpe / sizeof(int4);
+    return ((int4_row % 8) ^ int4_col) * sizeof(int4) / bpe;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_64B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    // int index = (row * 64 + col * bpe) / sizeof(int4);
+    // // int new_row = index / (128 / sizeof(int4));
+    // int new_row = row * 64 / 128;
+    // int new_col = index % (128 / sizeof(int4));
+    // int row_swiz = new_row;
+    // int col_swiz = (row_swiz % 4) ^ new_col;
+    // int index_swiz = (row_swiz * 128 + col_swiz * sizeof(int4)) / bpe;
+    // return index_swiz % (64 / bpe);
+
+    int new_row = row * 64 / 128;
+    int new_col = col * bpe / sizeof(int4);
+    int row_swiz = new_row;
+    int col_swiz = (row_swiz % 4) ^ new_col;
+    return col_swiz * sizeof(int4) / bpe;
+  }
+};
 
 //===----------------------------------------------------------------------===//
 // Mbarrier
@@ -174,6 +225,7 @@ __device__ static __forceinline__ void load_async(void *dst,
 // C shape:MxN stride:Nx1 matrix, row major
 //===----------------------------------------------------------------------===//
 
+template <CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     static void nvfp4_matmul_sm120_kernel(
         __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
@@ -326,11 +378,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
             /// Load shared to fragment for A operand
             int *a_regs = (int *)a_frag.data;
+            int a_shared_row = warp_m + atomic_m + (lane_id % 16);
+            int a_shared_col =
+                (warp_k + atomic_k + (lane_id / 16) * 32) / ELES_PER_NVFP4x2;
+            int a_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                a_shared_row, a_shared_col, sizeof(NVFP4x2));
+            int a_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                a_shared_row, a_shared_col, sizeof(NVFP4x2));
             uint32_t a_addr = __cvta_generic_to_shared(
                 a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 +
-                (warp_m + atomic_m + (lane_id % 16)) * TILE_BLOCK_K /
-                    ELES_PER_NVFP4x2 +
-                (warp_k + atomic_k + (lane_id / 16) * 32) / ELES_PER_NVFP4x2);
+                a_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                a_shared_col_swiz);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(a_regs[0]), "=r"(a_regs[1]), "=r"(a_regs[2]),
@@ -361,12 +419,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
               /// Load shared to fragment for B operand
               int *b_regs = (int *)b_frag.data;
+              int b_shared_row = warp_n + atomic_n + (lane_id % 8);
+              int b_shared_col =
+                  (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
+                  ELES_PER_NVFP4x2;
+              int b_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
+              int b_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
               uint32_t b_addr = __cvta_generic_to_shared(
                   b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2 +
-                  (warp_n + atomic_n + (lane_id % 8)) * TILE_BLOCK_K /
-                      ELES_PER_NVFP4x2 +
-                  (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
-                      ELES_PER_NVFP4x2);
+                  b_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                  b_shared_col_swiz);
               asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
                            "{%0, %1}, [%2];"
                            : "=r"(b_regs[0]), "=r"(b_regs[1])
@@ -600,10 +664,11 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
 
   /// Set dynamic shared memory size
+  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
+  auto *kernel = nvfp4_matmul_sm120_kernel<SWIZZLE>;
   size_t smem_size = TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE;
   CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-      nvfp4_matmul_sm120_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      smem_size));
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   /// Get stream
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
@@ -611,16 +676,16 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
 
   /// TMA descriptor
   CUtensorMap a_tensor_map =
-      create_tensor_map<TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2>(
+      create_tensor_map<TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2, SWIZZLE>(
           reinterpret_cast<const NVFP4x2 *>(A.data_ptr()), M,
           K / ELES_PER_NVFP4x2);
   CUtensorMap b_tensor_map =
-      create_tensor_map<TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2>(
+      create_tensor_map<TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2, SWIZZLE>(
           reinterpret_cast<const NVFP4x2 *>(B.data_ptr()), N,
           K / ELES_PER_NVFP4x2);
 
   /// Launch kernel
-  nvfp4_matmul_sm120_kernel<<<grid, block, smem_size, stream>>>(
+  kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
