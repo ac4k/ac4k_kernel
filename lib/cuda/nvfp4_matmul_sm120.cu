@@ -39,6 +39,9 @@ const int TILE_BLOCK_M = 128;
 const int TILE_BLOCK_N = 128;
 const int TILE_BLOCK_K = 128;
 const int TILE_BLOCK_PACK_K = TILE_BLOCK_K / ELES_PER_NVFP4x2;
+const int TILE_BLOCK_A_ELES = TILE_BLOCK_M * TILE_BLOCK_K;
+const int TILE_BLOCK_B_ELES = TILE_BLOCK_N * TILE_BLOCK_K;
+const int TILE_IN_ELES = TILE_BLOCK_A_ELES + TILE_BLOCK_B_ELES;
 
 /// Warp level tile size
 const int TILE_WARP_M = 64;
@@ -53,14 +56,30 @@ const int TILE_ATOMIC_N = 8;
 const int TILE_ATOMIC_K = 64;
 const int TILE_ATOMIC_PACK_K = TILE_ATOMIC_K / ELES_PER_NVFP4x2;
 
+const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
+const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
+const int WARP_NUM = WARP_M_NUM * WARP_N_NUM;
+
+//===----------------------------------------------------------------------===//
+// Define mutiple buffer stage
+//===----------------------------------------------------------------------===//
+
+const int STAGE = 2;
+
+//===----------------------------------------------------------------------===//
+// Consumer & Producer
+//===----------------------------------------------------------------------===//
+
+const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
+const int PRODUCER_THREAD_NUM = 32;
+
 //===----------------------------------------------------------------------===//
 // Create tma tensor map
 //===----------------------------------------------------------------------===//
 
 template <int BlockMajorSize, int BlockMinorSize>
-__forceinline__ CUtensorMap create_tensor_map(const NVFP4x2 *gmem_ptr,
-                                              int global_major_size,
-                                              int global_minor_size) {
+__host__ static __forceinline__ CUtensorMap create_tensor_map(
+    const NVFP4x2 *gmem_ptr, int global_major_size, int global_minor_size) {
   CUtensorMap template_tensor_map{};
 
   void *gmem_address = (void *)gmem_ptr;
@@ -83,6 +102,69 @@ __forceinline__ CUtensorMap create_tensor_map(const NVFP4x2 *gmem_ptr,
 }
 
 //===----------------------------------------------------------------------===//
+// Mbarrier
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ void init_barrier(uint64_t *bar, int count) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
+               "r"(count));
+}
+
+__device__ static __forceinline__ void expect_bytes(uint64_t *bar,
+                                                    uint32_t bytes) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n" ::
+          "r"(bar_ptr),
+      "r"(bytes));
+}
+
+__device__ static __forceinline__ void wait(uint64_t *bar, int phase) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n"
+      ".reg .pred                P1;\n"
+      "LAB_WAIT:\n"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+      "@P1                       bra.uni DONE;\n"
+      "bra.uni                   LAB_WAIT;\n"
+      "DONE:\n"
+      "}\n" ::"r"(mbar_ptr),
+      "r"(phase));
+}
+
+__device__ static __forceinline__ void arrive(uint64_t *bar,
+                                              uint32_t count = 1) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+               :
+               : "r"(mbar_ptr), "r"(count)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
+// TMA with mbarrier
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ void load_async(void *dst,
+                                                  void const *const tma_map,
+                                                  uint64_t *bar, int global_row,
+                                                  int global_col) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+  asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::"
+               "complete_tx::bytes"
+               " [%0], [%1, {%3, %4}], [%2];"
+               :
+               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(global_col),
+                 "r"(global_row)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
 // Matrix matmul kernel
 // D bf16 dtype
 // A/B nvfp4 dtype
@@ -92,14 +174,32 @@ __forceinline__ CUtensorMap create_tensor_map(const NVFP4x2 *gmem_ptr,
 // C shape:MxN stride:Nx1 matrix, row major
 //===----------------------------------------------------------------------===//
 
-__global__ static void nvfp4_matmul_sm120_kernel(
-    __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
-    const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
-    int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
-    const __grid_constant__ CUtensorMap b_tensor_map) {
-  //===----------------------------------------------------------------------===//
+__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+    static void nvfp4_matmul_sm120_kernel(
+        __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
+        const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
+        int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
+        const __grid_constant__ CUtensorMap b_tensor_map) {
+  //===--------------------------------------------------------------------===//
+  // Distribute for block, warp
+  //===--------------------------------------------------------------------===//
+
+  int tid = threadIdx.x;
+  bool is_consumer = tid < CONSUMER_THREAD_NUM;
+  bool is_producer = tid >= CONSUMER_THREAD_NUM;
+
+  int block_m = blockIdx.y * TILE_BLOCK_M;
+  int block_n = blockIdx.x * TILE_BLOCK_N;
+  int warp_id = tid / 32;
+  int warp_id_m = warp_id / WARP_N_NUM;
+  int warp_id_n = warp_id % WARP_N_NUM;
+  int warp_m = warp_id_m * TILE_WARP_M;
+  int warp_n = warp_id_n * TILE_WARP_N;
+  int lane_id = tid % 32;
+
+  //===--------------------------------------------------------------------===//
   // Define fragment for a, b and c operand
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
 
   /// Each thread has a copy of this tile
   AFrag_NVFP4_16x64 a_frag;
@@ -119,78 +219,91 @@ __global__ static void nvfp4_matmul_sm120_kernel(
     }
   }
 
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   // Define shared memory for a and b operand
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
 
-  __shared__ alignas(512) NVFP4x2 a_shared[TILE_BLOCK_M][TILE_BLOCK_PACK_K];
-  __shared__ alignas(512) NVFP4x2 b_shared[TILE_BLOCK_N][TILE_BLOCK_PACK_K];
+  extern __shared__ __align__(1024) NVFP4x2 smem[];
+  NVFP4x2 *a_shared = smem;
+  NVFP4x2 *b_shared =
+      a_shared + STAGE * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
 
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   // Define brrier for a and b tma
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
 
-  __shared__ barrier a_bar;
-  __shared__ barrier b_bar;
-  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-    init(&a_bar, blockDim.x * blockDim.y * blockDim.z);
-    init(&b_bar, blockDim.x * blockDim.y * blockDim.z);
-    cde::fence_proxy_async_shared_cta();
+  __shared__ __align__(8) uint64_t empty_bar[STAGE];
+  __shared__ __align__(8) uint64_t full_bar[STAGE];
+  if (is_producer) {
+#pragma unroll
+    for (int i = 0; i < STAGE; ++i) {
+      init_barrier(&empty_bar[i], WARP_NUM);
+      init_barrier(&full_bar[i], 1);
+    }
   }
-  __syncthreads();
+  asm volatile("barrier.cluster.arrive;\n" : :);
+  asm volatile("barrier.cluster.wait;\n" : :);
 
-  //===----------------------------------------------------------------------===//
-  // Define brrier token for a and b tma
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Producer
+  //===--------------------------------------------------------------------===//
 
-  barrier::arrival_token a_token, b_token;
+  if (is_producer && tid == CONSUMER_THREAD_NUM) {
+    for (int block_k = 0, stage = 0, phase = 0; block_k < K;
+         block_k += TILE_BLOCK_K, ++stage) {
+      int block_k_pack = block_k / ELES_PER_NVFP4x2;
 
-  //===----------------------------------------------------------------------===//
-  // Loop
-  //===----------------------------------------------------------------------===//
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
 
-  int block_m = blockIdx.y * TILE_BLOCK_M;
-  int block_n = blockIdx.x * TILE_BLOCK_N;
-  int warp_id_m = threadIdx.z;
-  int warp_id_n = threadIdx.y;
-  int warp_m = warp_id_m * TILE_WARP_M;
-  int warp_n = warp_id_n * TILE_WARP_N;
-  int lane_id = threadIdx.x;
+      wait(&empty_bar[stage], phase);
 
-  for (int block_k = 0; block_k < K; block_k += TILE_BLOCK_K) {
-    int block_padk_k = block_k / ELES_PER_NVFP4x2;
+      load_async(a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2,
+                 &a_tensor_map, &full_bar[stage], block_m, block_k_pack);
+      load_async(b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2,
+                 &b_tensor_map, &full_bar[stage], block_n, block_k_pack);
 
-    /// Load a/b from global to shared memory
-    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      cde::cp_async_bulk_tensor_2d_global_to_shared(
-          a_shared, &a_tensor_map, block_padk_k, block_m, a_bar);
-      a_token = cuda::device::barrier_arrive_tx(a_bar, 1, sizeof(a_shared));
-      cde::cp_async_bulk_tensor_2d_global_to_shared(
-          b_shared, &b_tensor_map, block_padk_k, block_n, b_bar);
-      b_token = cuda::device::barrier_arrive_tx(b_bar, 1, sizeof(b_shared));
-    } else {
-      a_token = a_bar.arrive();
-      b_token = b_bar.arrive();
+      expect_bytes(&full_bar[stage],
+                   TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2));
+    } // end loop block_k
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Consumer
+  //===--------------------------------------------------------------------===//
+
+  if (is_consumer) {
+    if (lane_id == 0) {
+#pragma unroll
+      for (int i = 0; i < STAGE; ++i) {
+        arrive(&empty_bar[i], 1);
+      }
     }
 
-    /// Wait for load to complete
-    a_bar.wait(std::move(a_token));
-    b_bar.wait(std::move(b_token));
+    //===------------------------------------------------------------------===//
+    // Loop
+    //===------------------------------------------------------------------===//
+
+    for (int block_k = 0, stage = 0, phase = 0; block_k < K;
+         block_k += TILE_BLOCK_K, ++stage) {
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
+
+      wait(&full_bar[stage], phase);
 
 #pragma unroll
-    for (int warp_k = 0; warp_k < TILE_BLOCK_K; warp_k += TILE_WARP_K) {
+      for (int warp_k = 0; warp_k < TILE_BLOCK_K; warp_k += TILE_WARP_K) {
 #pragma unroll
-      for (int atomic_k = 0; atomic_k < TILE_WARP_K;
-           atomic_k += TILE_ATOMIC_K) {
+        for (int atomic_k = 0; atomic_k < TILE_WARP_K;
+             atomic_k += TILE_ATOMIC_K) {
 #pragma unroll
-        for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
-             ++atomic_m_cnt) {
-          int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
-
-#pragma unroll
-          for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
-               ++atomic_n_cnt) {
-            int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+          for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+               ++atomic_m_cnt) {
+            int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
 
             /// SF
             /// Layout
@@ -210,110 +323,83 @@ __global__ static void nvfp4_matmul_sm120_kernel(
               sfa0 = reinterpret_cast<const uint32_t *>(
                   A_sf)[row_swiz * 4 + col_swiz / 4];
             }
-            /// SF B
-            uint32_t sfb0 = 0;
-            if (lane_id % 4 == 0) {
-              int row = block_n + warp_n + atomic_n + (lane_id / 4);
-              int col = block_k + warp_k + atomic_k;
-              int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-                             (K / (16 * 4)) * 32 * (row / 128);
-              int col_swiz = ((row / 32) % 4) * 4;
-              sfb0 = reinterpret_cast<const uint32_t *>(
-                  B_sf)[row_swiz * 4 + col_swiz / 4];
-            }
 
-            /// Load shared to fragment
+            /// Load shared to fragment for A operand
             int *a_regs = (int *)a_frag.data;
-            int *b_regs = (int *)b_frag.data;
             uint32_t a_addr = __cvta_generic_to_shared(
-                &a_shared[warp_m + atomic_m + (lane_id % 16)]
-                         [(warp_k + atomic_k + (lane_id / 16) * 32) /
-                          ELES_PER_NVFP4x2]);
-            uint32_t b_addr = __cvta_generic_to_shared(
-                &b_shared[warp_n + atomic_n + (lane_id % 8)]
-                         [(warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
-                          ELES_PER_NVFP4x2]);
+                a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 +
+                (warp_m + atomic_m + (lane_id % 16)) * TILE_BLOCK_K /
+                    ELES_PER_NVFP4x2 +
+                (warp_k + atomic_k + (lane_id / 16) * 32) / ELES_PER_NVFP4x2);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(a_regs[0]), "=r"(a_regs[1]), "=r"(a_regs[2]),
                            "=r"(a_regs[3])
                          : "r"(a_addr));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-                         "{%0, %1}, [%2];"
-                         : "=r"(b_regs[0]), "=r"(b_regs[1])
-                         : "r"(b_addr));
-
-            /// Apply mma
-            fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
-                a_frag.data[1], a_frag.data[2], a_frag.data[3], b_frag.data[0],
-                b_frag.data[1], c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
-          } // end loop atomic_n_cnt
-        } // end loop atomic_m_cnt
-      } // end loop atomic_k
-    } // end loop warp_k
-
-    __syncthreads();
-  } // end loop block_k
-
-  //===----------------------------------------------------------------------===//
-  // Apply alpha
-  //===----------------------------------------------------------------------===//
 
 #pragma unroll
-  for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
-       ++atomic_m_cnt) {
-#pragma unroll
-    for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
-         ++atomic_n_cnt) {
-#pragma unroll
-      for (int idx = 0;
-           idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
-           ++idx) {
-        c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
-      } // end loop idx
-    } // end loop atomic_n_cnt
-  } // end loop atomic_m_cnt
+            for (int atomic_n_cnt = 0;
+                 atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N; ++atomic_n_cnt) {
+              int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
 
-  //===----------------------------------------------------------------------===//
-  // Apply bias
-  //===----------------------------------------------------------------------===//
+              /// SF
+              /// Layout
+              /// [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)] x u8
+              /// dim0,       dim1,      dim2,       dim3,      dim4
+              /// TODO(jian.wu): need handle K padding
+              /// SF B
+              uint32_t sfb0 = 0;
+              if (lane_id % 4 == 0) {
+                int row = block_n + warp_n + atomic_n + (lane_id / 4);
+                int col = block_k + warp_k + atomic_k;
+                int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
+                               (K / (16 * 4)) * 32 * (row / 128);
+                int col_swiz = ((row / 32) % 4) * 4;
+                sfb0 = reinterpret_cast<const uint32_t *>(
+                    B_sf)[row_swiz * 4 + col_swiz / 4];
+              }
 
-  if (bias) {
-#pragma unroll
-    for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
-         ++atomic_m_cnt) {
-#pragma unroll
-      for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
-           ++atomic_n_cnt) {
-#pragma unroll
-        for (int idx = 0;
-             idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
-             ++idx) {
-          int thread_n =
-              atomic_n_cnt * TILE_ATOMIC_N +
-              c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, idx);
-          int n = block_n + warp_n + thread_n;
-          if (n < N) {
-            c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
-                __bfloat162float(bias[n]);
-          }
-        } // end loop idx
-      } // end loop atomic_n_cnt
-    } // end loop atomic_m_cnt
-  }
+              /// Load shared to fragment for B operand
+              int *b_regs = (int *)b_frag.data;
+              uint32_t b_addr = __cvta_generic_to_shared(
+                  b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2 +
+                  (warp_n + atomic_n + (lane_id % 8)) * TILE_BLOCK_K /
+                      ELES_PER_NVFP4x2 +
+                  (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
+                      ELES_PER_NVFP4x2);
+              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                           "{%0, %1}, [%2];"
+                           : "=r"(b_regs[0]), "=r"(b_regs[1])
+                           : "r"(b_addr));
 
-  //===----------------------------------------------------------------------===//
-  // Write back to D
-  //===----------------------------------------------------------------------===//
+              /// Apply mma
+              fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
+                  a_frag.data[1], a_frag.data[2], a_frag.data[3],
+                  b_frag.data[0], b_frag.data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
+            } // end loop atomic_n
+          } // end loop atomic_m
+        } // end loop atomic_k
+      } // end loop warp_k
 
-  if (block_m + TILE_BLOCK_M <= M && block_n + TILE_BLOCK_N <= N) {
-    // Not out-of-range
+      if (lane_id == 0) {
+        arrive(&empty_bar[stage], 1);
+      }
+    } // end loop block_k
+
+    //===------------------------------------------------------------------===//
+    // Epilogue
+    //===------------------------------------------------------------------===//
+
+    //===------------------------------------------------------------------===//
+    // Apply alpha
+    //===------------------------------------------------------------------===//
 
 #pragma unroll
     for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
@@ -325,66 +411,116 @@ __global__ static void nvfp4_matmul_sm120_kernel(
         for (int idx = 0;
              idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
              ++idx) {
-          int thread_m =
-              atomic_m_cnt * TILE_ATOMIC_M +
-              c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, idx);
-          int m = block_m + warp_m + thread_m;
-          if (m >= M) {
-            continue;
-          }
-          int thread_n =
-              atomic_n_cnt * TILE_ATOMIC_N +
-              c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, idx);
-          int n = block_n + warp_n + thread_n;
-          D[m * N + n] =
-              __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
+          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
         } // end loop idx
       } // end loop atomic_n_cnt
     } // end loop atomic_m_cnt
-  } else {
-    // Meet out-of-range
 
-    // Check warp
-    if (block_m + warp_m >= M || block_n + warp_n >= N) {
-      return;
+    //===------------------------------------------------------------------===//
+    // Apply bias
+    //===------------------------------------------------------------------===//
+
+    if (bias) {
+#pragma unroll
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+#pragma unroll
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+#pragma unroll
+          for (int idx = 0;
+               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+               ++idx) {
+            int thread_n = atomic_n_cnt * TILE_ATOMIC_N +
+                           c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
+                               lane_id, idx);
+            int n = block_n + warp_n + thread_n;
+            if (n < N) {
+              c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
+                  __bfloat162float(bias[n]);
+            }
+          } // end loop idx
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
     }
 
+    //===------------------------------------------------------------------===//
+    // Write back to D
+    //===------------------------------------------------------------------===//
+
+    if (block_m + TILE_BLOCK_M <= M && block_n + TILE_BLOCK_N <= N) {
+      // Not out-of-range
+
 #pragma unroll
-    for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
-         ++atomic_m_cnt) {
-      int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
-      if (block_m + warp_m + atomic_m >= M) {
-        break;
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+#pragma unroll
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+#pragma unroll
+          for (int idx = 0;
+               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+               ++idx) {
+            int thread_m = atomic_m_cnt * TILE_ATOMIC_M +
+                           c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(
+                               lane_id, idx);
+            int m = block_m + warp_m + thread_m;
+            int thread_n = atomic_n_cnt * TILE_ATOMIC_N +
+                           c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
+                               lane_id, idx);
+            int n = block_n + warp_n + thread_n;
+            D[m * N + n] = __float2bfloat16_rn(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
+          } // end loop idx
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
+    } else {
+      // Meet out-of-range
+
+      // Check warp
+      if (block_m + warp_m >= M || block_n + warp_n >= N) {
+        return;
       }
+
 #pragma unroll
-      for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
-           ++atomic_n_cnt) {
-        int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
-        if (block_n + warp_n + atomic_n >= N) {
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+        int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
+        if (block_m + warp_m + atomic_m >= M) {
           break;
         }
+
 #pragma unroll
-        for (int idx = 0;
-             idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
-             ++idx) {
-          int thread_m =
-              atomic_m +
-              c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, idx);
-          int m = block_m + warp_m + thread_m;
-          int thread_n =
-              atomic_n +
-              c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, idx);
-          int n = block_n + warp_n + thread_n;
-          if (m >= M || n >= N) {
-            continue;
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+          int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+          if (block_n + warp_n + atomic_n >= N) {
+            break;
           }
 
-          D[m * N + n] =
-              __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
-        } // end loop idx
-      } // end loop atomic_n_cnt
-    } // end loop atomic_m_cnt
-  }
+#pragma unroll
+          for (int idx = 0;
+               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+               ++idx) {
+            int thread_m =
+                atomic_m + c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(
+                               lane_id, idx);
+            int m = block_m + warp_m + thread_m;
+            int thread_n =
+                atomic_n + c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
+                               lane_id, idx);
+            int n = block_n + warp_n + thread_n;
+            if (m >= M || n >= N) {
+              continue;
+            }
+
+            D[m * N + n] = __float2bfloat16_rn(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
+          } // end loop idx
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
+    }
+  } // end if consumer
 }
 
 void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
@@ -461,8 +597,13 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
 
   /// Grid & Block dim3
   dim3 grid(ceil_div(N, TILE_BLOCK_N), ceil_div(M, TILE_BLOCK_M));
-  dim3 block(32, ceil_div(TILE_BLOCK_N, TILE_WARP_N),
-             ceil_div(TILE_BLOCK_M, TILE_WARP_M));
+  dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+
+  /// Set dynamic shared memory size
+  size_t smem_size = TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE;
+  CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+      nvfp4_matmul_sm120_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size));
 
   /// Get stream
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
@@ -479,7 +620,7 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
           K / ELES_PER_NVFP4x2);
 
   /// Launch kernel
-  nvfp4_matmul_sm120_kernel<<<grid, block, 0, stream>>>(
+  nvfp4_matmul_sm120_kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),

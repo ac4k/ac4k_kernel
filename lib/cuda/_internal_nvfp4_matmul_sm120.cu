@@ -62,15 +62,16 @@ nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B,
 #pragma unroll
     for (int idx = 0; idx < a_tile.REGISTERS_PER_THREAD; ++idx) {
       int row = a_tile.get_row_with_reg(tid, idx);
-      if (block_row + row >= M) {
-        continue;
-      }
-
       int col = a_tile.get_col_with_reg(tid, idx);
-      const NVFP4x2 *A_tile =
-          A + ((block_row + row) * K + col + k) / ELES_PER_NVFP4x2;
-      a_tile.data[idx] =
-          *reinterpret_cast<const AFrag_NVFP4_16x64::REG_TYPE *>(A_tile);
+      if (block_row + row >= M || k + col >= K) {
+        a_tile.data[idx] = 0;
+        continue;
+      } else {
+        const NVFP4x2 *A_tile =
+            A + ((block_row + row) * K + col + k) / ELES_PER_NVFP4x2;
+        a_tile.data[idx] =
+            *reinterpret_cast<const AFrag_NVFP4_16x64::REG_TYPE *>(A_tile);
+      }
     }
 
     /// Load B fragment
@@ -78,10 +79,15 @@ nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B,
     for (int idx = 0; idx < b_tile.REGISTERS_PER_THREAD; ++idx) {
       int row = b_tile.get_row_with_reg(tid, idx);
       int col = b_tile.get_col_with_reg(tid, idx);
-      const NVFP4x2 *B_tile =
-          B + (row + k + (block_col + col) * K) / ELES_PER_NVFP4x2;
-      b_tile.data[idx] =
-          *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(B_tile);
+      if (row + k >= K || block_col + col >= N) {
+        b_tile.data[idx] = 0;
+        continue;
+      } else {
+        const NVFP4x2 *B_tile =
+            B + (row + k + (block_col + col) * K) / ELES_PER_NVFP4x2;
+        b_tile.data[idx] =
+            *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(B_tile);
+      }
     }
 
     /// SF
@@ -154,10 +160,10 @@ nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B,
 #pragma unroll
   for (int idx = 0; idx < c_tile.REGISTERS_PER_THREAD; ++idx) {
     int row = c_tile.get_row_with_reg(tid, idx);
-    if (block_row + row >= M) {
+    int col = c_tile.get_col_with_reg(tid, idx);
+    if (block_row + row >= M || block_col + col >= N) {
       continue;
     }
-    int col = c_tile.get_col_with_reg(tid, idx);
     D[(block_row + row) * N + block_col + col] =
         __float2bfloat16_rn(c_tile.data[idx]);
   }
@@ -241,8 +247,8 @@ void _internal_nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
-  nvfp4_matmul_sm120_kernel<<<dim3(N / 8, (M + 16 - 1) / 16), dim3(32), 0,
-                              stream>>>(
+  nvfp4_matmul_sm120_kernel<<<dim3(ceil_div(N, 8), ceil_div(M, 16)), dim3(32),
+                              0, stream>>>(
       reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),

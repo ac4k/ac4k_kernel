@@ -43,6 +43,13 @@ def test_nvfp4_gemm(
 
     torch.testing.assert_close(out, expected_out, atol=1e-1, rtol=1e-1)
 
+    # check bit - level accuracy
+    from ac4k_kernel.ops import _internal_nvfp4_matmul
+    _internal_out = _internal_nvfp4_matmul(a_fp4, b_fp4, a_scale_interleaved,
+                                           b_scale_interleaved, alpha, bias)
+    torch.testing.assert_close(out.view(torch.uint16),
+                               _internal_out.view(torch.uint16))
+
     print("test passed\n")
 
 
@@ -56,3 +63,4 @@ if __name__ == "__main__":
     test_nvfp4_gemm(torch.bfloat16, (123, 321, 256))
     test_nvfp4_gemm(torch.bfloat16, (10, 15, 512))
     test_nvfp4_gemm(torch.bfloat16, (8192, 8192, 8192))
+    test_nvfp4_gemm(torch.bfloat16, (1, 4, 256))
