@@ -42,6 +42,8 @@ const int TILE_BLOCK_PACK_K = TILE_BLOCK_K / ELES_PER_NVFP4x2;
 const int TILE_BLOCK_A_ELES = TILE_BLOCK_M * TILE_BLOCK_K;
 const int TILE_BLOCK_B_ELES = TILE_BLOCK_N * TILE_BLOCK_K;
 const int TILE_IN_ELES = TILE_BLOCK_A_ELES + TILE_BLOCK_B_ELES;
+const int TILE_BLOCK_A_SF_ELES = TILE_BLOCK_M * TILE_BLOCK_K / 64;
+const int TILE_BLOCK_B_SF_ELES = TILE_BLOCK_N * TILE_BLOCK_K / 64;
 
 /// Warp level tile size
 const int TILE_WARP_M = 64;
@@ -95,6 +97,32 @@ __host__ static __forceinline__ CUtensorMap create_tensor_map(
 
   cuTensorMapEncodeTiled(
       &template_tensor_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, gmem_address,
+      gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape, smem_box_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+  return template_tensor_map;
+}
+
+template <int BlockMajorSize, int BlockMinorSize,
+          CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+__host__ static __forceinline__ CUtensorMap create_sf_tensor_map(
+    const uint32_t *gmem_ptr, int global_major_size, int global_minor_size) {
+  CUtensorMap template_tensor_map{};
+
+  void *gmem_address = (void *)gmem_ptr;
+  uint64_t gmem_prob_shape[5] = {128, static_cast<uint64_t>(global_minor_size),
+                                 static_cast<uint64_t>(global_major_size), 1,
+                                 1};
+  uint64_t gmem_prob_stride[5] = {sizeof(uint32_t), sizeof(uint32_t) * 128,
+                                  sizeof(uint32_t) * 128 * global_minor_size, 0,
+                                  0};
+  uint32_t smem_box_shape[5] = {128, static_cast<uint64_t>(BlockMinorSize),
+                                static_cast<uint64_t>(BlockMajorSize), 1, 1};
+  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+  cuTensorMapEncodeTiled(
+      &template_tensor_map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 3, gmem_address,
       gmem_prob_shape, gmem_prob_stride + 1, smem_box_shape, smem_box_stride,
       CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -215,6 +243,22 @@ __device__ static __forceinline__ void load_async(void *dst,
                : "memory");
 }
 
+__device__ static __forceinline__ void
+load_sf_async(void *dst, void const *const tma_map, uint64_t *bar,
+              int global_row, int global_col) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+  asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::"
+               "complete_tx::bytes"
+               " [%0], [%1, {%3, %4, %5}], [%2];"
+               :
+               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(0),
+                 "r"(global_col), "r"(global_row)
+               : "memory");
+}
+
 //===----------------------------------------------------------------------===//
 // Matrix matmul kernel
 // D bf16 dtype
@@ -231,7 +275,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
         const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
         int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
-        const __grid_constant__ CUtensorMap b_tensor_map) {
+        const __grid_constant__ CUtensorMap b_tensor_map,
+        const __grid_constant__ CUtensorMap a_sf_tensor_map,
+        const __grid_constant__ CUtensorMap b_sf_tensor_map) {
   //===--------------------------------------------------------------------===//
   // Distribute for block, warp
   //===--------------------------------------------------------------------===//
@@ -277,8 +323,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
   extern __shared__ __align__(1024) NVFP4x2 smem[];
   NVFP4x2 *a_shared = smem;
-  NVFP4x2 *b_shared =
-      a_shared + STAGE * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+  NVFP4x2 *b_shared = a_shared + STAGE * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2;
+  uint32_t *a_sf_shared = reinterpret_cast<uint32_t *>(
+      b_shared + STAGE * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2);
+  uint32_t *b_sf_shared = a_sf_shared + STAGE * TILE_BLOCK_A_SF_ELES;
 
   //===--------------------------------------------------------------------===//
   // Define brrier for a and b tma
@@ -312,13 +360,25 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
       wait(&empty_bar[stage], phase);
 
+      /// TMA A
       load_async(a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2,
                  &a_tensor_map, &full_bar[stage], block_m, block_k_pack);
+      /// TMA B
       load_async(b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2,
                  &b_tensor_map, &full_bar[stage], block_n, block_k_pack);
+      /// TMA A_SF
+      load_sf_async(a_sf_shared + stage * TILE_BLOCK_A_SF_ELES,
+                    &a_sf_tensor_map, &full_bar[stage], block_m / 128,
+                    block_k / 64);
+      /// TMA B_SF
+      load_sf_async(b_sf_shared + stage * TILE_BLOCK_B_SF_ELES,
+                    &b_sf_tensor_map, &full_bar[stage], block_n / 128,
+                    block_k / 64);
 
       expect_bytes(&full_bar[stage],
-                   TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2));
+                   TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) +
+                       (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) *
+                           sizeof(uint32_t));
     } // end loop block_k
   }
 
@@ -365,15 +425,13 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             /// SF A
             uint32_t sfa0 = 0;
             if (lane_id % 4 < 2) {
-              int row = block_m + warp_m + atomic_m + ((lane_id % 4) % 2) * 8 +
-                        (lane_id / 4);
-              int col = block_k + warp_k + atomic_k;
-
-              int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-                             (K / (16 * 4)) * 32 * (row / 128);
-              int col_swiz = ((row / 32) % 4) * 4;
-              sfa0 = reinterpret_cast<const uint32_t *>(
-                  A_sf)[row_swiz * 4 + col_swiz / 4];
+              int row =
+                  warp_m + atomic_m + ((lane_id % 4) % 2) * 8 + (lane_id / 4);
+              int col = warp_k + atomic_k;
+              int row_swiz = (row % 32) + 32 * (col / (16 * 4));
+              int col_swiz = (row / 32) % 4;
+              sfa0 = a_sf_shared[stage * TILE_BLOCK_A_SF_ELES + row_swiz * 4 +
+                                 col_swiz];
             }
 
             /// Load shared to fragment for A operand
@@ -408,13 +466,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
               /// SF B
               uint32_t sfb0 = 0;
               if (lane_id % 4 == 0) {
-                int row = block_n + warp_n + atomic_n + (lane_id / 4);
-                int col = block_k + warp_k + atomic_k;
-                int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-                               (K / (16 * 4)) * 32 * (row / 128);
-                int col_swiz = ((row / 32) % 4) * 4;
-                sfb0 = reinterpret_cast<const uint32_t *>(
-                    B_sf)[row_swiz * 4 + col_swiz / 4];
+                int row = warp_n + atomic_n + (lane_id / 4);
+                int col = warp_k + atomic_k;
+                int row_swiz = (row % 32) + 32 * (col / (16 * 4));
+                int col_swiz = (row / 32) % 4;
+                sfb0 = b_sf_shared[stage * TILE_BLOCK_B_SF_ELES + row_swiz * 4 +
+                                   col_swiz];
               }
 
               /// Load shared to fragment for B operand
@@ -636,11 +693,11 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   TORCH_CHECK(B_sf.stride(1) == 1, "scale_b stride[1] must be 1");
 
   /// Check alighment
-  int64_t M_ALIGN = 128;
-  int64_t N_ALIGN = 128;
-  int64_t K_ALIGN = TILE_BLOCK_K;
-  auto M_PAD = align_up(M, M_ALIGN);
-  auto N_PAD = align_up(N, N_ALIGN);
+  const int M_ALIGN = 128;
+  const int N_ALIGN = 128;
+  const int K_ALIGN = TILE_BLOCK_K;
+  int M_PAD = align_up(M, M_ALIGN);
+  int N_PAD = align_up(N, N_ALIGN);
   TORCH_CHECK(A_sf.sizes()[0] == M_PAD, "scale_a shape[0] must be ", M_PAD);
   TORCH_CHECK(B_sf.sizes()[0] == N_PAD, "scale_b shape[0] must be ", N_PAD);
   TORCH_CHECK(K % K_ALIGN == 0, "K must be aligned with ", K_ALIGN);
@@ -666,7 +723,9 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   /// Set dynamic shared memory size
   const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
   auto *kernel = nvfp4_matmul_sm120_kernel<SWIZZLE>;
-  size_t smem_size = TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE;
+  size_t smem_size =
+      TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
+      (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) * STAGE;
   CHECK_CUDA_ERROR(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -683,6 +742,14 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
       create_tensor_map<TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2, SWIZZLE>(
           reinterpret_cast<const NVFP4x2 *>(B.data_ptr()), N,
           K / ELES_PER_NVFP4x2);
+  CUtensorMap a_sf_tensor_map =
+      create_sf_tensor_map<TILE_BLOCK_M / M_ALIGN, TILE_BLOCK_K / 64>(
+          reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
+          static_cast<int>(M_PAD / M_ALIGN), static_cast<int>(K / 64));
+  CUtensorMap b_sf_tensor_map =
+      create_sf_tensor_map<TILE_BLOCK_N / N_ALIGN, TILE_BLOCK_K / 64>(
+          reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
+          static_cast<int>(N_PAD / N_ALIGN), static_cast<int>(K / 64));
 
   /// Launch kernel
   kernel<<<grid, block, smem_size, stream>>>(
@@ -695,7 +762,7 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
       bias.has_value()
           ? reinterpret_cast<const __nv_bfloat16 *>(bias.value().data_ptr())
           : nullptr,
-      M, N, K, a_tensor_map, b_tensor_map);
+      M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map, b_sf_tensor_map);
 }
 
 } // namespace ac4k
