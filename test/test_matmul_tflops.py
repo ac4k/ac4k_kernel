@@ -94,15 +94,15 @@ def test_nvfp4_gemm(
 
 if __name__ == "__main__":
     torch.manual_seed(345)
-    test_nvfp4_gemm(torch.bfloat16, (8192, 8192, 8192),
-                    test_runs=20,
-                    warmup_runs=5)
-    test_nvfp4_gemm(torch.bfloat16, (75600, 5120, 5120),
+    test_nvfp4_gemm(torch.bfloat16, (75600, 5120, 13824),
                     test_runs=20,
                     warmup_runs=5)
     test_nvfp4_gemm(torch.bfloat16, (75600, 13824, 5120),
                     test_runs=20,
                     warmup_runs=5)
-    test_nvfp4_gemm(torch.bfloat16, (75600, 5120, 13824 // 2),
+    test_nvfp4_gemm(torch.bfloat16, (75600, 5120, 5120),
                     test_runs=20,
                     warmup_runs=5)
+    # test_nvfp4_gemm(torch.bfloat16, (75600, 5120, 13824 // 2),
+    #                 test_runs=20,
+    #                 warmup_runs=5)
