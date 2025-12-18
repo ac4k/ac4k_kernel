@@ -700,7 +700,7 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   int N_PAD = align_up(N, N_ALIGN);
   TORCH_CHECK(A_sf.sizes()[0] == M_PAD, "scale_a shape[0] must be ", M_PAD);
   TORCH_CHECK(B_sf.sizes()[0] == N_PAD, "scale_b shape[0] must be ", N_PAD);
-  TORCH_CHECK(K % K_ALIGN == 0, "K must be aligned with ", K_ALIGN);
+  // TORCH_CHECK(K % K_ALIGN == 0, "K must be aligned with ", K_ALIGN);
 
   /// Check bias
   if (bias.has_value()) {

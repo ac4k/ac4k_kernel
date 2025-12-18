@@ -415,9 +415,11 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
 
     /// Step 6: o = P @ V
     ///         256 cycles
+    int dot1_k = dot0_n;
 
 #pragma unroll
-    for (int dot1_k = 0; dot1_k < TILE_DOT1_BLOCK_K; dot1_k += TILE_ATOMIC_K) {
+    for (int dot1_atomic_k = 0; dot1_atomic_k < TILE_DOT1_BLOCK_K;
+         dot1_atomic_k += TILE_ATOMIC_K) {
 #pragma unroll
       for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
            dot1_atomic_n += TILE_ATOMIC_N) {
@@ -426,7 +428,8 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
 #pragma unroll
         for (int idx = 0; idx < v_frag.REGISTERS_PER_THREAD; ++idx) {
           // TODO(v layout: [B, H, D, N])
-          int row = dot1_k + v_frag.get_row_with_reg(lane_id, idx);
+          int row =
+              dot1_k + dot1_atomic_k + v_frag.get_row_with_reg(lane_id, idx);
           int col = block_dot1_n + warp_dot1_n + dot1_atomic_n +
                     v_frag.get_col_with_reg(lane_id, idx);
           const NVFP4x2 *V_tile = V + (row + col * DOT1_K) / ELES_PER_NVFP4x2;
@@ -439,14 +442,9 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
         uint32_t v_sf_frag = 0;
         if (lane_id % 4 == 0) {
           int row = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
-          int col = dot1_k;
+          int col = dot1_k + dot1_atomic_k;
           v_sf_frag = reinterpret_cast<const uint32_t *>(
               V_SF)[col / 64 * B * H * Dv + row];
-          // int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-          //                (DOT1_K / (16 * 4)) * 32 * (row / 128);
-          // int col_swiz = ((row / 32) % 4) * 4;
-          // v_sf_frag = reinterpret_cast<const uint32_t *>(
-          //     V_SF)[row_swiz * 4 + col_swiz / 4];
         }
 
         /// Dot1
@@ -454,17 +452,18 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[1],
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[2],
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[3],
-            p_fp4_frag[0][dot1_k / TILE_ATOMIC_K].data[0],
-            p_fp4_frag[0][dot1_k / TILE_ATOMIC_K].data[1],
-            p_fp4_frag[0][dot1_k / TILE_ATOMIC_K].data[2],
-            p_fp4_frag[0][dot1_k / TILE_ATOMIC_K].data[3], v_frag.data[0],
-            v_frag.data[1], o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[0],
+            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[0],
+            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[1],
+            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[2],
+            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[3],
+            v_frag.data[0], v_frag.data[1],
+            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[0],
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[1],
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[2],
             o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[3],
-            p_fp4_sf_frag[0][dot1_k / TILE_ATOMIC_K], v_sf_frag);
+            p_fp4_sf_frag[0][dot1_atomic_k / TILE_ATOMIC_K], v_sf_frag);
       } // end loop dot1_atomic_n
-    } // end loop dot1_k
+    } // end loop dot1_atomic_k
   } // end loop dot0_n/dot1_k
 
   //===------------------------------------------------------------------===//
@@ -596,7 +595,6 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   dim3 grid(B, H, ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)));
-  // dim3 grid(B, H, 1); // debug
   dim3 block(32, WARP_NUM);
   nvfp4_mha_fwd_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<BF16 *>(o.data_ptr()),

@@ -6,78 +6,130 @@ from ac4k_kernel.ops import nvfp4_matmul, nvfp4_quant, nvfp4_attention, quantize
 from utils import get_global_scale
 
 
+def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
+    """
+    计算两个4D Tensor的整体余弦相似度
+    将整个Tensor展平为向量后计算相似度
+    """
+    # 展平为1D向量 [batch, channel, height, width] -> [n]
+    t1_flat = tensor1.flatten()
+    t2_flat = tensor2.flatten()
+
+    # 计算余弦相似度
+    similarity = F.cosine_similarity(
+        t1_flat.unsqueeze(0),  # 添加batch维度
+        t2_flat.unsqueeze(0),
+        dim=1,
+        eps=eps)
+    return similarity.item()  # 返回标量值
+
+
 def test_attention_bench(B, N, H, D):
     B = 1
-    N = 64
+    N = 256
     H = 1
     D = 128
     q = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
     k = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
     v = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
 
-    # q_global_scale = get_global_scale(q)
-    # k_global_scale = get_global_scale(k)
-    # v = v.T.contiguous()
-    # v_reorder = v.reshape(D, -1, 4, 4, 2)
-    # v_reorder = v_reorder.permute(0, 1, 3, 2, 4)
-    # v_reorder = v_reorder.contiguous()
-    # v_reorder = v_reorder.reshape(D, -1)
-    # v_reorder = v_reorder.contiguous()
-    # v_reorder_global_scale = get_global_scale(v_reorder)
-    # # v_global_scale = get_global_scale(v)
+    def ceil_div(a, b):
+        return (a + b - 1) // b
 
-    # qk_alpha = 1.0 / (q_global_scale * k_global_scale)
-    # # v_alpha = 1.0 / v_global_scale
-    # v_reorder_alpha = 1.0 / v_reorder_global_scale
+    def align_up(a, b):
+        return ceil_div(a, b) * b
 
-    # q_fp4, q_sf = nvfp4_quant(q, q_global_scale)
-    # k_fp4, k_sf = nvfp4_quant(k, k_global_scale)
-    # # v_fp4, v_sf = nvfp4_quant(v, v_global_scale)
-    # v_reorder_fp4, v_reorder_sf = nvfp4_quant(v_reorder, v_reorder_global_scale)
+    def pad(tensor, align_size):
+        # pad last dim
+        if tensor.shape[-1] % align_size != 0:
+            pad = (0, align_size - (tensor.shape[-1] % align_size)
+                   ) + (0, 0) * (len(tensor.shape) - 1)
+            return F.pad(tensor, pad=pad, mode='constant', value=0)
+        return tensor
 
-    ####
     def get_ref(q, k, v, B, N, H, D):
-        vt = v.T.contiguous()
+        # quantize q & k
+        q_rcp_global_scale = get_global_scale(q)
+        q_fp4, q_sf = nvfp4_quant(q, q_rcp_global_scale)
+        k_rcp_global_scale = get_global_scale(k)
+        k_fp4, k_sf = nvfp4_quant(k, k_rcp_global_scale)
+        qk_alpha = 1.0 / (q_rcp_global_scale * k_rcp_global_scale)
 
-        q_global_scale = get_global_scale(q)
-        k_global_scale = get_global_scale(k)
-        qk_alpha = 1.0 / (q_global_scale * k_global_scale)
-
-        q_fp4, q_sf = nvfp4_quant(q, q_global_scale)
-        k_fp4, k_sf = nvfp4_quant(k, k_global_scale)
-
-        s = nvfp4_matmul(q_fp4, k_fp4, q_sf, k_sf, qk_alpha)
-        s = s / math.sqrt(D)
-
-        max = torch.max(s, dim=-1, keepdim=True)
-
-        exp = torch.exp(s - max.values)
-
-        sum_exp = torch.sum(exp, dim=-1, keepdim=True)
-
-        # pad and quantize
-        exp_pad = F.pad(exp, pad=(0, 64, 0, 0), mode='constant', value=0)
-        # quantize exp
-        exp_pad_global_scale = get_global_scale(exp_pad)
-        exp_pad_alpha = 1.0 / exp_pad_global_scale
-        exp_pad_fp4, exp_pad_sf = nvfp4_quant(exp_pad, exp_pad_global_scale)
-
-        # pad v
-        v_pad = F.pad(vt, pad=(0, 64, 0, 0), mode='constant', value=0)
         # quantize v
-        v_pad_global_scale = get_global_scale(v_pad)
-        v_pad_alpha = 1.0 / v_pad_global_scale
-        v_pad_fp4, v_pad_sf = nvfp4_quant(v_pad, v_pad_global_scale)
+        v = v.T.contiguous()
+        # pad v
+        v = pad(v, 128)
+        # quantize v
+        v_rcp_global_scale = get_global_scale(v)
+        v_fp4, v_sf = nvfp4_quant(v, v_rcp_global_scale)
+        v_alpha = 1.0 / v_rcp_global_scale
 
-        # o
-        float1 = torch.ones([], dtype=torch.float32, device="cuda")
-        o = nvfp4_matmul(exp_pad_fp4, v_pad_fp4, exp_pad_sf, v_pad_sf, float1)
+        TILE_SIZE = 64
+        max = torch.full((N, 1), -torch.inf, device="cuda")
+        sum_exp = torch.zeros((N, 1), dtype=torch.float32, device="cuda")
+        o = torch.zeros((N, D), dtype=torch.float32, device="cuda")
+        for i in range(0, N, TILE_SIZE):
+            # tile sub k
+            k_fp4_sub = k_fp4[i:i + TILE_SIZE].contiguous()
+            k_sf_sub = k_sf.view(torch.int32)
+            k_sf_sub = k_sf_sub.reshape(-1, k_sf_sub.shape[1], 32, 4)
+            k_sf_sub = k_sf_sub[i // 128, :, :,
+                                ((i // 64) % 2) * 2:((i // 64) % 2) * 2 + 2]
+            k_sf_sub = pad(k_sf_sub, 4).contiguous()
+            k_sf_sub = k_sf_sub.view(torch.float8_e4m3fn)
+            k_sf_sub = k_sf_sub.reshape(-1, k_sf.shape[1])
 
-        o *= exp_pad_alpha * v_pad_alpha
+            # s = q @ k
+            s = nvfp4_matmul(q_fp4, k_fp4_sub, q_sf, k_sf_sub, qk_alpha)
+            s = s.to(torch.float32)
+            s = s / math.sqrt(D)
 
-        o = o / sum_exp
+            # softmax
+            max_new = torch.max(torch.max(s, dim=-1, keepdim=True).values, max)
+            exp = torch.exp(s - max_new)
+            sum_exp_new = torch.sum(exp, dim=-1, keepdim=True)
+
+            # quantize exp
+            exp = exp.to(torch.bfloat16)
+            exp_rcp_global_scale = get_global_scale(exp)
+            exp_alpha = 1.0 / exp_rcp_global_scale
+            exp_fp4, exp_sf = nvfp4_quant(exp, exp_rcp_global_scale)
+
+            # tile sub v
+            v_fp4_sub = v_fp4[:, i // 2:(i + TILE_SIZE) // 2].contiguous()
+            v_sf_sub = v_sf.view(torch.int32)
+            v_sf_sub = v_sf_sub.reshape(v_sf_sub.shape[0] // 128,
+                                        v_sf_sub.shape[1], -1)
+            v_sf_sub = v_sf_sub[:,
+                                i // 64:(i + TILE_SIZE) // 64, :].contiguous()
+            v_sf_sub = v_sf_sub.view(torch.float8_e4m3fn)
+            v_sf_sub = v_sf_sub.reshape(v_sf.shape[0], -1)
+
+            # o = exp @ v
+            o_new = nvfp4_matmul(exp_fp4, v_fp4_sub, exp_sf, v_sf_sub,
+                                 exp_alpha * v_alpha).to(torch.float32)
+
+            # update
+            sum_exp = torch.exp(max - max_new) * sum_exp + sum_exp_new
+            o = torch.exp(max - max_new) * o + o_new
+            max = max_new
+
+        o = (o / sum_exp).to(torch.bfloat16)
 
         print("o ref:")
+        print(o)
+
+        return o.reshape(B, N, H, D)
+
+    def get_ref1(q, k, v, B, N, H, D):
+        s = torch.matmul(q, k.transpose(-2, -1)).to(torch.float32)
+        s = s / math.sqrt(D)
+
+        p = torch.softmax(s, dim=-1).to(torch.bfloat16)
+
+        o = torch.matmul(p, v)
+
+        print("o ref1:")
         print(o)
 
         return o.reshape(B, N, H, D)
@@ -103,26 +155,20 @@ def test_attention_bench(B, N, H, D):
                             v_alpha, o)
 
         print("o ac4k:")
+
         print(o)
         return o
 
     o_ref = get_ref(q, k, v, B, N, H, D)
-
+    o_ref1 = get_ref1(q, k, v, B, N, H, D)
     o = get_ac4k(q, k, v, B, N, H, D)
 
-    # q_fp4 = q_fp4.view(B, N, H, -1)
-    # k_fp4 = k_fp4.view(B, N, H, -1)
-    # v_reorder_fp4 = v_reorder_fp4.view(B, D, H, -1)
-
-    # q_sf = q_sf.view(B, H, q_sf.shape[0], q_sf.shape[1])
-    # k_sf = k_sf.view(B, H, k_sf.shape[0], k_sf.shape[1])
-    # v_reorder_sf = v_reorder_sf.view(B, H, v_reorder_sf.shape[0], v_reorder_sf.shape[1])
-
-    # o = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
-
-    # o = nvfp4_attention(q_fp4, k_fp4, v_reorder_fp4, q_sf, k_sf, v_reorder_sf, qk_alpha, v_reorder_alpha, o)
-    # print("o")
-    # print(o)
+    similarity = cosine_similarity_4d_global(o, o_ref)
+    print(f"整体余弦相似度: {similarity:.4f}")
+    similarity1 = cosine_similarity_4d_global(o, o_ref1)
+    print(f"整体余弦相似度1: {similarity1:.4f}")
+    similarity2 = cosine_similarity_4d_global(o_ref, o_ref1)
+    print(f"整体余弦相似度2: {similarity2:.4f}")
 
     torch.testing.assert_close(o, o_ref, atol=2e-1, rtol=1e-1)
 
@@ -130,108 +176,3 @@ def test_attention_bench(B, N, H, D):
 if __name__ == "__main__":
     torch.manual_seed(9567)
     test_attention_bench(1, 64, 1, 128)
-
-# ##########################
-# 20251216
-# ##########################
-# import torch
-# import torch.nn.functional as F
-# import math
-
-# from ac4k_kernel.ops import nvfp4_matmul, nvfp4_quant, nvfp4_attention, quantize
-# from utils import get_global_scale
-
-# def test_attention_bench(B, N, H, D):
-#     B = 1
-#     N = 64
-#     H = 1
-#     D = 128
-#     q = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
-#     k = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
-#     v = torch.randn((N, D), dtype=torch.bfloat16, device="cuda")
-
-#     q_global_scale = get_global_scale(q)
-#     k_global_scale = get_global_scale(k)
-#     v = v.T.contiguous()
-#     v_reorder = v.reshape(D, -1, 4, 4, 2)
-#     v_reorder = v_reorder.permute(0, 1, 3, 2, 4)
-#     v_reorder = v_reorder.contiguous()
-#     v_reorder = v_reorder.reshape(D, -1)
-#     v_reorder = v_reorder.contiguous()
-#     v_reorder_global_scale = get_global_scale(v_reorder)
-#     # v_global_scale = get_global_scale(v)
-
-#     qk_alpha = 1.0 / (q_global_scale * k_global_scale)
-#     # v_alpha = 1.0 / v_global_scale
-#     v_reorder_alpha = 1.0 / v_reorder_global_scale
-
-#     q_fp4, q_sf = nvfp4_quant(q, q_global_scale)
-#     k_fp4, k_sf = nvfp4_quant(k, k_global_scale)
-#     # v_fp4, v_sf = nvfp4_quant(v, v_global_scale)
-#     v_reorder_fp4, v_reorder_sf = nvfp4_quant(v_reorder, v_reorder_global_scale)
-
-#     ####
-#     def ref(q, k, v, B, N, H, D):
-#         q_global_scale = get_global_scale(q)
-#         k_global_scale = get_global_scale(k)
-#         qk_alpha = 1.0 / (q_global_scale * k_global_scale)
-
-#         q_fp4, q_sf = nvfp4_quant(q, q_global_scale)
-#         k_fp4, k_sf = nvfp4_quant(k, k_global_scale)
-
-#         s = nvfp4_matmul(q_fp4, k_fp4, q_sf, k_sf, qk_alpha)
-#         s = s / math.sqrt(D)
-
-#         max = torch.max(s, dim=-1, keepdim=True)
-
-#         exp = torch.exp(s - max.values)
-
-#         l = torch.sum(exp, dim=-1, keepdim=True)
-
-#         # pad and quantize
-#         exp_pad = F.pad(exp, pad=(0, 64, 0, 0), mode='constant', value=0)
-#         # quantize exp
-#         exp_pad_global_scale = get_global_scale(exp_pad)
-#         exp_pad_alpha = 1.0 / exp_pad_global_scale
-#         exp_pad_fp4, exp_pad_sf = nvfp4_quant(exp_pad, exp_pad_global_scale)
-
-#         # pad v
-#         v_pad = F.pad(v, pad=(0, 64, 0, 0), mode='constant', value=0)
-#         # quantize v
-#         v_pad_global_scale = get_global_scale(v_pad)
-#         v_pad_alpha = 1.0 / v_pad_global_scale
-#         v_pad_fp4, v_pad_sf = nvfp4_quant(v_pad, v_pad_global_scale)
-
-#         # o
-#         float1 = torch.ones([], dtype=torch.float32, device="cuda")
-#         o = nvfp4_matmul(exp_pad_fp4, v_pad_fp4, exp_pad_sf, v_pad_sf, float1)
-#         o *= exp_pad_alpha * v_pad_alpha
-
-#         o = o / l
-
-#         print("o ref:")
-#         print(o)
-
-#         return o.reshape(B, N, H, D)
-
-#     o_ref = ref(q, k, v, B, N, H, D)
-
-#     q_fp4 = q_fp4.view(B, N, H, -1)
-#     k_fp4 = k_fp4.view(B, N, H, -1)
-#     v_reorder_fp4 = v_reorder_fp4.view(B, D, H, -1)
-
-#     q_sf = q_sf.view(B, H, q_sf.shape[0], q_sf.shape[1])
-#     k_sf = k_sf.view(B, H, k_sf.shape[0], k_sf.shape[1])
-#     v_reorder_sf = v_reorder_sf.view(B, H, v_reorder_sf.shape[0], v_reorder_sf.shape[1])
-
-#     o = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
-
-#     o = nvfp4_attention(q_fp4, k_fp4, v_reorder_fp4, q_sf, k_sf, v_reorder_sf, qk_alpha, v_reorder_alpha, o)
-#     print("o")
-#     print(o)
-
-#     torch.testing.assert_close(o, o_ref, atol=2e-1, rtol=1e-1)
-
-# if __name__ == "__main__":
-#     torch.manual_seed(9567)
-#     test_attention_bench(1, 64, 1, 128)
