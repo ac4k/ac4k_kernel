@@ -91,8 +91,11 @@ def quantize(input: torch.Tensor, dim=-1, swizzle=False, output=None, sf=None):
 
     FLOAT4_E2M1_MAX = 6.0
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    alpha = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(
-        torch.abs(input.view(-1))).to(torch.float32))
+    # alpha = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(
+    #     torch.abs(input.view(-1))).to(torch.float32))
+    alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
+             torch.amax(torch.abs(input.view(-1)), dim=-1)).to(torch.float32)
+    print("alpha: ", alpha)
     global_scale = 1 / alpha
 
     # refine dim

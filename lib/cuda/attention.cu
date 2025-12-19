@@ -164,13 +164,24 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
-__global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
-                                     const E4M3 *Q_SF, const NVFP4x2 *K,
-                                     const E4M3 *K_SF, const NVFP4x2 *V,
-                                     const E4M3 *V_SF, const float *alpha0,
-                                     const float *alpha1, int64_t B, int64_t H,
-                                     int64_t Nq, int64_t Nkv, int64_t Dqk,
-                                     int64_t Dv, float qk_norm) {
+__global__ void nvfp4_mha_fwd_kernel(
+    BF16 *O, int64_t o_b_stride, int64_t o_n_stride, int64_t o_h_stride,
+    int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
+    int64_t q_n_stride, int64_t q_h_stride, int64_t q_d_stride,
+    const E4M3 *Q_SF, int64_t q_sf_quantize_stride,
+    int64_t q_sf_non_quantize_stride, const NVFP4x2 *K, int64_t k_b_stride,
+    int64_t k_n_stride, int64_t k_h_stride, int64_t k_d_stride,
+    const E4M3 *K_SF, int64_t k_sf_quantize_stride,
+    int64_t k_sf_non_quantize_stride, const NVFP4x2 *V, int64_t v_b_stride,
+    int64_t v_h_stride, int64_t v_d_stride, int64_t v_n_stride,
+    const E4M3 *V_SF, int64_t v_sf_quantize_stride,
+    int64_t v_sf_non_quantize_stride, const float *alpha0, const float *alpha1,
+    int64_t B, int64_t H, int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv,
+    float qk_norm) {
+  int block_b = blockIdx.x;                    // batch
+  int block_h = blockIdx.y;                    // head
+  int block_n = blockIdx.z * TILE_DOT_BLOCK_M; // seq
+
   int lane_id = threadIdx.x % 32;
   int warp_id = threadIdx.y;
 
@@ -182,12 +193,12 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
   int DOT1_M = Nq;
   int DOT1_N = Dv;
   int DOT1_K = Nkv;
-  int block_m = blockIdx.z * TILE_DOT_BLOCK_M;
-  int block_n = 0;
-  int block_dot0_m = block_m;
-  int block_dot0_n = block_n;
-  int block_dot1_m = block_m;
-  int block_dot1_n = block_n;
+  int block_dot_m = block_n;
+  int block_dot_n = 0;
+  int block_dot0_m = block_dot_m;
+  int block_dot0_n = block_dot_n;
+  int block_dot1_m = block_dot_m;
+  int block_dot1_n = block_dot_n;
   int warp_dot0_m = 0;
   int warp_dot0_n = 0;
   int warp_dot1_m = 0;
@@ -234,11 +245,13 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
 #pragma unroll
       for (int idx = 0; idx < q_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
         // TODO(check out-of-bound)
-        int row = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
-                  q_frag[i][j].get_row_with_reg(lane_id, idx);
-        int col =
-            j * TILE_ATOMIC_K + q_frag[i][j].get_col_with_reg(lane_id, idx);
-        const NVFP4x2 *q_tile = Q + (row * Dqk + col) / ELES_PER_NVFP4x2;
+        // m map to N(seq)
+        int m = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
+                q_frag[i][j].get_row_with_reg(lane_id, idx);
+        // k map to Dqk(emb)
+        int k = j * TILE_ATOMIC_K + q_frag[i][j].get_col_with_reg(lane_id, idx);
+        const auto *q_tile = Q + block_b * q_b_stride + block_h * q_h_stride +
+                             m * q_n_stride + k / ELES_PER_NVFP4x2 * q_d_stride;
         q_frag[i][j].data[idx] =
             *reinterpret_cast<const AFrag_NVFP4_16x64::REG_TYPE *>(q_tile);
       }
@@ -250,14 +263,15 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
 #pragma unroll
     for (int j = 0; j < TILE_DOT0_WARP_K / TILE_ATOMIC_K; ++j) {
       if (lane_id % 4 < 2) {
-        int row = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
-                  ((lane_id % 4) % 2) * 8 + (lane_id / 4);
-        int col = j * TILE_ATOMIC_K;
-        int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-                       (Dqk / (16 * 4)) * 32 * (row / 128);
-        int col_swiz = ((row / 32) % 4) * 4;
-        q_sf_frag[i][j] = reinterpret_cast<const uint32_t *>(
-            Q_SF)[row_swiz * 4 + col_swiz / 4];
+        // m map to non-quantize
+        int m = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
+                (lane_id % 2) * 8 + lane_id / 4;
+        // k map to quantize
+        int k = j * TILE_ATOMIC_K;
+        const auto *q_sf_tile =
+            Q_SF + (k / (BLOCK_SIZE * 4)) * q_sf_quantize_stride +
+            (block_b * Nq * H + m * H + block_h) * q_sf_non_quantize_stride;
+        q_sf_frag[i][j] = *reinterpret_cast<const uint32_t *>(q_sf_tile);
       }
     }
   }
@@ -292,24 +306,29 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
         BFrag_NVFP4_64x8 k_frag;
 #pragma unroll
         for (int idx = 0; idx < k_frag.REGISTERS_PER_THREAD; ++idx) {
-          int row = dot0_k + k_frag.get_row_with_reg(lane_id, idx);
-          int col = block_dot0_n + warp_dot0_n + dot0_atomic_n +
-                    k_frag.get_col_with_reg(lane_id, idx);
-          const NVFP4x2 *K_tile = K + (row + col * DOT0_K) / ELES_PER_NVFP4x2;
+          // map k to K's Dk(emb)
+          int k = dot0_k + k_frag.get_row_with_reg(lane_id, idx);
+          // map n to K's N(seq)
+          int n = block_dot0_n + warp_dot0_n + dot0_atomic_n +
+                  k_frag.get_col_with_reg(lane_id, idx);
+          const auto *k_tile = K + block_b * k_b_stride + block_h * k_h_stride +
+                               n * k_n_stride +
+                               k / ELES_PER_NVFP4x2 * k_d_stride;
           k_frag.data[idx] =
-              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(K_tile);
+              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(k_tile);
         }
 
         /// Load K_SF
         uint32_t k_sf_frag = 0;
         if (lane_id % 4 == 0) {
-          int row = block_dot0_n + warp_dot0_n + dot0_atomic_n + (lane_id / 4);
-          int col = dot0_k;
-          int row_swiz = (row % 32) + 32 * (col / (16 * 4)) +
-                         (DOT0_K / (16 * 4)) * 32 * (row / 128);
-          int col_swiz = ((row / 32) % 4) * 4;
-          k_sf_frag = reinterpret_cast<const uint32_t *>(
-              K_SF)[row_swiz * 4 + col_swiz / 4];
+          // map k to quantize
+          int k = dot0_k;
+          // map n to non-quantize
+          int n = block_dot0_n + warp_dot0_n + dot0_atomic_n + (lane_id / 4);
+          const auto *k_sf_tile =
+              K_SF + (k / (BLOCK_SIZE * 4)) * k_sf_quantize_stride +
+              (block_b * Nkv * H + n * H + block_h) * k_sf_non_quantize_stride;
+          k_sf_frag = *reinterpret_cast<const uint32_t *>(k_sf_tile);
         }
 
         /// Dot0
@@ -427,24 +446,33 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
         BFrag_NVFP4_64x8 v_frag;
 #pragma unroll
         for (int idx = 0; idx < v_frag.REGISTERS_PER_THREAD; ++idx) {
-          // TODO(v layout: [B, H, D, N])
-          int row =
+          // map k to V's N(seq)
+          int k =
               dot1_k + dot1_atomic_k + v_frag.get_row_with_reg(lane_id, idx);
-          int col = block_dot1_n + warp_dot1_n + dot1_atomic_n +
-                    v_frag.get_col_with_reg(lane_id, idx);
-          const NVFP4x2 *V_tile = V + (row + col * DOT1_K) / ELES_PER_NVFP4x2;
+          // map n to V's D(emb)
+          int n = block_dot1_n + warp_dot1_n + dot1_atomic_n +
+                  v_frag.get_col_with_reg(lane_id, idx);
+
+          const auto *v_tile = V + block_b * v_b_stride + block_h * v_h_stride +
+                               n * v_d_stride +
+                               k / ELES_PER_NVFP4x2 * v_n_stride;
           v_frag.data[idx] =
-              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(V_tile);
+              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(v_tile);
         }
 
         /// Load V_SF
         /// V_SF layout: [N/64, B * H * D, 4]xuint8
         uint32_t v_sf_frag = 0;
         if (lane_id % 4 == 0) {
-          int row = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
-          int col = dot1_k + dot1_atomic_k;
-          v_sf_frag = reinterpret_cast<const uint32_t *>(
-              V_SF)[col / 64 * B * H * Dv + row];
+          // map n to V's D(emb)
+          int n = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
+          // map k to V's N(seq)
+          int k = dot1_k + dot1_atomic_k;
+
+          const auto *v_sf_tile =
+              V_SF + (k / (BLOCK_SIZE * 4)) * v_sf_quantize_stride +
+              (block_b * H * Dv + block_h * Dv + n) * v_sf_non_quantize_stride;
+          v_sf_frag = *reinterpret_cast<const uint32_t *>(v_sf_tile);
         }
 
         /// Dot1
@@ -493,11 +521,15 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
       for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
         int thread_m =
             i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
-        int m = block_m + warp_dot1_m + thread_m;
+        // map m to O's N(seq)
+        int m = block_dot_m + warp_dot1_m + thread_m;
         int thread_n =
             j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
-        int n = block_n + warp_dot1_n + thread_n;
-        O[m * DOT1_N + n] = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+        // map n to O's D(emb)
+        int n = block_dot_n + warp_dot1_n + thread_n;
+        auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                       block_h * o_h_stride + n * o_d_stride;
+        *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
       }
     }
   }
@@ -505,13 +537,13 @@ __global__ void nvfp4_mha_fwd_kernel(BF16 *O, const NVFP4x2 *Q,
 
 //===--------------------------------------------------------------------===//
 // ac4k mha attention with nvfp4 acceleration
-// Q: [B, Nq,  H, Dqk]xNVFP4
-// K: [B, Nkv, H, Dqk]xNVFP4
-// V: [B, Dv,  H, Nkv]xNVFP4
-// O: [B, Nq,  H, Dv]xNVFP4
-// Q_SF: [B, H, Nq,  Dqk/16]xUINT8
-// K_SF: [B, H, Nkv, Dqk/16]xUINT8
-// V_SF: [B, H, Dv,  Nkv/16]xUINT8
+// Q: [B, Nq,  H, Dqk/2]xNVFP4
+// K: [B, Nkv, H, Dqk/2]xNVFP4
+// V: [B, H, Dv, Nkv/2]xNVFP4
+// O: [B, Nq,  H, Dv/2]xNVFP4
+// Q_SF: [Dqk/64, B*Nq*H, 4]xUINT8
+// K_SF: [Dqk/64, B*Nkv*H, 4]xUINT8
+// V_SF: [Nkv/64, B*H*Dv, 4]xUINT8
 // alpha0: Q @ K global scale
 // alpha1: V global scale
 //===--------------------------------------------------------------------===//
@@ -527,17 +559,18 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   int64_t Nq = q.size(1);
   int64_t H = q.size(2);
   int64_t Dqk = q.size(3) * ELES_PER_NVFP4x2;
-  std::cout << __FILE__ << ":" << __LINE__ << std::endl;
   /// TODO(need remove limit)
   TORCH_CHECK(Dqk == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
   CHECK_INPUT(q_sf, at::ScalarType::Float8_e4m3fn,
-              "Q_SF must be a f8e4m3 tensor");
-  TORCH_CHECK(q_sf.dim() == 4, "Q_SF must be a 4D tensor");
-  TORCH_CHECK(q_sf.size(0) == B, "Q_SF must have the same batch size as Q");
-  TORCH_CHECK(q_sf.size(1) == H, "Q_SF must have the same head number as Q");
-  TORCH_CHECK(q_sf.size(2) == align_up(Nq, 128), "Meet invalid q_sf size(2)");
-  TORCH_CHECK(q_sf.size(3) == align_up(ceil_div(Dqk, BLOCK_SIZE), 4),
-              "Meet invalid q_sf size(3)");
+              "q_sf must be a f8e4m3 tensor");
+  TORCH_CHECK(q_sf.dim() == 3, "Q_SF must be a 3D tensor");
+  TORCH_CHECK(q_sf.size(0) == ceil_div(Dqk, BLOCK_SIZE * 4),
+              "Meet invalid q_sf size(0) with ", q_sf.size(0),
+              "==", ceil_div(Dqk, BLOCK_SIZE * 4));
+  TORCH_CHECK(q_sf.size(1) == B * Nq * H, "Meet invalid q_sf size(1) with ",
+              q_sf.size(1), "==", B * Nq * H);
+  TORCH_CHECK(q_sf.size(2) == 4, "Meet invalid q_sf size(2) with ",
+              q_sf.size(2), "==", 4);
 
   /// CHECK K & K_SF
   CHECK_INPUT(k, at::ScalarType::Byte, "K must be pack to uint8 tensor");
@@ -549,12 +582,14 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
               "K must have the same dim as Q");
   CHECK_INPUT(k_sf, at::ScalarType::Float8_e4m3fn,
               "K_SF must be a f8e4m3 tensor");
-  TORCH_CHECK(k_sf.dim() == 4, "K_SF must be a 4D tensor");
-  TORCH_CHECK(k_sf.size(0) == B, "K_SF must have the same batch size as Q");
-  TORCH_CHECK(k_sf.size(1) == H, "K_SF must have the same head number as Q");
-  TORCH_CHECK(k_sf.size(2) == align_up(Nkv, 128), "Meet invalid k_sf size(2)");
-  TORCH_CHECK(k_sf.size(3) == align_up(ceil_div(Dqk, BLOCK_SIZE), 4),
-              "Meet invalid k_sf size(3)");
+  TORCH_CHECK(k_sf.dim() == 3, "k_sf must be a 3D tensor");
+  TORCH_CHECK(k_sf.size(0) == ceil_div(Dqk, BLOCK_SIZE * 4),
+              "Meet invalid k_sf size(0) with ", k_sf.size(0),
+              "==", ceil_div(Dqk, BLOCK_SIZE * 4));
+  TORCH_CHECK(k_sf.size(1) == B * Nkv * H, "Meet invalid k_sf size(1) with ",
+              k_sf.size(1), "==", B * Nkv * H);
+  TORCH_CHECK(k_sf.size(2) == 4, "Meet invalid k_sf size(2) with ",
+              k_sf.size(2), "==", 4);
 
   /// CHECK V & V_SF
   CHECK_INPUT(v, at::ScalarType::Byte, "V must be pack to uint8 tensor");
@@ -597,14 +632,17 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   dim3 grid(B, H, ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)));
   dim3 block(32, WARP_NUM);
   nvfp4_mha_fwd_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<BF16 *>(o.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(q.data_ptr()),
-      reinterpret_cast<const E4M3 *>(q_sf.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(k.data_ptr()),
-      reinterpret_cast<const E4M3 *>(k_sf.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(v.data_ptr()),
-      reinterpret_cast<const E4M3 *>(v_sf.data_ptr()),
-      reinterpret_cast<const float *>(alpha0.data_ptr()),
+      reinterpret_cast<BF16 *>(o.data_ptr()), o.stride(0), o.stride(1),
+      o.stride(2), o.stride(3), reinterpret_cast<const NVFP4x2 *>(q.data_ptr()),
+      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+      reinterpret_cast<const E4M3 *>(q_sf.data_ptr()), q_sf.stride(0),
+      q_sf.stride(1), reinterpret_cast<const NVFP4x2 *>(k.data_ptr()),
+      k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+      reinterpret_cast<const E4M3 *>(k_sf.data_ptr()), k_sf.stride(0),
+      k_sf.stride(1), reinterpret_cast<const NVFP4x2 *>(v.data_ptr()),
+      v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+      reinterpret_cast<const E4M3 *>(v_sf.data_ptr()), v_sf.stride(0),
+      v_sf.stride(1), reinterpret_cast<const float *>(alpha0.data_ptr()),
       reinterpret_cast<const float *>(alpha1.data_ptr()), B, H, Nq, Nkv, Dqk,
       Dv, 1.0f / std::sqrt(static_cast<float>(Dqk)));
 }
