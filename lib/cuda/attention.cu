@@ -42,7 +42,7 @@ constexpr int64_t HEAD_DIM_ALIGN_SIZE = 128;
 //===----------------------------------------------------------------------===//
 
 /// Block level tile size
-constexpr int TILE_DOT_BLOCK_M = 16;
+constexpr int TILE_DOT_BLOCK_M = 128;
 constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
 constexpr int TILE_DOT0_BLOCK_N = 64;
 constexpr int TILE_DOT0_BLOCK_K = 128;
@@ -51,7 +51,7 @@ constexpr int TILE_DOT1_BLOCK_N = 128;
 constexpr int TILE_DOT1_BLOCK_K = TILE_DOT0_BLOCK_N;
 
 /// Warp level tile size
-constexpr int TILE_DOT0_WARP_M = TILE_DOT_BLOCK_M;
+constexpr int TILE_DOT0_WARP_M = 32;
 constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
 constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
 constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
@@ -103,63 +103,67 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   float rcp_global_scale_value = static_cast<float>(448 * 6);
 
 #pragma unroll
-  for (int i = 0; i < N1; i += 8) {
-    uint32_t sfu32[2];
+  for (int n0 = 0; n0 < N0; ++n0) {
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+    for (int i = 0; i < N1; i += 8) {
+      uint32_t sfu32[2];
 #pragma unroll
-      for (int k = 0; k < 8; k += 4) {
-        float max = fmax(p_f32_in[0][i + k].data[j * 2],
-                         p_f32_in[0][i + k].data[j * 2 + 1]);
+      for (int j = 0; j < 2; ++j) {
 #pragma unroll
-        for (int l = 1; l < 4; ++l) {
-          max = fmax(max, p_f32_in[0][i + k + l].data[j * 2]);
-          max = fmax(max, p_f32_in[0][i + k + l].data[j * 2 + 1]);
-        }
-        max = fmax(__shfl_xor_sync(0xffffffff, max, 1), max);
-
-        /// sf
-        float sf_value = rcp_global_scale_value * (max * 0.16666666666666666f);
-        uint8_t sfu8;
-        {
-          __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
-          sfu8 = static_cast<uint16_t>(tmp.__x);
-          sf_value = static_cast<float>(tmp);
-        }
-        uint8_t sfu8_other = __shfl_xor_sync(0xffffffff, sfu8, 2);
-        uint16_t sfu16;
-        if (lane_id % 4 < 2) {
-          sfu16 = static_cast<uint16_t>(sfu8) +
-                  (static_cast<uint16_t>(sfu8_other) << 8);
-        } else {
-          sfu16 = (static_cast<uint16_t>(sfu8) << 8) +
-                  static_cast<uint16_t>(sfu8_other);
-        }
-        reinterpret_cast<uint16_t *>(&sfu32[j])[k / 4] = sfu16;
-
-        float out_scale =
-            sf_value != 0
-                ? rcp_global_scale_value * reciprocal_approximate_ftz(sf_value)
-                : 0.0f;
-
-        float in[8];
+        for (int k = 0; k < 8; k += 4) {
+          float max = fmax(p_f32_in[n0][i + k].data[j * 2],
+                           p_f32_in[n0][i + k].data[j * 2 + 1]);
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-          in[2 * m] = p_f32_in[0][i + k + m].data[j * 2] * out_scale;
-          in[2 * m + 1] = p_f32_in[0][i + k + m].data[j * 2 + 1] * out_scale;
-        }
+          for (int l = 1; l < 4; ++l) {
+            max = fmax(max, p_f32_in[n0][i + k + l].data[j * 2]);
+            max = fmax(max, p_f32_in[n0][i + k + l].data[j * 2 + 1]);
+          }
+          max = fmax(__shfl_xor_sync(0xffffffff, max, 1), max);
 
-        /// Convert 8xfloat32 to 8xe2m1(uint32)
-        uint32_t e2m1x8 = fp32_vec_to_e2m1(in);
-        p_fp4_out[0][8 * i / 64].data[j + k / 4 * 2] = e2m1x8;
-      } // end loop k
-    }
+          /// sf
+          float sf_value =
+              rcp_global_scale_value * (max * 0.16666666666666666f);
+          uint8_t sfu8;
+          {
+            __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
+            sfu8 = static_cast<uint16_t>(tmp.__x);
+            sf_value = static_cast<float>(tmp);
+          }
+          uint8_t sfu8_other = __shfl_xor_sync(0xffffffff, sfu8, 2);
+          uint16_t sfu16;
+          if (lane_id % 4 < 2) {
+            sfu16 = static_cast<uint16_t>(sfu8) +
+                    (static_cast<uint16_t>(sfu8_other) << 8);
+          } else {
+            sfu16 = (static_cast<uint16_t>(sfu8) << 8) +
+                    static_cast<uint16_t>(sfu8_other);
+          }
+          reinterpret_cast<uint16_t *>(&sfu32[j])[k / 4] = sfu16;
 
-    uint32_t sf0 = sfu32[0];
-    uint32_t sf1 = __shfl_xor_sync(0xffffffff, sfu32[1], 1);
-    uint32_t sf_final = lane_id % 4 == 0 ? sf0 : sf1;
-    sf[0][8 * i / 64] = sf_final;
-  }
+          float out_scale = sf_value != 0
+                                ? rcp_global_scale_value *
+                                      reciprocal_approximate_ftz(sf_value)
+                                : 0.0f;
+
+          float in[8];
+#pragma unroll
+          for (int m = 0; m < 4; ++m) {
+            in[2 * m] = p_f32_in[n0][i + k + m].data[j * 2] * out_scale;
+            in[2 * m + 1] = p_f32_in[n0][i + k + m].data[j * 2 + 1] * out_scale;
+          }
+
+          /// Convert 8xfloat32 to 8xe2m1(uint32)
+          uint32_t e2m1x8 = fp32_vec_to_e2m1(in);
+          p_fp4_out[n0][8 * i / 64].data[j + k / 4 * 2] = e2m1x8;
+        } // end loop k
+      } // end loop j
+
+      uint32_t sf0 = sfu32[0];
+      uint32_t sf1 = __shfl_xor_sync(0xffffffff, sfu32[1], 1);
+      uint32_t sf_final = lane_id % 4 == 0 ? sf0 : sf1;
+      sf[n0][8 * i / 64] = sf_final;
+    } // end loop i
+  } // end loop n0
 
   return;
 }
@@ -199,9 +203,9 @@ __global__ void nvfp4_mha_fwd_kernel(
   int block_dot0_n = block_dot_n;
   int block_dot1_m = block_dot_m;
   int block_dot1_n = block_dot_n;
-  int warp_dot0_m = 0;
+  int warp_dot0_m = warp_id * TILE_DOT0_WARP_M;
   int warp_dot0_n = 0;
-  int warp_dot1_m = 0;
+  int warp_dot1_m = warp_id * TILE_DOT1_WARP_M;
   int warp_dot1_n = 0;
 
   //===--------------------------------------------------------------------===//
@@ -214,11 +218,18 @@ __global__ void nvfp4_mha_fwd_kernel(
   uint32_t q_sf_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
                     [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
   /// max(row max of S=Q @ K)
-  float max0 = -INFINITY;
-  float max1 = -INFINITY;
+  float max0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+  float max1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
   /// l（sum of exp)
-  float l0 = 0;
-  float l1 = 0;
+  float l0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+  float l1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+#pragma unroll
+  for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+    max0[i] = -INFINITY;
+    max1[i] = -INFINITY;
+    l0[i] = 0.0f;
+    l1[i] = 0.0f;
+  }
   /// o: P @ V
   DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
                        [TILE_DOT1_WARP_N / TILE_ATOMIC_N];
@@ -244,7 +255,6 @@ __global__ void nvfp4_mha_fwd_kernel(
     for (int j = 0; j < TILE_DOT0_WARP_K / TILE_ATOMIC_K; ++j) {
 #pragma unroll
       for (int idx = 0; idx < q_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-        // TODO(check out-of-bound)
         // m map to N(seq)
         int m = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
                 q_frag[i][j].get_row_with_reg(lane_id, idx);
@@ -299,53 +309,62 @@ __global__ void nvfp4_mha_fwd_kernel(
 
 #pragma unroll
     for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K; dot0_k += TILE_ATOMIC_K) {
+      int dot0_atomic_k_cnt = dot0_k / TILE_ATOMIC_K;
 #pragma unroll
-      for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
-           dot0_atomic_n += TILE_ATOMIC_N) {
-        /// Load K
-        BFrag_NVFP4_64x8 k_frag;
+      for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
+           dot0_atomic_m += TILE_ATOMIC_M) {
+        int dot0_atomic_m_cnt = dot0_atomic_m / TILE_ATOMIC_M;
 #pragma unroll
-        for (int idx = 0; idx < k_frag.REGISTERS_PER_THREAD; ++idx) {
-          // map k to K's Dk(emb)
-          int k = dot0_k + k_frag.get_row_with_reg(lane_id, idx);
-          // map n to K's N(seq)
-          int n = block_dot0_n + warp_dot0_n + dot0_atomic_n +
-                  k_frag.get_col_with_reg(lane_id, idx);
-          const auto *k_tile = K + block_b * k_b_stride + block_h * k_h_stride +
-                               n * k_n_stride +
-                               k / ELES_PER_NVFP4x2 * k_d_stride;
-          k_frag.data[idx] =
-              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(k_tile);
-        }
+        for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
+             dot0_atomic_n += TILE_ATOMIC_N) {
+          int dot0_atomic_n_cnt = dot0_atomic_n / TILE_ATOMIC_N;
+          /// Load K
+          BFrag_NVFP4_64x8 k_frag;
+#pragma unroll
+          for (int idx = 0; idx < k_frag.REGISTERS_PER_THREAD; ++idx) {
+            // map k to K's Dk(emb)
+            int k = dot0_k + k_frag.get_row_with_reg(lane_id, idx);
+            // map n to K's N(seq)
+            int n = block_dot0_n + warp_dot0_n + dot0_atomic_n +
+                    k_frag.get_col_with_reg(lane_id, idx);
+            const auto *k_tile = K + block_b * k_b_stride +
+                                 block_h * k_h_stride + n * k_n_stride +
+                                 k / ELES_PER_NVFP4x2 * k_d_stride;
+            k_frag.data[idx] =
+                *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(k_tile);
+          }
 
-        /// Load K_SF
-        uint32_t k_sf_frag = 0;
-        if (lane_id % 4 == 0) {
-          // map k to quantize
-          int k = dot0_k;
-          // map n to non-quantize
-          int n = block_dot0_n + warp_dot0_n + dot0_atomic_n + (lane_id / 4);
-          const auto *k_sf_tile =
-              K_SF + (k / (BLOCK_SIZE * 4)) * k_sf_quantize_stride +
-              (block_b * Nkv * H + n * H + block_h) * k_sf_non_quantize_stride;
-          k_sf_frag = *reinterpret_cast<const uint32_t *>(k_sf_tile);
-        }
+          /// Load K_SF
+          uint32_t k_sf_frag = 0;
+          if (lane_id % 4 == 0) {
+            // map k to quantize
+            int k = dot0_k;
+            // map n to non-quantize
+            int n = block_dot0_n + warp_dot0_n + dot0_atomic_n + (lane_id / 4);
+            const auto *k_sf_tile =
+                K_SF + (k / (BLOCK_SIZE * 4)) * k_sf_quantize_stride +
+                (block_b * Nkv * H + n * H + block_h) *
+                    k_sf_non_quantize_stride;
+            k_sf_frag = *reinterpret_cast<const uint32_t *>(k_sf_tile);
+          }
 
-        /// Dot0
-        fma(s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[0],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[1],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[2],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[3],
-            q_frag[0][dot0_k / TILE_ATOMIC_K].data[0],
-            q_frag[0][dot0_k / TILE_ATOMIC_K].data[1],
-            q_frag[0][dot0_k / TILE_ATOMIC_K].data[2],
-            q_frag[0][dot0_k / TILE_ATOMIC_K].data[3], k_frag.data[0],
-            k_frag.data[1], s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[0],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[1],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[2],
-            s_frag[0][dot0_atomic_n / TILE_ATOMIC_N].data[3],
-            q_sf_frag[0][dot0_k / TILE_ATOMIC_K], k_sf_frag);
-      } // end loop dot0_atomic_n
+          /// Dot0
+          fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+              k_frag.data[0], k_frag.data[1],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+              q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+        } // end loop dot0_atomic_n
+      } // end loop dot0_atomic_m
     } // end loop dot0_k
 
     /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
@@ -363,50 +382,68 @@ __global__ void nvfp4_mha_fwd_kernel(
     }
 
     /// Step 2: max = rowmax(S): 40 cycles
-    float max_new0 = max0;
-    float max_new1 = max1;
+    float max_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float max_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++i) {
-      max_new0 = fmaxf(max_new0, s_frag[0][i].data[0]);
-      max_new0 = fmaxf(max_new0, s_frag[0][i].data[1]);
-      max_new1 = fmaxf(max_new1, s_frag[0][i].data[2]);
-      max_new1 = fmaxf(max_new1, s_frag[0][i].data[3]);
-    }
-    max_new0 = fmaxf(__shfl_xor_sync(0xffffffff, max_new0, 1), max_new0);
-    max_new0 = fmaxf(__shfl_xor_sync(0xffffffff, max_new0, 2), max_new0);
-    max_new1 = fmaxf(__shfl_xor_sync(0xffffffff, max_new1, 1), max_new1);
-    max_new1 = fmaxf(__shfl_xor_sync(0xffffffff, max_new1, 2), max_new1);
+    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+      max_new0[i] = max0[i];
+      max_new1[i] = max1[i];
+#pragma unroll
+      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+        max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
+        max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
+        max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
+        max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
+      } // end loop j
+      max_new0[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
+      max_new0[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2), max_new0[i]);
+      max_new1[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
+      max_new1[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
+    } // end loop i
 
     /// Step 3: p = exp(S - max)
     ///         160 cycles
     DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
                          [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++i) {
-      p_frag[0][i].data[0] = expf(s_frag[0][i].data[0] - max_new0);
-      p_frag[0][i].data[1] = expf(s_frag[0][i].data[1] - max_new0);
-      p_frag[0][i].data[2] = expf(s_frag[0][i].data[2] - max_new1);
-      p_frag[0][i].data[3] = expf(s_frag[0][i].data[3] - max_new1);
-    }
+    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+        p_frag[i][j].data[0] = expf(s_frag[i][j].data[0] - max_new0[i]);
+        p_frag[i][j].data[1] = expf(s_frag[i][j].data[1] - max_new0[i]);
+        p_frag[i][j].data[2] = expf(s_frag[i][j].data[2] - max_new1[i]);
+        p_frag[i][j].data[3] = expf(s_frag[i][j].data[3] - max_new1[i]);
+      } // end loop j
+    } // end loop i
 
     /// Step 4: l = sum(p)
     ///         14 + 4 * 2 + 2 * 7 = 36 cycles
-    float l_new0 = p_frag[0][0].data[0] + p_frag[0][0].data[1];
-    float l_new1 = p_frag[0][0].data[2] + p_frag[0][0].data[3];
+    float l_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float l_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
-    for (int i = 1; i < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++i) {
-      l_new0 += p_frag[0][i].data[0];
-      l_new0 += p_frag[0][i].data[1];
-      l_new1 += p_frag[0][i].data[2];
-      l_new1 += p_frag[0][i].data[3];
-    }
-    l_new0 += __shfl_xor_sync(0xffffffff, l_new0, 1);
-    l_new0 += __shfl_xor_sync(0xffffffff, l_new0, 2);
-    l_new1 += __shfl_xor_sync(0xffffffff, l_new1, 1);
-    l_new1 += __shfl_xor_sync(0xffffffff, l_new1, 2);
-    // Update l
-    l0 = expf(max0 - max_new0) * l0 + l_new0;
-    l1 = expf(max1 - max_new1) * l1 + l_new1;
+    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+      l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
+      l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
+#pragma unroll
+      for (int j = 1; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+        l_new0[i] += p_frag[i][j].data[0];
+        l_new0[i] += p_frag[i][j].data[1];
+        l_new1[i] += p_frag[i][j].data[2];
+        l_new1[i] += p_frag[i][j].data[3];
+      } // end loop j
+      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 1);
+      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
+      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
+      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
+
+      // Update l
+      l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
+      l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+    } // end loop i
 
     /// Step 4: o = expf(max - max_new) * o
     ///         4 * 8 + 2 = 34
@@ -415,15 +452,18 @@ __global__ void nvfp4_mha_fwd_kernel(
     for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
       for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-        o_frag[i][j].data[0] *= expf(max0 - max_new0);
-        o_frag[i][j].data[1] *= expf(max0 - max_new0);
-        o_frag[i][j].data[2] *= expf(max1 - max_new1);
-        o_frag[i][j].data[3] *= expf(max1 - max_new1);
+        o_frag[i][j].data[0] *= expf(max0[i] - max_new0[i]);
+        o_frag[i][j].data[1] *= expf(max0[i] - max_new0[i]);
+        o_frag[i][j].data[2] *= expf(max1[i] - max_new1[i]);
+        o_frag[i][j].data[3] *= expf(max1[i] - max_new1[i]);
       }
     }
-    /// Update max
-    max0 = max_new0;
-    max1 = max_new1;
+/// Update max
+#pragma unroll
+    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+      max0[i] = max_new0[i];
+      max1[i] = max_new1[i];
+    }
 
     /// Step 5: quantize P from f32 to nvfp4
     AFrag_NVFP4_16x64 p_fp4_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
@@ -439,58 +479,66 @@ __global__ void nvfp4_mha_fwd_kernel(
 #pragma unroll
     for (int dot1_atomic_k = 0; dot1_atomic_k < TILE_DOT1_BLOCK_K;
          dot1_atomic_k += TILE_ATOMIC_K) {
+      int dot1_atomic_k_cnt = dot1_atomic_k / TILE_ATOMIC_K;
 #pragma unroll
-      for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
-           dot1_atomic_n += TILE_ATOMIC_N) {
-        /// Load V
-        BFrag_NVFP4_64x8 v_frag;
+      for (int dot1_atomic_m = 0; dot1_atomic_m < TILE_DOT1_WARP_M;
+           dot1_atomic_m += TILE_ATOMIC_M) {
+        int dot1_atomic_m_cnt = dot1_atomic_m / TILE_ATOMIC_M;
 #pragma unroll
-        for (int idx = 0; idx < v_frag.REGISTERS_PER_THREAD; ++idx) {
-          // map k to V's N(seq)
-          int k =
-              dot1_k + dot1_atomic_k + v_frag.get_row_with_reg(lane_id, idx);
-          // map n to V's D(emb)
-          int n = block_dot1_n + warp_dot1_n + dot1_atomic_n +
-                  v_frag.get_col_with_reg(lane_id, idx);
+        for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
+             dot1_atomic_n += TILE_ATOMIC_N) {
+          int dot1_atomic_n_cnt = dot1_atomic_n / TILE_ATOMIC_N;
+          /// Load V
+          BFrag_NVFP4_64x8 v_frag;
+#pragma unroll
+          for (int idx = 0; idx < v_frag.REGISTERS_PER_THREAD; ++idx) {
+            // map k to V's N(seq)
+            int k =
+                dot1_k + dot1_atomic_k + v_frag.get_row_with_reg(lane_id, idx);
+            // map n to V's D(emb)
+            int n = block_dot1_n + warp_dot1_n + dot1_atomic_n +
+                    v_frag.get_col_with_reg(lane_id, idx);
 
-          const auto *v_tile = V + block_b * v_b_stride + block_h * v_h_stride +
-                               n * v_d_stride +
-                               k / ELES_PER_NVFP4x2 * v_n_stride;
-          v_frag.data[idx] =
-              *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(v_tile);
-        }
+            const auto *v_tile = V + block_b * v_b_stride +
+                                 block_h * v_h_stride + n * v_d_stride +
+                                 k / ELES_PER_NVFP4x2 * v_n_stride;
+            v_frag.data[idx] =
+                *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(v_tile);
+          }
 
-        /// Load V_SF
-        /// V_SF layout: [N/64, B * H * D, 4]xuint8
-        uint32_t v_sf_frag = 0;
-        if (lane_id % 4 == 0) {
-          // map n to V's D(emb)
-          int n = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
-          // map k to V's N(seq)
-          int k = dot1_k + dot1_atomic_k;
+          /// Load V_SF
+          /// V_SF layout: [N/64, B * H * D, 4]xuint8
+          uint32_t v_sf_frag = 0;
+          if (lane_id % 4 == 0) {
+            // map n to V's D(emb)
+            int n = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
+            // map k to V's N(seq)
+            int k = dot1_k + dot1_atomic_k;
 
-          const auto *v_sf_tile =
-              V_SF + (k / (BLOCK_SIZE * 4)) * v_sf_quantize_stride +
-              (block_b * H * Dv + block_h * Dv + n) * v_sf_non_quantize_stride;
-          v_sf_frag = *reinterpret_cast<const uint32_t *>(v_sf_tile);
-        }
+            const auto *v_sf_tile =
+                V_SF + (k / (BLOCK_SIZE * 4)) * v_sf_quantize_stride +
+                (block_b * H * Dv + block_h * Dv + n) *
+                    v_sf_non_quantize_stride;
+            v_sf_frag = *reinterpret_cast<const uint32_t *>(v_sf_tile);
+          }
 
-        /// Dot1
-        fma(o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[0],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[1],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[2],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[3],
-            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[0],
-            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[1],
-            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[2],
-            p_fp4_frag[0][dot1_atomic_k / TILE_ATOMIC_K].data[3],
-            v_frag.data[0], v_frag.data[1],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[0],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[1],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[2],
-            o_frag[0][dot1_atomic_n / TILE_ATOMIC_N].data[3],
-            p_fp4_sf_frag[0][dot1_atomic_k / TILE_ATOMIC_K], v_sf_frag);
-      } // end loop dot1_atomic_n
+          /// Dot1
+          fma(o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
+              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[0],
+              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[1],
+              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[2],
+              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[3],
+              v_frag.data[0], v_frag.data[1],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
+              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
+              p_fp4_sf_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt], v_sf_frag);
+        } // end loop dot1_atomic_n
+      } // end loop dot1_atomic_m
     } // end loop dot1_atomic_k
   } // end loop dot0_n/dot1_k
 
@@ -502,8 +550,8 @@ __global__ void nvfp4_mha_fwd_kernel(
 
   for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
     for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-      float scale0 = (1.0f / l0) * (1.0f / (448 * 6)) * *alpha1;
-      float scale1 = (1.0f / l1) * (1.0f / (448 * 6)) * *alpha1;
+      float scale0 = (1.0f / l0[i]) * (1.0f / (448 * 6)) * *alpha1;
+      float scale1 = (1.0f / l1[i]) * (1.0f / (448 * 6)) * *alpha1;
       o_frag[i][j].data[0] *= scale0;
       o_frag[i][j].data[1] *= scale0;
       o_frag[i][j].data[2] *= scale1;

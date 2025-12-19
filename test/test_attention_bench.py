@@ -131,7 +131,7 @@ def test_attention_bench(B, N, H, D):
                 o[b, :, h, :] = o_sub
 
         print("o ref:")
-        print(o[:2, :2, :2, :2])
+        print(o)
 
         return o.reshape(B, N, H, D)
 
@@ -153,7 +153,7 @@ def test_attention_bench(B, N, H, D):
             1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
 
         print("o sdp:")
-        print(o[:2, :2, :2, :2])
+        print(o)
 
         return o
 
@@ -188,7 +188,7 @@ def test_attention_bench(B, N, H, D):
                             v_alpha, o)
 
         print("o ac4k:")
-        print(o[:2, :2, :2, :2])
+        print(o)
 
         return o
 
@@ -197,6 +197,14 @@ def test_attention_bench(B, N, H, D):
     o_ref = get_ref(q, k, v, B, N, H, D)
     o_sdp = get_sdp(q, k, v)
     o = get_ac4k(q, k, v, B, N, H, D)
+
+    # # torch.save(o, "{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
+    # o_backup = loaded_x = torch.load("{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
+    # torch.testing.assert_close(o.view(torch.uint16), o_backup.view(torch.uint16))
+
+    # o = o[0, :, 0, :]
+    # o_sdp = o_sdp[0, :, 0, :]
+    # o_ref = o_ref[0, :, 0, :]
 
     similarity = cosine_similarity_4d_global(o, o_sdp)
     print(f"o vs o_sdp 整体余弦相似度: {similarity:.4f}")
