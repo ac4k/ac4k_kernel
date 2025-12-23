@@ -25,10 +25,6 @@ def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
 
 
 def test_attention_bench(B, N, H, D):
-    B = 11
-    N = 128
-    H = 12
-    D = 128
     q = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
     k = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
     v = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
@@ -158,34 +154,19 @@ def test_attention_bench(B, N, H, D):
         return o
 
     def get_ac4k(q, k, v, B, N, H, D):
-        # ## new2
-        # q = q.view(B, N, H, -1)
-        # q_fp4, q_sf, q_alpha = quantize(q, dim=-1)
-
-        # k = k.view(B, N, H, -1)
-        # k_fp4, k_sf, k_alpha = quantize(k, dim=-1)
-
-        # qk_alpha = q_alpha * k_alpha
-
-        # v = v.view(B, N, H, -1)
-        # v_fp4, v_sf, v_alpha = quantize(v, dim=1, swizzle=True)
-
-        # o = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
-        # o = nvfp4_attention(q_fp4, k_fp4, v_fp4, q_sf, k_sf, v_sf, qk_alpha,
-        #                     v_alpha, o)
-
         ## new2
-        q_fp4, q_sf, q_alpha = quantize(q, dim=-1)
+        q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
 
-        k_fp4, k_sf, k_alpha = quantize(k, dim=-1)
+        k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
 
         qk_alpha = q_alpha * k_alpha
 
-        v_fp4, v_sf, v_alpha = quantize(v, dim=1, swizzle=True)
+        v_fp4, v_sf, v_alpha = quantize(v, 3, 1, swizzle=True)
 
-        o = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+        o = torch.empty((B, H, N, D), dtype=torch.bfloat16, device="cuda")
         o = nvfp4_attention(q_fp4, k_fp4, v_fp4, q_sf, k_sf, v_sf, qk_alpha,
                             v_alpha, o)
+        o = o.transpose(1, 2).contiguous()
 
         print("o ac4k:")
         print(o)
@@ -198,13 +179,9 @@ def test_attention_bench(B, N, H, D):
     o_sdp = get_sdp(q, k, v)
     o = get_ac4k(q, k, v, B, N, H, D)
 
-    # # torch.save(o, "{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
+    # torch.save(o, "{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
     # o_backup = loaded_x = torch.load("{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
     # torch.testing.assert_close(o.view(torch.uint16), o_backup.view(torch.uint16))
-
-    # o = o[0, :, 0, :]
-    # o_sdp = o_sdp[0, :, 0, :]
-    # o_ref = o_ref[0, :, 0, :]
 
     similarity = cosine_similarity_4d_global(o, o_sdp)
     print(f"o vs o_sdp 整体余弦相似度: {similarity:.4f}")
@@ -213,9 +190,10 @@ def test_attention_bench(B, N, H, D):
     similarity2 = cosine_similarity_4d_global(o_ref, o_sdp)
     print(f"o_ref vs o_sdp 整体余弦相似度2: {similarity2:.4f}")
 
-    torch.testing.assert_close(o, o_ref, atol=2e-1, rtol=1e-1)
+    torch.testing.assert_close(o, o_sdp, atol=2e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":
     torch.manual_seed(9567)
     test_attention_bench(1, 64, 1, 128)
+    test_attention_bench(2, 128, 3, 128)

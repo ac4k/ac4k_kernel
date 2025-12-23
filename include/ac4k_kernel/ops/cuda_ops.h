@@ -12,8 +12,8 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
 
 void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                     torch::Tensor const &in,
-                    torch::Tensor const &rcp_global_scale, uint32_t dim,
-                    bool swizzle);
+                    torch::Tensor const &rcp_global_scale, uint32_t cross_dim,
+                    uint32_t reduce_dim, bool swizzle);
 
 void nvfp4_quant_sm120(torch::Tensor &output, torch::Tensor &output_sf,
                        torch::Tensor const &input,

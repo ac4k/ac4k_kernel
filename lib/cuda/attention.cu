@@ -36,6 +36,7 @@ constexpr int ELES_PER_NVFP4x2 = 2;
 constexpr int64_t HEAD_DIM_SIZE = 128;
 constexpr int64_t BLOCK_SIZE = 16;
 constexpr int64_t HEAD_DIM_ALIGN_SIZE = 128;
+constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 
 //===----------------------------------------------------------------------===//
 // Define tile size for block level, warp level and atomic level
@@ -60,20 +61,195 @@ constexpr int TILE_DOT1_WARP_K = TILE_DOT1_BLOCK_K;
 
 constexpr int WARP_NUM =
     TILE_DOT0_BLOCK_M / TILE_DOT0_WARP_M * TILE_DOT0_BLOCK_N / TILE_DOT0_WARP_N;
+constexpr int WARP_SIZE = 32;
 
 /// Atomic level tile size
 constexpr int TILE_ATOMIC_M = 16;
 constexpr int TILE_ATOMIC_N = 8;
 constexpr int TILE_ATOMIC_K = 64;
 
-// Fast reciprocal.
+/// Tile size
+constexpr int TILE_Q_BLOCK_ELES = TILE_DOT0_BLOCK_M * TILE_DOT0_BLOCK_K;
+constexpr int TILE_K_BLOCK_ELES = TILE_DOT0_BLOCK_K * TILE_DOT0_BLOCK_N;
+constexpr int TILE_V_BLOCK_ELES = TILE_DOT1_BLOCK_K * TILE_DOT1_BLOCK_N;
+constexpr int TILE_Q_SF_BLOCK_ELES = TILE_Q_BLOCK_ELES / BLOCK_SIZE;
+constexpr int TILE_K_SF_BLOCK_ELES = TILE_K_BLOCK_ELES / BLOCK_SIZE;
+constexpr int TILE_V_SF_BLOCK_ELES = TILE_V_BLOCK_ELES / BLOCK_SIZE;
+constexpr int TILE_Q_BLOCK_SIZE =
+    TILE_Q_BLOCK_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+constexpr int TILE_K_BLOCK_SIZE =
+    TILE_K_BLOCK_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+constexpr int TILE_V_BLOCK_SIZE =
+    TILE_V_BLOCK_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+constexpr int TILE_Q_SF_BLOCK_SIZE = TILE_Q_SF_BLOCK_ELES * sizeof(E4M3);
+constexpr int TILE_K_SF_BLOCK_SIZE = TILE_K_SF_BLOCK_ELES * sizeof(E4M3);
+constexpr int TILE_V_SF_BLOCK_SIZE = TILE_V_SF_BLOCK_ELES * sizeof(E4M3);
+
+//===----------------------------------------------------------------------===//
+// Define mutiple buffer stage
+//===----------------------------------------------------------------------===//
+
+const int STAGE = 2;
+
+//===----------------------------------------------------------------------===//
+// Consumer & Producer
+//===----------------------------------------------------------------------===//
+
+const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
+const int PRODUCER_THREAD_NUM = 32;
+
+//===----------------------------------------------------------------------===//
+// Create tma tensor map
+//===----------------------------------------------------------------------===//
+
+template <int Dim0, int Dim1, int Dim2, int Dim3, CUtensorMapDataType DataType,
+          typename T, CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+static __forceinline__ CUtensorMap create_4d_tensor_map(const T *gmem_ptr,
+                                                        uint64_t global_dim0,
+                                                        uint64_t global_dim1,
+                                                        uint64_t global_dim2,
+                                                        uint64_t global_dim3) {
+  int BPE = sizeof(T);
+
+  CUtensorMap template_tensor_map{};
+  void *gmem_address = (void *)gmem_ptr;
+  uint64_t gmem_prob_shape[5] = {global_dim3, global_dim2, global_dim1,
+                                 global_dim0, 1};
+  uint64_t gmem_prob_stride[5] = {
+      static_cast<uint64_t>(BPE), static_cast<uint64_t>(BPE * global_dim3),
+      static_cast<uint64_t>(BPE * global_dim3 * global_dim2),
+      static_cast<uint64_t>(BPE * global_dim3 * global_dim2 * global_dim1), 0};
+  uint32_t smem_box_shape[5] = {
+      static_cast<uint32_t>(Dim3), static_cast<uint32_t>(Dim2),
+      static_cast<uint32_t>(Dim1), static_cast<uint32_t>(Dim0), 1};
+  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+  CHECK_CUDA_DRIVER_ERROR(cuTensorMapEncodeTiled(
+      &template_tensor_map, DataType, 4, gmem_address, gmem_prob_shape,
+      gmem_prob_stride + 1, smem_box_shape, smem_box_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+  return template_tensor_map;
+}
+
+//===----------------------------------------------------------------------===//
+// Swizzle
+//===----------------------------------------------------------------------===//
+
+template <CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+struct SwizzleIndexMap {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    return col;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_128B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    int int4_row = row;
+    int int4_col = col * bpe / sizeof(int4);
+    return ((int4_row % 8) ^ int4_col) * sizeof(int4) / bpe;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_64B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    int new_row = row * 64 / 128;
+    int new_col = col * bpe / sizeof(int4);
+    int row_swiz = new_row;
+    int col_swiz = (row_swiz % 4) ^ new_col;
+    return col_swiz * sizeof(int4) / bpe;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Mbarrier
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ void init_barrier(uint64_t *bar, int count) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
+               "r"(count));
+}
+
+__device__ static __forceinline__ void expect_bytes(uint64_t *bar,
+                                                    uint32_t bytes) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n" ::
+          "r"(bar_ptr),
+      "r"(bytes));
+}
+
+__device__ static __forceinline__ void wait(uint64_t *bar, int phase) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n"
+      ".reg .pred                P1;\n"
+      "LAB_WAIT:\n"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+      "@P1                       bra.uni DONE;\n"
+      "bra.uni                   LAB_WAIT;\n"
+      "DONE:\n"
+      "}\n" ::"r"(mbar_ptr),
+      "r"(phase));
+}
+
+__device__ static __forceinline__ void arrive(uint64_t *bar,
+                                              uint32_t count = 1) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+               :
+               : "r"(mbar_ptr), "r"(count)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
+// TMA with mbarrier
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ void
+load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
+              int off1, int off2, int off3) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+  asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::"
+               "complete_tx::bytes"
+               " [%0], [%1, {%3, %4, %5, %6}], [%2];"
+               :
+               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(off3),
+                 "r"(off2), "r"(off1), "r"(off0)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
+// Fast reciprocal
+//===----------------------------------------------------------------------===//
+
 __forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
   float b;
   asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
   return b;
 }
 
-// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+//===----------------------------------------------------------------------===//
+// Convert 8xfloat32 to 8xNVFP4 (represented as one uint32_t)
+//===----------------------------------------------------------------------===//
+
 __forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
   uint32_t val;
   asm volatile("{\n"
@@ -168,26 +344,37 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
-__global__ void nvfp4_mha_fwd_kernel(
-    BF16 *O, int64_t o_b_stride, int64_t o_n_stride, int64_t o_h_stride,
-    int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
-    int64_t q_n_stride, int64_t q_h_stride, int64_t q_d_stride,
-    const E4M3 *Q_SF, int64_t q_sf_quantize_stride,
-    int64_t q_sf_non_quantize_stride, const NVFP4x2 *K, int64_t k_b_stride,
-    int64_t k_n_stride, int64_t k_h_stride, int64_t k_d_stride,
-    const E4M3 *K_SF, int64_t k_sf_quantize_stride,
-    int64_t k_sf_non_quantize_stride, const NVFP4x2 *V, int64_t v_b_stride,
-    int64_t v_h_stride, int64_t v_d_stride, int64_t v_n_stride,
-    const E4M3 *V_SF, int64_t v_sf_quantize_stride,
-    int64_t v_sf_non_quantize_stride, const float *alpha0, const float *alpha1,
-    int64_t B, int64_t H, int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv,
-    float qk_norm) {
+template <CUtensorMapSwizzle Swizzle>
+__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+    void nvfp4_mha_fwd_kernel(
+        BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
+        int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
+        int64_t q_n_stride, int64_t q_h_stride, int64_t q_d_stride,
+        const E4M3 *Q_SF, int64_t q_sf_quantize_stride,
+        int64_t q_sf_non_quantize_stride, const NVFP4x2 *K, int64_t k_b_stride,
+        int64_t k_n_stride, int64_t k_h_stride, int64_t k_d_stride,
+        const E4M3 *K_SF, int64_t k_sf_quantize_stride,
+        int64_t k_sf_non_quantize_stride, const NVFP4x2 *V, int64_t v_b_stride,
+        int64_t v_h_stride, int64_t v_d_stride, int64_t v_n_stride,
+        const E4M3 *V_SF, int64_t v_sf_quantize_stride,
+        int64_t v_sf_non_quantize_stride, const float *alpha0,
+        const float *alpha1, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
+        int64_t Dqk, int64_t Dv, float qk_norm,
+        const __grid_constant__ CUtensorMap q_tensor_map,
+        const __grid_constant__ CUtensorMap k_tensor_map,
+        const __grid_constant__ CUtensorMap v_tensor_map,
+        const __grid_constant__ CUtensorMap q_sf_tensor_map,
+        const __grid_constant__ CUtensorMap k_sf_tensor_map,
+        const __grid_constant__ CUtensorMap v_sf_tensor_map) {
   int block_b = blockIdx.x;                    // batch
   int block_h = blockIdx.y;                    // head
   int block_n = blockIdx.z * TILE_DOT_BLOCK_M; // seq
 
-  int lane_id = threadIdx.x % 32;
-  int warp_id = threadIdx.y;
+  int tid = threadIdx.x;
+  int lane_id = tid % 32;
+  int warp_id = tid / 32;
+  bool is_consumer = tid < CONSUMER_THREAD_NUM;
+  bool is_producer = tid >= CONSUMER_THREAD_NUM;
 
   // dot0 = q @ k
   // dot1 = p @ v
@@ -246,352 +433,495 @@ __global__ void nvfp4_mha_fwd_kernel(
   }
 
   //===--------------------------------------------------------------------===//
-  // Pre-load Q && Q_SF
+  // Define shared memory for q, k and v
   //===--------------------------------------------------------------------===//
 
+  extern __shared__ __align__(1024) NVFP4x2 smem[];
+  NVFP4x2 *q_shared = smem;
+  NVFP4x2 *k_shared = q_shared + TILE_Q_BLOCK_ELES / ELES_PER_NVFP4x2;
+  NVFP4x2 *v_shared = k_shared + TILE_K_BLOCK_ELES / ELES_PER_NVFP4x2 * STAGE;
+  E4M3 *sf_smem = reinterpret_cast<E4M3 *>(
+      v_shared + TILE_V_BLOCK_ELES / ELES_PER_NVFP4x2 * STAGE);
+  E4M3 *q_sf_shared = sf_smem;
+  E4M3 *k_sf_shared = q_sf_shared + TILE_Q_SF_BLOCK_ELES * STAGE;
+  E4M3 *v_sf_shared = k_sf_shared + TILE_K_SF_BLOCK_ELES * STAGE;
+  auto get_q_stage_mem = [&](int stage) {
+    (void)stage;
+    return q_shared;
+  };
+  auto get_k_stage_mem = [&](int stage) {
+    return k_shared + TILE_K_BLOCK_ELES / ELES_PER_NVFP4x2 * stage;
+  };
+  auto get_v_stage_mem = [&](int stage) {
+    return v_shared + TILE_V_BLOCK_ELES / ELES_PER_NVFP4x2 * stage;
+  };
+  auto get_q_sf_stage_mem = [&](int stage) {
+    return q_sf_shared + TILE_Q_SF_BLOCK_ELES * stage;
+  };
+  auto get_k_sf_stage_mem = [&](int stage) {
+    return k_sf_shared + TILE_K_SF_BLOCK_ELES * stage;
+  };
+  auto get_v_sf_stage_mem = [&](int stage) {
+    return v_sf_shared + TILE_V_SF_BLOCK_ELES * stage;
+  };
+
+  //===--------------------------------------------------------------------===//
+  // Define brrier for a and b tma
+  //===--------------------------------------------------------------------===//
+
+  __shared__ __align__(8) uint64_t empty_bar[STAGE];
+  __shared__ __align__(8) uint64_t full_bar[STAGE];
+  if (is_producer) {
 #pragma unroll
-  for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-    for (int j = 0; j < TILE_DOT0_WARP_K / TILE_ATOMIC_K; ++j) {
-#pragma unroll
-      for (int idx = 0; idx < q_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-        // m map to N(seq)
-        int m = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
-                q_frag[i][j].get_row_with_reg(lane_id, idx);
-        // k map to Dqk(emb)
-        int k = j * TILE_ATOMIC_K + q_frag[i][j].get_col_with_reg(lane_id, idx);
-        const auto *q_tile = Q + block_b * q_b_stride + block_h * q_h_stride +
-                             m * q_n_stride + k / ELES_PER_NVFP4x2 * q_d_stride;
-        q_frag[i][j].data[idx] =
-            *reinterpret_cast<const AFrag_NVFP4_16x64::REG_TYPE *>(q_tile);
-      }
+    for (int i = 0; i < STAGE; ++i) {
+      init_barrier(&empty_bar[i], WARP_NUM);
+      init_barrier(&full_bar[i], 1);
     }
   }
+  asm volatile("barrier.cluster.arrive;\n" : :);
+  asm volatile("barrier.cluster.wait;\n" : :);
 
+  //===--------------------------------------------------------------------===//
+  // Producer
+  //===--------------------------------------------------------------------===//
+
+  if (is_producer && tid == CONSUMER_THREAD_NUM) {
+    int stage = 0;
+    int phase = 0;
+
+    /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
+
+    /// Acquire
+    wait(&empty_bar[stage], phase);
+    load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
+                  block_b, block_h, block_dot_m, 0);
+    load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map, &full_bar[stage],
+                  block_b, block_h, 0, block_dot_m);
+    load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
+                  block_b, block_h, 0, 0);
+    load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map, &full_bar[stage],
+                  block_b, block_h, 0, 0);
+    load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
+                  block_b, block_h, 0, 0);
+    load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map, &full_bar[stage],
+                  block_b, block_h, 0, 0);
+    /// Commit
+    expect_bytes(&full_bar[stage],
+                 TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                     TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
+                     TILE_V_SF_BLOCK_SIZE);
+
+    ++stage;
+
+    /// Next
+    for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
+         dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
+
+      /// Acquire
+      wait(&empty_bar[stage], phase);
+
+      /// TMA K/V and K_SF/V_SF
+      load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
+                    block_b, block_h, dot0_n, 0);
+      load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, dot0_n);
+      load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
+                    block_b, block_h, 0, dot0_n / ELES_PER_NVFP4x2);
+      load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
+                    &full_bar[stage], block_b, block_h,
+                    dot0_n / (BLOCK_SIZE * 4), 0);
+
+      /// Commit
+      expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                                         TILE_K_SF_BLOCK_SIZE +
+                                         TILE_V_SF_BLOCK_SIZE);
+    }
+  } // end if (is_producer)
+
+  //===--------------------------------------------------------------------===//
+  // Consumer
+  //===--------------------------------------------------------------------===//
+
+  if (is_consumer) {
+    if (lane_id == 0) {
 #pragma unroll
-  for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-    for (int j = 0; j < TILE_DOT0_WARP_K / TILE_ATOMIC_K; ++j) {
-      if (lane_id % 4 < 2) {
-        // m map to non-quantize
-        int m = block_dot0_m + warp_dot0_m + i * TILE_ATOMIC_M +
-                (lane_id % 2) * 8 + lane_id / 4;
-        // k map to quantize
-        int k = j * TILE_ATOMIC_K;
-        const auto *q_sf_tile =
-            Q_SF + (k / (BLOCK_SIZE * 4)) * q_sf_quantize_stride +
-            (block_b * Nq * H + m * H + block_h) * q_sf_non_quantize_stride;
-        q_sf_frag[i][j] = *reinterpret_cast<const uint32_t *>(q_sf_tile);
+      for (int i = 0; i < STAGE; ++i) {
+        arrive(&empty_bar[i], 1);
       }
     }
-  }
 
-  for (int dot0_n = 0; dot0_n < DOT0_N; dot0_n += TILE_DOT0_BLOCK_N) {
-    block_dot0_n = dot0_n;
+    for (int dot0_n = 0, stage = 0, phase = 0; dot0_n < DOT0_N;
+         dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
 
-    /// S
-    DFrag_F32_16x8 s_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                         [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
+      block_dot0_n = dot0_n;
+
+      /// Wait
+      wait(&full_bar[stage], phase);
+
+      if (dot0_n == 0) {
+        /// Load shared to fragment for Q/Q_SF operand
+
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+        for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
-      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+          for (int j = 0; j < TILE_DOT0_WARP_K / TILE_ATOMIC_K; ++j) {
+            /// Q
+            int *q_regs = (int *)q_frag[i][j].data;
+            int q_shared_row = warp_dot0_m + i * TILE_ATOMIC_M + (lane_id % 16);
+            int q_shared_col =
+                (j * TILE_ATOMIC_K + (lane_id / 16) * 32) / ELES_PER_NVFP4x2;
+            int q_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                q_shared_row, q_shared_col, sizeof(NVFP4x2));
+            int q_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                q_shared_row, q_shared_col, sizeof(NVFP4x2));
+            uint32_t q_addr = __cvta_generic_to_shared(
+                get_q_stage_mem(stage) +
+                q_shared_row_swiz * TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2 +
+                q_shared_col_swiz);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(q_regs[0]), "=r"(q_regs[1]), "=r"(q_regs[2]),
+                           "=r"(q_regs[3])
+                         : "r"(q_addr));
+
+            /// Q_SF
+            if (lane_id % 4 < 2) {
+              // m map to non-quantize
+              int m = warp_dot0_m + i * TILE_ATOMIC_M + (lane_id % 2) * 8 +
+                      lane_id / 4;
+              // k map to quantize
+              int k = j * TILE_ATOMIC_K;
+              const auto *q_sf_tile =
+                  get_q_sf_stage_mem(stage) +
+                  (k / (BLOCK_SIZE * 4)) * TILE_DOT0_BLOCK_M * 4 + m * 4;
+              q_sf_frag[i][j] = *reinterpret_cast<const uint32_t *>(q_sf_tile);
+            }
+          } // end loop i
+        } // end loop j
+      } // end if (dot0_n == 0) leading
+
+      /// S
+      DFrag_F32_16x8 s_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                           [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
 #pragma unroll
-        for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-          /// Clear s fragment
-          s_frag[i][j].data[k] = 0.0f;
+      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+          for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+            /// Clear s fragment
+            s_frag[i][j].data[k] = 0.0f;
+          }
         }
       }
-    }
 
-    /// Step 0: S = Q @ K
-    ///      16x64x128=> 16*8*2=256 cycles
+      /// Step 0: S = Q @ K
+      ///      16x64x128=> 16*8*2=256 cycles
 
 #pragma unroll
-    for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K; dot0_k += TILE_ATOMIC_K) {
-      int dot0_atomic_k_cnt = dot0_k / TILE_ATOMIC_K;
+      for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K;
+           dot0_k += TILE_ATOMIC_K) {
+        int dot0_atomic_k_cnt = dot0_k / TILE_ATOMIC_K;
 #pragma unroll
-      for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
-           dot0_atomic_m += TILE_ATOMIC_M) {
-        int dot0_atomic_m_cnt = dot0_atomic_m / TILE_ATOMIC_M;
+        for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
+             dot0_atomic_m += TILE_ATOMIC_M) {
+          int dot0_atomic_m_cnt = dot0_atomic_m / TILE_ATOMIC_M;
 #pragma unroll
-        for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
-             dot0_atomic_n += TILE_ATOMIC_N) {
-          int dot0_atomic_n_cnt = dot0_atomic_n / TILE_ATOMIC_N;
-          /// Load K
-          BFrag_NVFP4_64x8 k_frag;
+          for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
+               dot0_atomic_n += TILE_ATOMIC_N) {
+            int dot0_atomic_n_cnt = dot0_atomic_n / TILE_ATOMIC_N;
+            /// Load K
+            BFrag_NVFP4_64x8 k_frag;
+            {
+              int *k_regs = (int *)k_frag.data;
+              int k_shared_row = warp_dot0_n + dot0_atomic_n + (lane_id % 8);
+              int k_shared_col =
+                  (dot0_k + ((lane_id % 16) / 8) * 32) / ELES_PER_NVFP4x2;
+              int k_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                  k_shared_row, k_shared_col, sizeof(NVFP4x2));
+              int k_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                  k_shared_row, k_shared_col, sizeof(NVFP4x2));
+              uint32_t k_addr = __cvta_generic_to_shared(
+                  get_k_stage_mem(stage) +
+                  k_shared_row_swiz * TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2 +
+                  k_shared_col_swiz);
+              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                           "{%0, %1}, [%2];"
+                           : "=r"(k_regs[0]), "=r"(k_regs[1])
+                           : "r"(k_addr));
+            }
+            /// Load K_SF
+            uint32_t k_sf_frag = 0;
+            if (lane_id % 4 == 0) {
+              // map k to quantize
+              int k = dot0_k;
+              // map n to non-quantize
+              int n = warp_dot0_n + dot0_atomic_n + (lane_id / 4);
+              const auto *k_sf_tile =
+                  get_k_sf_stage_mem(stage) +
+                  (k / (BLOCK_SIZE * 4)) * TILE_DOT0_BLOCK_N * 4 + n * 4;
+              k_sf_frag = *reinterpret_cast<const uint32_t *>(k_sf_tile);
+            }
+
+            /// Dot0
+            fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+                k_frag.data[0], k_frag.data[1],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+          } // end loop dot0_atomic_n
+        } // end loop dot0_atomic_m
+      } // end loop dot0_k
+
+      /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
+      ///         8 * 4 = 32 cycles
+      float qk_scale = *alpha0 * qk_norm;
 #pragma unroll
-          for (int idx = 0; idx < k_frag.REGISTERS_PER_THREAD; ++idx) {
-            // map k to K's Dk(emb)
-            int k = dot0_k + k_frag.get_row_with_reg(lane_id, idx);
-            // map n to K's N(seq)
-            int n = block_dot0_n + warp_dot0_n + dot0_atomic_n +
-                    k_frag.get_col_with_reg(lane_id, idx);
-            const auto *k_tile = K + block_b * k_b_stride +
-                                 block_h * k_h_stride + n * k_n_stride +
-                                 k / ELES_PER_NVFP4x2 * k_d_stride;
-            k_frag.data[idx] =
-                *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(k_tile);
+      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+          for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+            s_frag[i][j].data[k] *= qk_scale;
           }
-
-          /// Load K_SF
-          uint32_t k_sf_frag = 0;
-          if (lane_id % 4 == 0) {
-            // map k to quantize
-            int k = dot0_k;
-            // map n to non-quantize
-            int n = block_dot0_n + warp_dot0_n + dot0_atomic_n + (lane_id / 4);
-            const auto *k_sf_tile =
-                K_SF + (k / (BLOCK_SIZE * 4)) * k_sf_quantize_stride +
-                (block_b * Nkv * H + n * H + block_h) *
-                    k_sf_non_quantize_stride;
-            k_sf_frag = *reinterpret_cast<const uint32_t *>(k_sf_tile);
-          }
-
-          /// Dot0
-          fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
-              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
-              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
-              q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
-              k_frag.data[0], k_frag.data[1],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-              s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-              q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
-        } // end loop dot0_atomic_n
-      } // end loop dot0_atomic_m
-    } // end loop dot0_k
-
-    /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
-    ///         8 * 4 = 32 cycles
-    float qk_scale = *alpha0 * qk_norm;
-#pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-        for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-          s_frag[i][j].data[k] *= qk_scale;
         }
       }
-    }
 
-    /// Step 2: max = rowmax(S): 40 cycles
-    float max_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-    float max_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+      /// Step 2: max = rowmax(S): 40 cycles
+      float max_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+      float max_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-      max_new0[i] = max0[i];
-      max_new1[i] = max1[i];
+      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+        max_new0[i] = max0[i];
+        max_new1[i] = max1[i];
 #pragma unroll
-      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-        max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
-        max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
-        max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
-        max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
-      } // end loop j
-      max_new0[i] =
-          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
-      max_new0[i] =
-          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2), max_new0[i]);
-      max_new1[i] =
-          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
-      max_new1[i] =
-          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
-    } // end loop i
+        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+          max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
+          max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
+          max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
+          max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
+        } // end loop j
+        max_new0[i] =
+            fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
+        max_new0[i] =
+            fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2), max_new0[i]);
+        max_new1[i] =
+            fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
+        max_new1[i] =
+            fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
+      } // end loop i
 
-    /// Step 3: p = exp(S - max)
-    ///         160 cycles
-    DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                         [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
+      /// Step 3: p = exp(S - max)
+      ///         160 cycles
+      DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                           [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
-      for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-        p_frag[i][j].data[0] = expf(s_frag[i][j].data[0] - max_new0[i]);
-        p_frag[i][j].data[1] = expf(s_frag[i][j].data[1] - max_new0[i]);
-        p_frag[i][j].data[2] = expf(s_frag[i][j].data[2] - max_new1[i]);
-        p_frag[i][j].data[3] = expf(s_frag[i][j].data[3] - max_new1[i]);
-      } // end loop j
-    } // end loop i
+        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+          p_frag[i][j].data[0] = expf(s_frag[i][j].data[0] - max_new0[i]);
+          p_frag[i][j].data[1] = expf(s_frag[i][j].data[1] - max_new0[i]);
+          p_frag[i][j].data[2] = expf(s_frag[i][j].data[2] - max_new1[i]);
+          p_frag[i][j].data[3] = expf(s_frag[i][j].data[3] - max_new1[i]);
+        } // end loop j
+      } // end loop i
 
-    /// Step 4: l = sum(p)
-    ///         14 + 4 * 2 + 2 * 7 = 36 cycles
-    float l_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-    float l_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+      /// Step 4: l = sum(p)
+      ///         14 + 4 * 2 + 2 * 7 = 36 cycles
+      float l_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+      float l_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-      l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
-      l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
+      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+        l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
+        l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
 #pragma unroll
-      for (int j = 1; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-        l_new0[i] += p_frag[i][j].data[0];
-        l_new0[i] += p_frag[i][j].data[1];
-        l_new1[i] += p_frag[i][j].data[2];
-        l_new1[i] += p_frag[i][j].data[3];
-      } // end loop j
-      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 1);
-      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
-      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
-      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
+        for (int j = 1; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
+          l_new0[i] += p_frag[i][j].data[0];
+          l_new0[i] += p_frag[i][j].data[1];
+          l_new1[i] += p_frag[i][j].data[2];
+          l_new1[i] += p_frag[i][j].data[3];
+        } // end loop j
+        l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 1);
+        l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
+        l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
+        l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
-      // Update l
-      l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
-      l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
-    } // end loop i
+        // Update l
+        l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
+        l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+      } // end loop i
 
-    /// Step 4: o = expf(max - max_new) * o
-    ///         4 * 8 + 2 = 34
+      /// Step 4: o = expf(max - max_new) * o
+      ///         4 * 8 + 2 = 34
+
+#pragma unroll
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+          o_frag[i][j].data[0] *= expf(max0[i] - max_new0[i]);
+          o_frag[i][j].data[1] *= expf(max0[i] - max_new0[i]);
+          o_frag[i][j].data[2] *= expf(max1[i] - max_new1[i]);
+          o_frag[i][j].data[3] *= expf(max1[i] - max_new1[i]);
+        }
+      }
+/// Update max
+#pragma unroll
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+        max0[i] = max_new0[i];
+        max1[i] = max_new1[i];
+      }
+
+      /// Step 5: quantize P from f32 to nvfp4
+      AFrag_NVFP4_16x64 p_fp4_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
+                                  [TILE_DOT1_WARP_K / TILE_ATOMIC_K];
+      uint32_t p_fp4_sf_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
+                            [TILE_DOT1_WARP_K / TILE_ATOMIC_K];
+      convert_to_nvfp4(p_frag, p_fp4_frag, p_fp4_sf_frag);
+
+      /// Step 6: o = P @ V
+      ///         256 cycles
+      int dot1_k = dot0_n;
+
+#pragma unroll
+      for (int dot1_atomic_k = 0; dot1_atomic_k < TILE_DOT1_BLOCK_K;
+           dot1_atomic_k += TILE_ATOMIC_K) {
+        int dot1_atomic_k_cnt = dot1_atomic_k / TILE_ATOMIC_K;
+#pragma unroll
+        for (int dot1_atomic_m = 0; dot1_atomic_m < TILE_DOT1_WARP_M;
+             dot1_atomic_m += TILE_ATOMIC_M) {
+          int dot1_atomic_m_cnt = dot1_atomic_m / TILE_ATOMIC_M;
+#pragma unroll
+          for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
+               dot1_atomic_n += TILE_ATOMIC_N) {
+            int dot1_atomic_n_cnt = dot1_atomic_n / TILE_ATOMIC_N;
+            /// Load V
+            BFrag_NVFP4_64x8 v_frag;
+            {
+              int *v_regs = (int *)v_frag.data;
+              int v_shared_row = warp_dot1_n + dot1_atomic_n + (lane_id % 8);
+              int v_shared_col = (dot1_atomic_k + ((lane_id % 16) / 8) * 32) /
+                                 ELES_PER_NVFP4x2;
+              int v_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                  v_shared_row, v_shared_col, sizeof(NVFP4x2));
+              int v_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                  v_shared_row, v_shared_col, sizeof(NVFP4x2));
+              uint32_t v_addr = __cvta_generic_to_shared(
+                  get_v_stage_mem(stage) +
+                  v_shared_row_swiz * TILE_DOT1_BLOCK_K / ELES_PER_NVFP4x2 +
+                  v_shared_col_swiz);
+              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                           "{%0, %1}, [%2];"
+                           : "=r"(v_regs[0]), "=r"(v_regs[1])
+                           : "r"(v_addr));
+            }
+            /// Load V_SF
+            uint32_t v_sf_frag = 0;
+            if (lane_id % 4 == 0) {
+              // map k to quantize
+              int k = dot1_atomic_k;
+              // map n to non-quantize
+              int n = warp_dot1_n + dot1_atomic_n + (lane_id / 4);
+              const auto *v_sf_tile =
+                  get_v_sf_stage_mem(stage) +
+                  (k / (BLOCK_SIZE * 4)) * TILE_DOT1_BLOCK_N * 4 + n * 4;
+              v_sf_frag = *reinterpret_cast<const uint32_t *>(v_sf_tile);
+            }
+
+            /// Dot1
+            fma(o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
+                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[0],
+                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[1],
+                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[2],
+                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[3],
+                v_frag.data[0], v_frag.data[1],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
+                p_fp4_sf_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt], v_sf_frag);
+          } // end loop dot1_atomic_n
+        } // end loop dot1_atomic_m
+      } // end loop dot1_atomic_k
+
+      /// Release
+      if (lane_id == 0) {
+        arrive(&empty_bar[stage], 1);
+      }
+    } // end loop dot0_n/dot1_k
+
+    //===------------------------------------------------------------------===//
+    // Epilogue
+    //===------------------------------------------------------------------===//
+
+    /// step 8: o = o / l * alpha1(V global scale) * p_scale(1/(448 * 6))
 
 #pragma unroll
     for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
       for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-        o_frag[i][j].data[0] *= expf(max0[i] - max_new0[i]);
-        o_frag[i][j].data[1] *= expf(max0[i] - max_new0[i]);
-        o_frag[i][j].data[2] *= expf(max1[i] - max_new1[i]);
-        o_frag[i][j].data[3] *= expf(max1[i] - max_new1[i]);
+        float scale0 = (1.0f / l0[i]) * (1.0f / (448 * 6)) * *alpha1;
+        float scale1 = (1.0f / l1[i]) * (1.0f / (448 * 6)) * *alpha1;
+        o_frag[i][j].data[0] *= scale0;
+        o_frag[i][j].data[1] *= scale0;
+        o_frag[i][j].data[2] *= scale1;
+        o_frag[i][j].data[3] *= scale1;
       }
     }
-/// Update max
+
+    /// Step 9: Write back to O
+
 #pragma unroll
     for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
-      max0[i] = max_new0[i];
-      max1[i] = max_new1[i];
-    }
-
-    /// Step 5: quantize P from f32 to nvfp4
-    AFrag_NVFP4_16x64 p_fp4_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
-                                [TILE_DOT1_WARP_K / TILE_ATOMIC_K];
-    uint32_t p_fp4_sf_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
-                          [TILE_DOT1_WARP_K / TILE_ATOMIC_K];
-    convert_to_nvfp4(p_frag, p_fp4_frag, p_fp4_sf_frag);
-
-    /// Step 6: o = P @ V
-    ///         256 cycles
-    int dot1_k = dot0_n;
-
 #pragma unroll
-    for (int dot1_atomic_k = 0; dot1_atomic_k < TILE_DOT1_BLOCK_K;
-         dot1_atomic_k += TILE_ATOMIC_K) {
-      int dot1_atomic_k_cnt = dot1_atomic_k / TILE_ATOMIC_K;
+      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
 #pragma unroll
-      for (int dot1_atomic_m = 0; dot1_atomic_m < TILE_DOT1_WARP_M;
-           dot1_atomic_m += TILE_ATOMIC_M) {
-        int dot1_atomic_m_cnt = dot1_atomic_m / TILE_ATOMIC_M;
-#pragma unroll
-        for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
-             dot1_atomic_n += TILE_ATOMIC_N) {
-          int dot1_atomic_n_cnt = dot1_atomic_n / TILE_ATOMIC_N;
-          /// Load V
-          BFrag_NVFP4_64x8 v_frag;
-#pragma unroll
-          for (int idx = 0; idx < v_frag.REGISTERS_PER_THREAD; ++idx) {
-            // map k to V's N(seq)
-            int k =
-                dot1_k + dot1_atomic_k + v_frag.get_row_with_reg(lane_id, idx);
-            // map n to V's D(emb)
-            int n = block_dot1_n + warp_dot1_n + dot1_atomic_n +
-                    v_frag.get_col_with_reg(lane_id, idx);
-
-            const auto *v_tile = V + block_b * v_b_stride +
-                                 block_h * v_h_stride + n * v_d_stride +
-                                 k / ELES_PER_NVFP4x2 * v_n_stride;
-            v_frag.data[idx] =
-                *reinterpret_cast<const BFrag_NVFP4_64x8::REG_TYPE *>(v_tile);
-          }
-
-          /// Load V_SF
-          /// V_SF layout: [N/64, B * H * D, 4]xuint8
-          uint32_t v_sf_frag = 0;
-          if (lane_id % 4 == 0) {
-            // map n to V's D(emb)
-            int n = block_dot1_n + warp_dot1_n + dot1_atomic_n + (lane_id / 4);
-            // map k to V's N(seq)
-            int k = dot1_k + dot1_atomic_k;
-
-            const auto *v_sf_tile =
-                V_SF + (k / (BLOCK_SIZE * 4)) * v_sf_quantize_stride +
-                (block_b * H * Dv + block_h * Dv + n) *
-                    v_sf_non_quantize_stride;
-            v_sf_frag = *reinterpret_cast<const uint32_t *>(v_sf_tile);
-          }
-
-          /// Dot1
-          fma(o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
-              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[0],
-              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[1],
-              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[2],
-              p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[3],
-              v_frag.data[0], v_frag.data[1],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
-              o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
-              p_fp4_sf_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt], v_sf_frag);
-        } // end loop dot1_atomic_n
-      } // end loop dot1_atomic_m
-    } // end loop dot1_atomic_k
-  } // end loop dot0_n/dot1_k
-
-  //===------------------------------------------------------------------===//
-  // Epilogue
-  //===------------------------------------------------------------------===//
-
-  /// step 8: o = o / l * alpha1(V global scale) * p_scale(1/(448 * 6))
-
-  for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
-    for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-      float scale0 = (1.0f / l0[i]) * (1.0f / (448 * 6)) * *alpha1;
-      float scale1 = (1.0f / l1[i]) * (1.0f / (448 * 6)) * *alpha1;
-      o_frag[i][j].data[0] *= scale0;
-      o_frag[i][j].data[1] *= scale0;
-      o_frag[i][j].data[2] *= scale1;
-      o_frag[i][j].data[3] *= scale1;
-    }
-  }
-
-  /// Step 9: Write back to O
-
-#pragma unroll
-  for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-    for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-      for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-        int thread_m =
-            i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
-        // map m to O's N(seq)
-        int m = block_dot_m + warp_dot1_m + thread_m;
-        int thread_n =
-            j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
-        // map n to O's D(emb)
-        int n = block_dot_n + warp_dot1_n + thread_n;
-        auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
-                       block_h * o_h_stride + n * o_d_stride;
-        *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+        for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+          int thread_m =
+              i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
+          // map m to O's N(seq)
+          int m = block_dot_m + warp_dot1_m + thread_m;
+          int thread_n =
+              j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
+          // map n to O's D(emb)
+          int n = block_dot_n + warp_dot1_n + thread_n;
+          auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                         block_h * o_h_stride + n * o_d_stride;
+          *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+        }
       }
     }
-  }
+  } // end if(is_consumer)
 }
 
 //===--------------------------------------------------------------------===//
 // ac4k mha attention with nvfp4 acceleration
-// Q: [B, Nq,  H, Dqk/2]xNVFP4
-// K: [B, Nkv, H, Dqk/2]xNVFP4
-// V: [B, H, Dv, Nkv/2]xNVFP4
-// O: [B, Nq,  H, Dv/2]xNVFP4
-// Q_SF: [Dqk/64, B*Nq*H, 4]xUINT8
-// K_SF: [Dqk/64, B*Nkv*H, 4]xUINT8
-// V_SF: [Nkv/64, B*H*Dv, 4]xUINT8
+// Q:     [B,   H,    Nq,     Dqk/2]xNVFP4
+// K:     [B,   H,    Nkv,    Dqk/2]xNVFP4
+// V:     [B,   H,    Dv,     Nkv/2]xNVFP4
+// O:     [B,   H,    Nq,     Dv]xNVFP4
+// Q_SF:  [B,   H,    Dqk/64, Nq,   4]xF8
+// K_SF:  [B,   H,    Dqk/64, Nkv,  4]xF8
+// V_SF:  [B,   H,    Dv/64,  Nkv,  4]xF8
 // alpha0: Q @ K global scale
 // alpha1: V global scale
 //===--------------------------------------------------------------------===//
@@ -604,40 +934,50 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   CHECK_INPUT(q, at::ScalarType::Byte, "Q must be pack to uint8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
   int64_t B = q.size(0);
-  int64_t Nq = q.size(1);
-  int64_t H = q.size(2);
+  int64_t H = q.size(1);
+  int64_t Nq = q.size(2);
   int64_t Dqk = q.size(3) * ELES_PER_NVFP4x2;
   /// TODO(need remove limit)
   TORCH_CHECK(Dqk == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
   CHECK_INPUT(q_sf, at::ScalarType::Float8_e4m3fn,
               "q_sf must be a f8e4m3 tensor");
-  TORCH_CHECK(q_sf.dim() == 3, "Q_SF must be a 3D tensor");
-  TORCH_CHECK(q_sf.size(0) == ceil_div(Dqk, BLOCK_SIZE * 4),
-              "Meet invalid q_sf size(0) with ", q_sf.size(0),
+  TORCH_CHECK(q_sf.dim() == 5, "Q_SF must be a 5D tensor");
+  TORCH_CHECK(q_sf.size(0) == B, "Meet invalid q_sf size(0) with ",
+              q_sf.size(0), "==", B);
+  TORCH_CHECK(q_sf.size(1) == H, "Meet invalid q_sf size(1) with ",
+              q_sf.size(1), "==", H);
+  TORCH_CHECK(q_sf.size(2) == ceil_div(Dqk, BLOCK_SIZE * 4),
+              "Meet invalid q_sf size(2) with ", q_sf.size(2),
               "==", ceil_div(Dqk, BLOCK_SIZE * 4));
-  TORCH_CHECK(q_sf.size(1) == B * Nq * H, "Meet invalid q_sf size(1) with ",
-              q_sf.size(1), "==", B * Nq * H);
-  TORCH_CHECK(q_sf.size(2) == 4, "Meet invalid q_sf size(2) with ",
-              q_sf.size(2), "==", 4);
+  TORCH_CHECK(q_sf.size(3) == align_up(Nq, CROSS_DIM_ALIGN_SIZE),
+              "Meet invalid q_sf size(3) with ", q_sf.size(3),
+              "==", align_up(Nq, CROSS_DIM_ALIGN_SIZE));
+  TORCH_CHECK(q_sf.size(4) == 4, "Meet invalid q_sf size(4) with ",
+              q_sf.size(4), "==", 4);
 
   /// CHECK K & K_SF
   CHECK_INPUT(k, at::ScalarType::Byte, "K must be pack to uint8 tensor");
   TORCH_CHECK(k.dim() == 4, "K must be a 4D tensor");
   TORCH_CHECK(k.size(0) == B, "K must have the same batch size as Q");
-  int64_t Nkv = k.size(1);
-  TORCH_CHECK(k.size(2) == H, "K must have the same head number as Q");
+  TORCH_CHECK(k.size(1) == H, "K must have the same head number as Q");
+  int64_t Nkv = k.size(2);
   TORCH_CHECK(k.size(3) * ELES_PER_NVFP4x2 == Dqk,
               "K must have the same dim as Q");
   CHECK_INPUT(k_sf, at::ScalarType::Float8_e4m3fn,
               "K_SF must be a f8e4m3 tensor");
-  TORCH_CHECK(k_sf.dim() == 3, "k_sf must be a 3D tensor");
-  TORCH_CHECK(k_sf.size(0) == ceil_div(Dqk, BLOCK_SIZE * 4),
-              "Meet invalid k_sf size(0) with ", k_sf.size(0),
+  TORCH_CHECK(k_sf.dim() == 5, "k_sf must be a 5D tensor");
+  TORCH_CHECK(k_sf.size(0) == B, "Meet invalid k_sf size(0) with ",
+              k_sf.size(0), "==", B);
+  TORCH_CHECK(k_sf.size(1) == H, "Meet invalid k_sf size(1) with ",
+              k_sf.size(1), "==", H);
+  TORCH_CHECK(k_sf.size(2) == ceil_div(Dqk, BLOCK_SIZE * 4),
+              "Meet invalid k_sf size(2) with ", k_sf.size(2),
               "==", ceil_div(Dqk, BLOCK_SIZE * 4));
-  TORCH_CHECK(k_sf.size(1) == B * Nkv * H, "Meet invalid k_sf size(1) with ",
-              k_sf.size(1), "==", B * Nkv * H);
-  TORCH_CHECK(k_sf.size(2) == 4, "Meet invalid k_sf size(2) with ",
-              k_sf.size(2), "==", 4);
+  TORCH_CHECK(k_sf.size(3) == align_up(Nkv, CROSS_DIM_ALIGN_SIZE),
+              "Meet invalid k_sf size(3) with ", k_sf.size(3),
+              "==", align_up(Nkv, CROSS_DIM_ALIGN_SIZE));
+  TORCH_CHECK(k_sf.size(4) == 4, "Meet invalid k_sf size(4) with ",
+              k_sf.size(4), "==", 4);
 
   /// CHECK V & V_SF
   CHECK_INPUT(v, at::ScalarType::Byte, "V must be pack to uint8 tensor");
@@ -651,21 +991,26 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(Dv == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
   CHECK_INPUT(v_sf, at::ScalarType::Float8_e4m3fn,
               "V_SF must be a f8e4m3 tensor");
-  TORCH_CHECK(v_sf.dim() == 3, "V_SF must be a 3D tensor");
-  TORCH_CHECK(v_sf.size(0) == ceil_div(Nkv, BLOCK_SIZE * 4),
-              "Meet invalid v_sf size(0) with ", v_sf.size(0),
+  TORCH_CHECK(v_sf.dim() == 5, "V_SF must be a 5D tensor");
+  TORCH_CHECK(v_sf.size(0) == B, "Meet invalid v_sf size(0) with ",
+              v_sf.size(0), "==", B);
+  TORCH_CHECK(v_sf.size(1) == H, "Meet invalid v_sf size(1) with ",
+              v_sf.size(1), "==", H);
+  TORCH_CHECK(v_sf.size(2) == ceil_div(Nkv, BLOCK_SIZE * 4),
+              "Meet invalid v_sf size(2) with ", v_sf.size(2),
               "==", ceil_div(Nkv, BLOCK_SIZE * 4));
-  TORCH_CHECK(v_sf.size(1) == B * H * Dv, "Meet invalid v_sf size(1) with ",
-              v_sf.size(1), "==", B * H * Dv);
-  TORCH_CHECK(v_sf.size(2) == 4, "Meet invalid v_sf size(2) with ",
-              v_sf.size(2), "==", 4);
+  TORCH_CHECK(v_sf.size(3) == align_up(Dv, CROSS_DIM_ALIGN_SIZE),
+              "Meet invalid v_sf size(3) with ", v_sf.size(3),
+              "==", align_up(Dv, CROSS_DIM_ALIGN_SIZE));
+  TORCH_CHECK(v_sf.size(4) == 4, "Meet invalid v_sf size(4) with ",
+              v_sf.size(4), "==", 4);
 
   /// CHECK O
   CHECK_INPUT(o, at::ScalarType::BFloat16, "O must be a bfloat16 tensor");
   TORCH_CHECK(o.dim() == 4, "O must be a 4D tensor");
   TORCH_CHECK(o.size(0) == B, "O must have the same batch size as Q");
-  TORCH_CHECK(o.size(1) == Nq, "O must have the same sequence length as Q");
-  TORCH_CHECK(o.size(2) == H, "O must have the same head number as Q");
+  TORCH_CHECK(o.size(1) == H, "O must have the same head number as Q");
+  TORCH_CHECK(o.size(2) == Nq, "O must have the same sequence length as Q");
   TORCH_CHECK(o.size(3) == Dv, "O must have the same dim as V");
 
   /// CHECK alpha0 & alpha1
@@ -674,25 +1019,81 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   CHECK_INPUT(alpha1, at::ScalarType::Float, "alpha1 must be a float tensor");
   TORCH_CHECK(alpha1.dim() == 0, "alpha1 must be a scalar");
 
+  /// TMA descriptor
+  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_NONE;
+  CUtensorMap q_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+      reinterpret_cast<const NVFP4x2 *>(q.data_ptr()),
+      static_cast<uint64_t>(q.size(0)), static_cast<uint64_t>(q.size(1)),
+      static_cast<uint64_t>(q.size(2)), static_cast<uint64_t>(q.size(3)));
+  CUtensorMap k_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT0_BLOCK_N, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+      reinterpret_cast<const NVFP4x2 *>(k.data_ptr()),
+      static_cast<uint64_t>(k.size(0)), static_cast<uint64_t>(k.size(1)),
+      static_cast<uint64_t>(k.size(2)), static_cast<uint64_t>(k.size(3)));
+  CUtensorMap v_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT1_BLOCK_N, TILE_DOT1_BLOCK_K / ELES_PER_NVFP4x2,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+      reinterpret_cast<const NVFP4x2 *>(v.data_ptr()),
+      static_cast<uint64_t>(v.size(0)), static_cast<uint64_t>(v.size(1)),
+      static_cast<uint64_t>(v.size(2)), static_cast<uint64_t>(v.size(3)));
+
+  CUtensorMap q_sf_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT0_BLOCK_K / (BLOCK_SIZE * 4), TILE_DOT0_BLOCK_M,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+      reinterpret_cast<const uint32_t *>(q_sf.data_ptr()),
+      static_cast<uint64_t>(q_sf.size(0)), static_cast<uint64_t>(q_sf.size(1)),
+      static_cast<uint64_t>(q_sf.size(2)), static_cast<uint64_t>(q_sf.size(3)));
+  CUtensorMap k_sf_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT0_BLOCK_K / (BLOCK_SIZE * 4), TILE_DOT0_BLOCK_N,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+      reinterpret_cast<const uint32_t *>(k_sf.data_ptr()),
+      static_cast<uint64_t>(k_sf.size(0)), static_cast<uint64_t>(k_sf.size(1)),
+      static_cast<uint64_t>(k_sf.size(2)), static_cast<uint64_t>(k_sf.size(3)));
+  CUtensorMap v_sf_tensor_map = create_4d_tensor_map<
+      1, 1, TILE_DOT1_BLOCK_K / (BLOCK_SIZE * 4), TILE_DOT1_BLOCK_N,
+      CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+      reinterpret_cast<const uint32_t *>(v_sf.data_ptr()),
+      static_cast<uint64_t>(v_sf.size(0)), static_cast<uint64_t>(v_sf.size(1)),
+      static_cast<uint64_t>(v_sf.size(2)), static_cast<uint64_t>(v_sf.size(3)));
+
+  /// Set dynamic shared memory size
+  auto *kernel = nvfp4_mha_fwd_kernel<SWIZZLE>;
+  size_t smem_size =
+      TILE_Q_BLOCK_SIZE +
+      (TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE + TILE_Q_SF_BLOCK_SIZE +
+       TILE_K_SF_BLOCK_SIZE + TILE_V_SF_BLOCK_SIZE) *
+          STAGE;
+  CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
   /// Get CUDA stream
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  /// Launch kernel
   dim3 grid(B, H, ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)));
-  dim3 block(32, WARP_NUM);
-  nvfp4_mha_fwd_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<BF16 *>(o.data_ptr()), o.stride(0), o.stride(1),
-      o.stride(2), o.stride(3), reinterpret_cast<const NVFP4x2 *>(q.data_ptr()),
-      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-      reinterpret_cast<const E4M3 *>(q_sf.data_ptr()), q_sf.stride(0),
-      q_sf.stride(1), reinterpret_cast<const NVFP4x2 *>(k.data_ptr()),
-      k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-      reinterpret_cast<const E4M3 *>(k_sf.data_ptr()), k_sf.stride(0),
-      k_sf.stride(1), reinterpret_cast<const NVFP4x2 *>(v.data_ptr()),
-      v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-      reinterpret_cast<const E4M3 *>(v_sf.data_ptr()), v_sf.stride(0),
-      v_sf.stride(1), reinterpret_cast<const float *>(alpha0.data_ptr()),
+  dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+  kernel<<<grid, block, smem_size, stream>>>(
+      reinterpret_cast<BF16 *>(o.data_ptr()),
+      /* o b stride */ o.stride(0),
+      /* o h stride */ o.stride(1),
+      /* o n stride */ o.stride(2),
+      /* o d stride */ o.stride(3),
+      reinterpret_cast<const NVFP4x2 *>(q.data_ptr()), q.stride(0), q.stride(1),
+      q.stride(2), q.stride(3), reinterpret_cast<const E4M3 *>(q_sf.data_ptr()),
+      q_sf.stride(0), q_sf.stride(1),
+      reinterpret_cast<const NVFP4x2 *>(k.data_ptr()), k.stride(0), k.stride(1),
+      k.stride(2), k.stride(3), reinterpret_cast<const E4M3 *>(k_sf.data_ptr()),
+      k_sf.stride(0), k_sf.stride(1),
+      reinterpret_cast<const NVFP4x2 *>(v.data_ptr()), v.stride(0), v.stride(1),
+      v.stride(2), v.stride(3), reinterpret_cast<const E4M3 *>(v_sf.data_ptr()),
+      v_sf.stride(0), v_sf.stride(1),
+      reinterpret_cast<const float *>(alpha0.data_ptr()),
       reinterpret_cast<const float *>(alpha1.data_ptr()), B, H, Nq, Nkv, Dqk,
-      Dv, 1.0f / std::sqrt(static_cast<float>(Dqk)));
+      Dv, 1.0f / std::sqrt(static_cast<float>(Dqk)), q_tensor_map, k_tensor_map,
+      v_tensor_map, q_sf_tensor_map, k_sf_tensor_map, v_sf_tensor_map);
 }
 
 } // namespace ac4k

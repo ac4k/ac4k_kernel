@@ -43,6 +43,9 @@ constexpr int TILE_THREAD_NON_QUANTIZE_DIM = 1;
 constexpr int GROUP_SIZE = 32;
 constexpr int THREAD_NUM_PER_GROUP = GROUP_SIZE / TILE_THREAD_QUANTIZE_DIM;
 
+constexpr int CROSS_DIM_ALIGN_SIZE = 16;
+constexpr int REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF;
+
 __forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
   float b;
   asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
@@ -69,47 +72,38 @@ __forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   return val;
 }
 
-/// Reorder out
-/// TODO
-/// reshape: [quantize_dim] -> [-1, 4, 4, 2]
-/// transpose: [0, 2, 1, 3]
-///
-/// SF layout
-/// [quantize_dim/64, dim0 * dim1 * dim2, 4]xE4M3
-///
-/// OUT layout
-/// [non_quantize_dim0, non_quantize_dim1, non_quantize_dim2,
-///  ceil_up(quantize_dim, 64)/2]xnvfp4x2
-
 template <bool Swizzle>
-__global__ void
-quantize_sm120_kernel(NVFP4x2 *out, E4M3 *sf, const BF16 *in,
-                      const float *rcp_global_scale, int64_t non_quantize_dim0,
-                      int64_t non_quantize_dim1, int64_t non_quantize_dim2,
-                      int64_t quantize_dim, int64_t non_quantize_stride0,
-                      int64_t non_quantize_stride1,
-                      int64_t non_quantize_stride2, int64_t quantize_stride) {
-  /// SF stride
-  int64_t sf_stride2 = 1;
-  int64_t sf_stride1 = PACK_SF * sf_stride2;
-  int64_t sf_stride0 =
-      non_quantize_dim0 * non_quantize_dim1 * non_quantize_dim2 * sf_stride1;
+__global__ void quantize_sm120_kernel(
+    NVFP4x2 *out, uint32_t *sf, const BF16 *in, const float *rcp_global_scale,
+    int64_t in_dim0, int64_t in_dim1, int64_t /* cross-dim-size */ in_dim2,
+    int64_t /* reduce-dim-size */ in_dim3, int64_t in_stride0,
+    int64_t in_stride1, int64_t in_stride2, int64_t in_stride3) {
+  /// SF stride(uint32_t)
+  /// [xx, xx, reduce_dim_align / 64, cross_dim_align] x uint32
+  int64_t sf_stride3 = 1;
+  int64_t sf_stride2 = sf_stride3 * align_up(in_dim2, CROSS_DIM_ALIGN_SIZE);
+  int64_t sf_stride1 = sf_stride2 * ceil_div(in_dim3, REDUCE_DIM_ALIGN_SIZE);
+  int64_t sf_stride0 = sf_stride1 * in_dim1;
   /// OUT stride
+  /// [xx, xx, cross_dim_align, reduce_dim_align / 2] x NVFP4x2
+  int64_t out_dim0 = in_dim0;
+  int64_t out_dim1 = in_dim1;
+  int64_t out_dim2 = align_up(in_dim2, CROSS_DIM_ALIGN_SIZE);
+  int64_t out_dim3 = align_up(in_dim3, REDUCE_DIM_ALIGN_SIZE) / 2;
   int64_t out_stride3 = 1;
-  int64_t out_stride2 =
-      align_up(quantize_dim, BLOCK_SIZE * PACK_SF) / 2 * out_stride3;
-  int64_t out_stride1 = non_quantize_dim2 * out_stride2;
-  int64_t out_stride0 = non_quantize_dim1 * out_stride1;
+  int64_t out_stride2 = out_stride3 * out_dim3;
+  int64_t out_stride1 = out_stride2 * out_dim2;
+  int64_t out_stride0 = out_stride1 * out_dim1;
 
   float alpha = *rcp_global_scale;
 
-  for (int dim0 = 0; dim0 < non_quantize_dim0; ++dim0) {
+  for (int dim0 = 0; dim0 < out_dim0; ++dim0) {
     int dim1 = blockIdx.z;
     int dim2 = (blockIdx.y * TILE_BLOCK_NON_QUANTIZE_DIM +
                 threadIdx.y * TILE_THREAD_NON_QUANTIZE_DIM) %
-               non_quantize_dim2;
-    int apply_dim = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
-                    threadIdx.x * TILE_THREAD_QUANTIZE_DIM;
+               in_dim2;
+    int dim3 = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
+               threadIdx.x * TILE_THREAD_QUANTIZE_DIM;
 
     BF16 bf16[TILE_THREAD_QUANTIZE_DIM];
     /// TODO: need opt load
@@ -118,13 +112,12 @@ quantize_sm120_kernel(NVFP4x2 *out, E4M3 *sf, const BF16 *in,
       for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
         int group_id = threadIdx.x / THREAD_NUM_PER_GROUP;
         int tid_in_group = threadIdx.x % THREAD_NUM_PER_GROUP;
-        int apply_dim = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
-                        group_id * GROUP_SIZE + 2 * tid_in_group + i / 2 * 8 +
-                        (i % 2);
-        if (apply_dim < quantize_dim) {
-          bf16[i] =
-              in[dim0 * non_quantize_stride0 + dim1 * non_quantize_stride1 +
-                 dim2 * non_quantize_stride2 + apply_dim * quantize_stride];
+        int dim3 = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
+                   group_id * GROUP_SIZE + 2 * tid_in_group + i / 2 * 8 +
+                   (i % 2);
+        if (dim3 < in_dim3) {
+          bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
+                       dim2 * in_stride2 + dim3 * in_stride3];
         } else {
           reinterpret_cast<uint16_t *>(bf16)[i] = 0;
         }
@@ -132,11 +125,9 @@ quantize_sm120_kernel(NVFP4x2 *out, E4M3 *sf, const BF16 *in,
     } else {
 #pragma unroll
       for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
-        if (apply_dim + i < quantize_dim) {
-          bf16[i] =
-              in[dim0 * non_quantize_stride0 + dim1 * non_quantize_stride1 +
-                 dim2 * non_quantize_stride2 +
-                 (apply_dim + i) * quantize_stride];
+        if (dim3 + i < in_dim3) {
+          bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
+                       dim2 * in_stride2 + (dim3 + i) * in_stride3];
         } else {
           reinterpret_cast<uint16_t *>(bf16)[i] = 0;
         }
@@ -164,9 +155,10 @@ quantize_sm120_kernel(NVFP4x2 *out, E4M3 *sf, const BF16 *in,
       sf_value = static_cast<float>(tmp);
     }
     if (threadIdx.x % 2 == 0) {
-      sf[apply_dim / 64 * sf_stride0 +
-         dim0 * non_quantize_dim1 * non_quantize_dim2 * 4 +
-         dim1 * non_quantize_dim2 * 4 + dim2 * 4 + threadIdx.x / 2] = sfu8;
+      reinterpret_cast<uint8_t *>(&sf[dim0 * sf_stride0 + dim1 * sf_stride1 +
+                                      dim3 / BLOCK_SIZE / PACK_SF * sf_stride2 +
+                                      dim2 * sf_stride3])[threadIdx.x / 2] =
+          sfu8;
     }
 
     float out_scale =
@@ -182,24 +174,26 @@ quantize_sm120_kernel(NVFP4x2 *out, E4M3 *sf, const BF16 *in,
 
     NVFP4x8 e2m1x8 = fp32_vec_to_e2m1(f32x2);
     *reinterpret_cast<NVFP4x8 *>(out + dim0 * out_stride0 + dim1 * out_stride1 +
-                                 dim2 * out_stride2 + apply_dim / 2) = e2m1x8;
+                                 dim2 * out_stride2 + dim3 / 2 * out_stride3) =
+        e2m1x8;
   }
 }
 
 /// OUT layout
-/// [non_dim0, non_dim1, non_dim2, ceil_up(quantize_dim, 64)/2]xNVFP4x2
+/// [xx, xx, cross_dim_align, reduce_dim_align / 2] x NVFP4x2
 ///
 /// SF layout
-/// [ceil_div(quantize_dim, 64), non_dim0 * non_dim1 * non_dim2, 4]xE4M3
+/// [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x E4M3
 void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                     torch::Tensor const &in,
-                    torch::Tensor const &rcp_global_scale, uint32_t dim,
-                    bool swizzle) {
+                    torch::Tensor const &rcp_global_scale, uint32_t cross_dim,
+                    uint32_t reduce_dim, bool swizzle) {
+  static_assert(TILE_BLOCK_QUANTIZE_DIM == REDUCE_DIM_ALIGN_SIZE);
   /// Check in
   std::vector<int64_t> in_shape;
   std::vector<int64_t> in_stride;
   CHECK_INPUT(in, at::ScalarType::BFloat16, "in must be bfloat16");
-  TORCH_CHECK(in.dim() <= 4 && in.dim() >= 1, "in must be 1-4D");
+  TORCH_CHECK(in.dim() <= 4 && in.dim() >= 2, "in must be 2-4D");
   for (int i = 0; i < in.dim(); i++) {
     in_shape.push_back(in.size(i));
     in_stride.push_back(in.stride(i));
@@ -210,9 +204,12 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
   TORCH_CHECK(rcp_global_scale.dim() == 0, "rcp_global_scale must be a scalar");
 
   /// Check dim
-  TORCH_CHECK(dim < static_cast<uint32_t>(in.dim()),
-              "dim must be less than in.dim()");
-  int64_t quantize_dim_size = in_shape[dim];
+  TORCH_CHECK(cross_dim < static_cast<uint32_t>(in.dim()),
+              "cross_dim must be less than in.dim()");
+  TORCH_CHECK(reduce_dim < static_cast<uint32_t>(in.dim()),
+              "reduce_dim must be less than in.dim()");
+  int64_t cross_dim_size = in_shape[cross_dim];
+  int64_t reduce_dim_size = in_shape[reduce_dim];
 
   /// Check out
   std::vector<int64_t> out_shape;
@@ -221,27 +218,33 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
   for (int i = 0; i < out.dim(); ++i) {
     out_shape.push_back(out.size(i));
   }
-  for (uint32_t i = 0, counter = 0; i < in_shape.size(); ++i) {
-    if (i != dim) {
+  for (uint32_t i = 0, counter = 0; i < out_shape.size() - 2; ++i) {
+    if (i != cross_dim && i != reduce_dim) {
       TORCH_CHECK(in_shape[i] == out_shape[counter++],
                   "out must be the same shape as in");
     }
   }
-  TORCH_CHECK(out_shape[in_shape.size() - 1] * 2 ==
-                  align_up(quantize_dim_size, BLOCK_SIZE * PACK_SF),
-              "meet invalid quantize dim size");
+  TORCH_CHECK(out_shape[in_shape.size() - 2] ==
+                  align_up(cross_dim_size, CROSS_DIM_ALIGN_SIZE),
+              "meet invalid reduce dim size");
+  TORCH_CHECK(out_shape[in_shape.size() - 1] ==
+                  align_up(reduce_dim_size, REDUCE_DIM_ALIGN_SIZE) / 2,
+              "meet invalid reduce dim size");
 
   /// Check sf
   CHECK_OUTPUT(sf, at::ScalarType::Float8_e4m3fn, "sf must be float8 tensor");
-  /// sf layout: [quantize_dim_size / 64, non_quantize_dim_size, 4]xfp8
-  TORCH_CHECK(sf.dim() == 3, "sf must be 3D");
-  TORCH_CHECK(sf.size(0) == ceil_div(quantize_dim_size, BLOCK_SIZE * PACK_SF),
+  /// sf layout: [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x E4M3
+  TORCH_CHECK(sf.dim() == in.dim() + 1, "meet invalid sf rank");
+  for (int i = 0; i < out_shape.size() - 2; ++i) {
+    TORCH_CHECK(sf.size(i) == out_shape[i], "meet invalid sf shape");
+  }
+  TORCH_CHECK(sf.size(in_shape.size() - 2) ==
+                  ceil_div(reduce_dim_size, REDUCE_DIM_ALIGN_SIZE),
               "meet invalid sf shape");
-  TORCH_CHECK(sf.size(1) == std::accumulate(in_shape.begin(), in_shape.end(),
-                                            1L, std::multiplies<int64_t>()) /
-                                quantize_dim_size,
+  TORCH_CHECK(sf.size(in_shape.size() - 1) ==
+                  align_up(cross_dim_size, CROSS_DIM_ALIGN_SIZE),
               "meet invalid sf shape");
-  TORCH_CHECK(sf.size(2) == PACK_SF, "meet invalid sf shape");
+  TORCH_CHECK(sf.size(in_shape.size()) == PACK_SF, "meet invalid sf shape");
 
   /// Expand to 4D
   for (int i = in.dim(); i < 4; ++i) {
@@ -249,40 +252,41 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
     in_stride.insert(in_stride.begin(), in_shape[1] * in_stride[0]);
     out_shape.insert(out_shape.begin(), 1);
   }
-  dim += in_shape.size() - in.dim();
-
-  auto get_non_quantize_stride = [&](int i) -> int64_t {
-    if (i < dim) {
-      return in_stride[i];
-    } else {
-      return in_stride[i + 1];
+  cross_dim += in_shape.size() - in.dim();
+  reduce_dim += in_shape.size() - in.dim();
+  TORCH_CHECK(cross_dim != reduce_dim,
+              "cross_dim and reduce_dim must be different");
+  std::vector<int64_t> in_stride_wo_cross_reduce;
+  for (int i = 0; i < in_stride.size(); ++i) {
+    if (i != cross_dim && i != reduce_dim) {
+      in_stride_wo_cross_reduce.push_back(in_stride[i]);
     }
-  };
+  }
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  dim3 grid(ceil_div(quantize_dim_size, TILE_BLOCK_QUANTIZE_DIM),
+  dim3 grid(ceil_div(reduce_dim_size, TILE_BLOCK_QUANTIZE_DIM),
             ceil_div(out_shape[2], TILE_BLOCK_NON_QUANTIZE_DIM), out_shape[1]);
   dim3 block(TILE_BLOCK_QUANTIZE_DIM / TILE_THREAD_QUANTIZE_DIM,
              TILE_BLOCK_NON_QUANTIZE_DIM / TILE_THREAD_NON_QUANTIZE_DIM);
   if (swizzle) {
     quantize_sm120_kernel<true><<<grid, block, 0, stream>>>(
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
-        reinterpret_cast<E4M3 *>(sf.data_ptr()),
+        reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),
         reinterpret_cast<const float *>(rcp_global_scale.data_ptr()),
-        out_shape[0], out_shape[1], out_shape[2], quantize_dim_size,
-        get_non_quantize_stride(0), get_non_quantize_stride(1),
-        get_non_quantize_stride(2), in_stride[dim]);
+        out_shape[0], out_shape[1], cross_dim_size, reduce_dim_size,
+        in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
+        in_stride[cross_dim], in_stride[reduce_dim]);
   } else {
     quantize_sm120_kernel<false><<<grid, block, 0, stream>>>(
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
-        reinterpret_cast<E4M3 *>(sf.data_ptr()),
+        reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),
         reinterpret_cast<const float *>(rcp_global_scale.data_ptr()),
-        out_shape[0], out_shape[1], out_shape[2], quantize_dim_size,
-        get_non_quantize_stride(0), get_non_quantize_stride(1),
-        get_non_quantize_stride(2), in_stride[dim]);
+        out_shape[0], out_shape[1], cross_dim_size, reduce_dim_size,
+        in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
+        in_stride[cross_dim], in_stride[reduce_dim]);
   }
 }
 
