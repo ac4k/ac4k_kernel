@@ -31,4 +31,9 @@ void _internal_nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
                                   torch::Tensor const &alpha,
                                   c10::optional<torch::Tensor> const &bias);
 
+void rope_3d_apply(const torch::Tensor& x,           // [B, S, N, D], bfloat16
+                   const torch::Tensor& grid_sizes,  // [B, 3], int32
+                   const torch::Tensor& freqs,       // [max_pos, C], complex128
+                   torch::Tensor& output);           // [B, S, N, D], bfloat16
+
 } // namespace ac4k

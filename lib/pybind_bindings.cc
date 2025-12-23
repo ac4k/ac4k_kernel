@@ -24,4 +24,8 @@ PYBIND11_MODULE(_cuda_ops, m) {
   /// quantize
   m.def("quantize_sm120", &ac4k::quantize_sm120,
         "CUDA-accelerated bfloat16 to nvfp4 quantize.");
+
+  /// RoPE 3D apply
+  m.def("rope_3d_apply", &ac4k::rope_3d_apply,
+        "CUDA-accelerated 3D Rotary Position Embedding.");
 }
