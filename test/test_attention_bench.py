@@ -175,7 +175,7 @@ def test_attention_bench(B, N, H, D):
 
     # o_ref = get_ref(q, k, v, B, N, H, D)
     # o_ref1 = get_ref1(q, k, v, B, N, H, D)
-    o_ref = get_ref(q, k, v, B, N, H, D)
+    # o_ref = get_ref(q, k, v, B, N, H, D)
     o_sdp = get_sdp(q, k, v)
     o = get_ac4k(q, k, v, B, N, H, D)
 
@@ -185,10 +185,10 @@ def test_attention_bench(B, N, H, D):
 
     similarity = cosine_similarity_4d_global(o, o_sdp)
     print(f"o vs o_sdp 整体余弦相似度: {similarity:.4f}")
-    similarity1 = cosine_similarity_4d_global(o, o_ref)
-    print(f"o vs o_ref 整体余弦相似度1: {similarity1:.4f}")
-    similarity2 = cosine_similarity_4d_global(o_ref, o_sdp)
-    print(f"o_ref vs o_sdp 整体余弦相似度2: {similarity2:.4f}")
+    # similarity1 = cosine_similarity_4d_global(o, o_ref)
+    # print(f"o vs o_ref 整体余弦相似度1: {similarity1:.4f}")
+    # similarity2 = cosine_similarity_4d_global(o_ref, o_sdp)
+    # print(f"o_ref vs o_sdp 整体余弦相似度2: {similarity2:.4f}")
 
     torch.testing.assert_close(o, o_sdp, atol=2e-1, rtol=1e-1)
 
