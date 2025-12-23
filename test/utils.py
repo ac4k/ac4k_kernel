@@ -4,6 +4,8 @@ import torch
 def get_global_scale(input):
     FLOAT4_E2M1_MAX = 6.0
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    # TODO: need opt precision
+    # global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(torch.abs(input.view(-1)), dim=-1).to(torch.float32))
     global_scale = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
                     torch.amax(torch.abs(input).flatten(), dim=-1)).to(
                         torch.float32)

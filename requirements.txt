@@ -2,6 +2,7 @@
 
 
 clang-format
+ninja
 pre_commit>=4.4.0
 identify>=2.6.15
 torch>=2.8.0
