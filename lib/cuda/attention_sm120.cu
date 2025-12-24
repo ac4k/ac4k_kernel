@@ -344,6 +344,21 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
+//===----------------------------------------------------------------------===//
+// Fast exp
+//===----------------------------------------------------------------------===//
+
+__forceinline__ __device__ float fast_exp(float x, float scaled) {
+  constexpr float LOG2E_F = 1.4426950408889634f;
+  scaled = scaled * LOG2E_F;
+  return exp2f(x * LOG2E_F - scaled);
+}
+
+__forceinline__ __device__ float fast_exp(float x) {
+  constexpr float LOG2E_F = 1.4426950408889634f;
+  return exp2f(x * LOG2E_F);
+}
+
 template <CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     void nvfp4_mha_fwd_kernel(
@@ -736,10 +751,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-          p_frag[i][j].data[0] = expf(s_frag[i][j].data[0] - max_new0[i]);
-          p_frag[i][j].data[1] = expf(s_frag[i][j].data[1] - max_new0[i]);
-          p_frag[i][j].data[2] = expf(s_frag[i][j].data[2] - max_new1[i]);
-          p_frag[i][j].data[3] = expf(s_frag[i][j].data[3] - max_new1[i]);
+          p_frag[i][j].data[0] = fast_exp(s_frag[i][j].data[0], max_new0[i]);
+          p_frag[i][j].data[1] = fast_exp(s_frag[i][j].data[1], max_new0[i]);
+          p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
+          p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
         } // end loop j
       } // end loop i
 
@@ -768,15 +783,15 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         /// total redundant exp sum is exp(-max) * (align_up(N,
         /// TILE_DOT0_BLOCK_N) - N)
         if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
-          l_new0[i] -= expf(-max_new0[i]) *
-                       (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N);
-          l_new1[i] -= expf(-max_new1[i]) *
-                       (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N);
+          l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+                       fast_exp(max_new0[i]);
+          l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+                       fast_exp(max_new1[i]);
         }
 
         // Update l
-        l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
-        l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+        l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
+        l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
 
       /// Step 4: o = expf(max - max_new) * o
@@ -786,10 +801,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-          o_frag[i][j].data[0] *= expf(max0[i] - max_new0[i]);
-          o_frag[i][j].data[1] *= expf(max0[i] - max_new0[i]);
-          o_frag[i][j].data[2] *= expf(max1[i] - max_new1[i]);
-          o_frag[i][j].data[3] *= expf(max1[i] - max_new1[i]);
+          o_frag[i][j].data[0] *= fast_exp(max0[i], max_new0[i]);
+          o_frag[i][j].data[1] *= fast_exp(max0[i], max_new0[i]);
+          o_frag[i][j].data[2] *= fast_exp(max1[i], max_new1[i]);
+          o_frag[i][j].data[3] *= fast_exp(max1[i], max_new1[i]);
         }
       }
 /// Update max
