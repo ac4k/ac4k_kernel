@@ -89,9 +89,8 @@ def test_quantize_bench(shape, cross_dim, reduce_dim, swizzle=False):
 
     output, sf, _ = quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
     # reshape output
-    output = output.reshape(-1, align_up(origin_cross_dim_size, 16),
+    output = output.reshape(-1, origin_cross_dim_size,
                             align_up(origin_reduce_dim_size, 64) // 2)
-    output = output[:, :origin_cross_dim_size, :].contiguous()
     # reshape sf
     sf = sf.reshape(-1, ceil_div(origin_reduce_dim_size, 64),
                     align_up(origin_cross_dim_size, 16), 4)
@@ -111,7 +110,7 @@ def test_random_bennch(num):
         swizzle = random.choice([False, True])
 
         # avoid too large input
-        while reduce(operator.mul, shape, 1) > 1 * 1024 * 1024 * 1024:
+        while reduce(operator.mul, shape, 1) > 50 * 1024 * 1024:
             for i in range(rank):
                 if shape[i] > 1:
                     shape[i] = shape[i] // 2
@@ -132,4 +131,4 @@ if __name__ == "__main__":
     test_quantize_bench((1024, 1024), -2, -1)
     test_quantize_bench((1024, 1024), 1, 0)
     test_quantize_bench((128, 512), 0, 1)
-    test_random_bennch(555)
+    test_random_bennch(666)

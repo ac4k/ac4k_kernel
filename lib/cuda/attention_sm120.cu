@@ -763,6 +763,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
+        /// Fix exp sum
+        /// redundant p is exp(0 - max)
+        /// total redundant exp sum is exp(-max) * (align_up(N,
+        /// TILE_DOT0_BLOCK_N) - N)
+        if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+          l_new0[i] -= expf(-max_new0[i]) *
+                       (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N);
+          l_new1[i] -= expf(-max_new1[i]) *
+                       (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N);
+        }
+
         // Update l
         l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
         l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
@@ -890,23 +901,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
     /// Step 9: Write back to O
 
+    if (block_dot_m + warp_dot0_m + TILE_DOT0_WARP_M <= Nq &&
+        block_dot_n + warp_dot0_n + TILE_DOT1_WARP_N <= Dv) {
 #pragma unroll
-    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
-      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
 #pragma unroll
-        for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-          int thread_m =
-              i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
-          // map m to O's N(seq)
-          int m = block_dot_m + warp_dot1_m + thread_m;
-          int thread_n =
-              j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
-          // map n to O's D(emb)
-          int n = block_dot_n + warp_dot1_n + thread_n;
-          auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
-                         block_h * o_h_stride + n * o_d_stride;
-          *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+            int thread_m =
+                i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
+            // map m to O's N(seq)
+            int m = block_dot_m + warp_dot1_m + thread_m;
+            int thread_n =
+                j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
+            // map n to O's D(emb)
+            int n = block_dot_n + warp_dot1_n + thread_n;
+            auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                           block_h * o_h_stride + n * o_d_stride;
+            *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+            int thread_m =
+                i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
+            // map m to O's N(seq)
+            int m = block_dot_m + warp_dot1_m + thread_m;
+            int thread_n =
+                j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
+            // map n to O's D(emb)
+            int n = block_dot_n + warp_dot1_n + thread_n;
+            if (m < Nq && n < Dv) {
+              auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                             block_h * o_h_stride + n * o_d_stride;
+              *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+            }
+          }
         }
       }
     }
@@ -929,16 +966,20 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
                    torch::Tensor &k, torch::Tensor &k_sf, torch::Tensor &v,
                    torch::Tensor &v_sf, torch::Tensor &alpha0,
-                   torch::Tensor &alpha1) {
+                   torch::Tensor &alpha1, int64_t Dqk) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Byte, "Q must be pack to uint8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
   int64_t B = q.size(0);
   int64_t H = q.size(1);
   int64_t Nq = q.size(2);
-  int64_t Dqk = q.size(3) * ELES_PER_NVFP4x2;
+  TORCH_CHECK(q.size(3) == align_up(Dqk, BLOCK_SIZE * 4) / ELES_PER_NVFP4x2,
+              "q.size(3) must be ",
+              align_up(Dqk, BLOCK_SIZE * 4) / ELES_PER_NVFP4x2, " but see ",
+              q.size(3));
   /// TODO(need remove limit)
-  TORCH_CHECK(Dqk == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
+  TORCH_CHECK(Dqk <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
+              HEAD_DIM_ALIGN_SIZE);
   CHECK_INPUT(q_sf, at::ScalarType::Float8_e4m3fn,
               "q_sf must be a f8e4m3 tensor");
   TORCH_CHECK(q_sf.dim() == 5, "Q_SF must be a 5D tensor");
@@ -961,8 +1002,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(k.size(0) == B, "K must have the same batch size as Q");
   TORCH_CHECK(k.size(1) == H, "K must have the same head number as Q");
   int64_t Nkv = k.size(2);
-  TORCH_CHECK(k.size(3) * ELES_PER_NVFP4x2 == Dqk,
-              "K must have the same dim as Q");
+  TORCH_CHECK(k.size(3) == q.size(3), "K must have the same dim as Q");
   CHECK_INPUT(k_sf, at::ScalarType::Float8_e4m3fn,
               "K_SF must be a f8e4m3 tensor");
   TORCH_CHECK(k_sf.dim() == 5, "k_sf must be a 5D tensor");
@@ -988,7 +1028,8 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(v.size(3) * ELES_PER_NVFP4x2 == align_up(Nkv, BLOCK_SIZE * 4),
               "V must have the same sequence length as K");
   /// TODO(need remove limit)
-  TORCH_CHECK(Dv == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
+  TORCH_CHECK(Dv <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
+              HEAD_DIM_ALIGN_SIZE);
   CHECK_INPUT(v_sf, at::ScalarType::Float8_e4m3fn,
               "V_SF must be a f8e4m3 tensor");
   TORCH_CHECK(v_sf.dim() == 5, "V_SF must be a 5D tensor");

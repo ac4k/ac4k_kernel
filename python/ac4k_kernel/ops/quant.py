@@ -73,6 +73,7 @@ def _load_cuda_quantize():
 def quantize(input: torch.Tensor,
              cross_dim,
              reduce_dim,
+             alpha=None,
              swizzle=False,
              output=None,
              sf=None):
@@ -107,8 +108,10 @@ def quantize(input: torch.Tensor,
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     # alpha = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(
     #     torch.abs(input.view(-1))).to(torch.float32))
-    alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
-             torch.amax(torch.abs(input.view(-1)), dim=-1)).to(torch.float32)
+    if alpha is None:
+        alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
+                 torch.amax(torch.abs(input.view(-1)), dim=-1)).to(
+                     torch.float32)
     global_scale = 1 / alpha
 
     # refine dim
@@ -116,6 +119,7 @@ def quantize(input: torch.Tensor,
         cross_dim += input.ndim
     if reduce_dim < 0:
         reduce_dim += input.ndim
+    assert cross_dim != reduce_dim, "cross_dim and reduce_dim must be different"
 
     # shape inference for out and sf
     input_shape = input.shape
@@ -125,7 +129,7 @@ def quantize(input: torch.Tensor,
     for i in range(len(input_shape)):
         if i != cross_dim and i != reduce_dim:
             output_shape.append(input_shape[i])
-    output_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
+    output_shape.append(input_shape[cross_dim])
     output_shape.append(
         align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
         NVFP4_ELES_PER_BYTE)
@@ -136,7 +140,8 @@ def quantize(input: torch.Tensor,
         if i != cross_dim and i != reduce_dim:
             sf_shape.append(input_shape[i])
     sf_shape.append(
-        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) // 64)
+        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
+        (BLOCK_SIZE * PACK_SF))
     sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
     sf_shape.append(4)
 
@@ -146,7 +151,8 @@ def quantize(input: torch.Tensor,
                              dtype=torch.uint8,
                              device=input.device)
     if sf is None:
-        sf = torch.empty(sf_shape,
+        # FIXME: fix zero memset
+        sf = torch.zeros(sf_shape,
                          dtype=torch.float8_e4m3fn,
                          device=input.device)
 
