@@ -43,16 +43,16 @@ constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 //===----------------------------------------------------------------------===//
 
 /// Block level tile size
-constexpr int TILE_DOT_BLOCK_M = 128;
+constexpr int TILE_DOT_BLOCK_M = 64;
 constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
-constexpr int TILE_DOT0_BLOCK_N = 64;
+constexpr int TILE_DOT0_BLOCK_N = 128;
 constexpr int TILE_DOT0_BLOCK_K = 128;
 constexpr int TILE_DOT1_BLOCK_M = TILE_DOT0_BLOCK_M;
 constexpr int TILE_DOT1_BLOCK_N = 128;
 constexpr int TILE_DOT1_BLOCK_K = TILE_DOT0_BLOCK_N;
 
 /// Warp level tile size
-constexpr int TILE_DOT0_WARP_M = 32;
+constexpr int TILE_DOT0_WARP_M = 16;
 constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
 constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
 constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
@@ -626,17 +626,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       /// S
       DFrag_F32_16x8 s_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
                            [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
-#pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-          for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-            /// Clear s fragment
-            s_frag[i][j].data[k] = 0.0f;
-          }
-        }
-      }
 
       /// Step 0: S = Q @ K
       ///      16x64x128=> 16*8*2=256 cycles
@@ -687,20 +676,33 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             }
 
             /// Dot0
-            fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
-                k_frag.data[0], k_frag.data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            if (dot0_k == 0) {
+              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+                  k_frag.data[0], k_frag.data[1], 0, 0, 0, 0,
+                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            } else {
+              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+                  k_frag.data[0], k_frag.data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            }
           } // end loop dot0_atomic_n
         } // end loop dot0_atomic_m
       } // end loop dot0_k
