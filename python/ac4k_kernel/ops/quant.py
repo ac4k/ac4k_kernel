@@ -116,6 +116,7 @@ def quantize(input: torch.Tensor,
         cross_dim += input.ndim
     if reduce_dim < 0:
         reduce_dim += input.ndim
+    assert cross_dim != reduce_dim, "cross_dim and reduce_dim must be different"
 
     # shape inference for out and sf
     input_shape = input.shape
@@ -125,7 +126,7 @@ def quantize(input: torch.Tensor,
     for i in range(len(input_shape)):
         if i != cross_dim and i != reduce_dim:
             output_shape.append(input_shape[i])
-    output_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
+    output_shape.append(input_shape[cross_dim])
     output_shape.append(
         align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
         NVFP4_ELES_PER_BYTE)
@@ -136,7 +137,8 @@ def quantize(input: torch.Tensor,
         if i != cross_dim and i != reduce_dim:
             sf_shape.append(input_shape[i])
     sf_shape.append(
-        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) // 64)
+        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
+        (BLOCK_SIZE * PACK_SF))
     sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
     sf_shape.append(4)
 
@@ -146,7 +148,8 @@ def quantize(input: torch.Tensor,
                              dtype=torch.uint8,
                              device=input.device)
     if sf is None:
-        sf = torch.empty(sf_shape,
+        # FIXME: fix zero memset
+        sf = torch.zeros(sf_shape,
                          dtype=torch.float8_e4m3fn,
                          device=input.device)
 

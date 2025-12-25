@@ -2,8 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-from ac4k_kernel.ops import nvfp4_matmul, nvfp4_quant, nvfp4_attention, quantize
-from utils import get_global_scale
+from ac4k_kernel.ops import nvfp4_matmul, nvfp4_attention, quantize
 
 
 def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
@@ -44,92 +43,88 @@ def test_attention_bench(B, N, H, D):
         return tensor
 
     def get_ref(q, k, v, B, N, H, D):
+        q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
+        k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
+        v_fp4, v_sf, v_alpha = quantize(v, 3, 1)
+        qk_alpha = q_alpha * k_alpha
 
-        def get_single(q, k, v, B, N, H, D):
-            # quantize q & k
-            q_rcp_global_scale = get_global_scale(q)
-            q_fp4, q_sf = nvfp4_quant(q, q_rcp_global_scale)
-            k_rcp_global_scale = get_global_scale(k)
-            k_fp4, k_sf = nvfp4_quant(k, k_rcp_global_scale)
-            qk_alpha = 1.0 / (q_rcp_global_scale * k_rcp_global_scale)
+        OUT = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
 
-            # quantize v
-            v = v.T.contiguous()
-            # pad v
-            v = pad(v, 128)
-            # quantize v
-            v_rcp_global_scale = get_global_scale(v)
-            v_fp4, v_sf = nvfp4_quant(v, v_rcp_global_scale)
-            v_alpha = 1.0 / v_rcp_global_scale
-
-            TILE_SIZE = 64
-            max = torch.full((N, 1), -torch.inf, device="cuda")
-            sum_exp = torch.zeros((N, 1), dtype=torch.float32, device="cuda")
-            o = torch.zeros((N, D), dtype=torch.float32, device="cuda")
-            for i in range(0, N, TILE_SIZE):
-                # tile sub k
-                k_fp4_sub = k_fp4[i:i + TILE_SIZE].contiguous()
-                k_sf_sub = k_sf.view(torch.int32)
-                k_sf_sub = k_sf_sub.reshape(-1, k_sf_sub.shape[1], 32, 4)
-                k_sf_sub = k_sf_sub[i // 128, :, :, ((i // 64) % 2) *
-                                    2:((i // 64) % 2) * 2 + 2]
-                k_sf_sub = pad(k_sf_sub, 4).contiguous()
-                k_sf_sub = k_sf_sub.view(torch.float8_e4m3fn)
-                k_sf_sub = k_sf_sub.reshape(-1, k_sf.shape[1])
-
-                # s = q @ k
-                s = nvfp4_matmul(q_fp4, k_fp4_sub, q_sf, k_sf_sub, qk_alpha)
-                s = s.to(torch.float32)
-                s = s / math.sqrt(D)
-
-                # softmax
-                max_new = torch.max(
-                    torch.max(s, dim=-1, keepdim=True).values, max)
-                exp = torch.exp(s - max_new)
-                sum_exp_new = torch.sum(exp, dim=-1, keepdim=True)
-
-                # quantize exp
-                exp = exp.to(torch.bfloat16)
-                exp_rcp_global_scale = get_global_scale(exp)
-                exp_alpha = 1.0 / exp_rcp_global_scale
-                exp_fp4, exp_sf = nvfp4_quant(exp, exp_rcp_global_scale)
-
-                # tile sub v
-                v_fp4_sub = v_fp4[:, i // 2:(i + TILE_SIZE) // 2].contiguous()
-                v_sf_sub = v_sf.view(torch.int32)
-                v_sf_sub = v_sf_sub.reshape(v_sf_sub.shape[0] // 128,
-                                            v_sf_sub.shape[1], -1)
-                v_sf_sub = v_sf_sub[:, i // 64:(i + TILE_SIZE) //
-                                    64, :].contiguous()
-                v_sf_sub = v_sf_sub.view(torch.float8_e4m3fn)
-                v_sf_sub = v_sf_sub.reshape(v_sf.shape[0], -1)
-
-                # o = exp @ v
-                o_new = nvfp4_matmul(exp_fp4, v_fp4_sub, exp_sf, v_sf_sub,
-                                     exp_alpha * v_alpha).to(torch.float32)
-
-                # update
-                sum_exp = torch.exp(max - max_new) * sum_exp + sum_exp_new
-                o = torch.exp(max - max_new) * o + o_new
-                max = max_new
-
-            o = (o / sum_exp).to(torch.bfloat16)
-
-            return o
-
-        o = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+        TILE_SIZE = 64
+        FLOAT4_E2M1_MAX = 6.0
+        FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+        alpha = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX /
+                 torch.full([], 1, dtype=torch.bfloat16, device="cuda")).to(
+                     torch.float32)
         for b in range(B):
             for h in range(H):
-                q_sub = q[b, :, h, :].contiguous()
-                k_sub = k[b, :, h, :].contiguous()
-                v_sub = v[b, :, h, :].contiguous()
-                o_sub = get_single(q_sub, k_sub, v_sub, 1, N, 1, D)
-                o[b, :, h, :] = o_sub
+                max = torch.full((N, 1),
+                                 -torch.inf,
+                                 dtype=torch.float32,
+                                 device="cuda")
+                sum_exp = torch.full((N, 1),
+                                     0,
+                                     dtype=torch.float32,
+                                     device="cuda")
+                o = torch.zeros((N, D), dtype=torch.float32, device="cuda")
+                for n in range(0, N, TILE_SIZE):
+                    n_end = n + TILE_SIZE if n + TILE_SIZE < N else N
+                    assert n != n_end
+                    n_end_align = align_up(n_end, 16)
+                    n_end_align64 = align_up(n_end, 64)
+                    # dv_align = align_up(D, 16)
+                    sub_q = q_fp4[b, h, :, :].contiguous()
+                    sub_k = k_fp4[b, h, n:n_end, :].contiguous()
+                    sub_v = v_fp4[b, h, :,
+                                  n // 2:n_end_align64 // 2].contiguous()
+                    sub_q_sf = q_sf[b, h, :, :, :].contiguous()
+                    sub_k_sf = k_sf[b, h, :, n:n_end_align, :].contiguous()
+                    sub_v_sf = v_sf[b, h, n // 64:(n + TILE_SIZE) //
+                                    64, :, :].contiguous()
 
-        print("o ref:")
-        print(o)
+                    sub_q = sub_q.reshape(-1, sub_q.shape[-1])
+                    sub_k = sub_k.reshape(-1, sub_k.shape[-1])
+                    sub_v = sub_v.reshape(-1, sub_v.shape[-1])
+                    sub_q_sf = sub_q_sf.reshape(-1, sub_q_sf.shape[-2], 4)
+                    sub_k_sf = sub_k_sf.reshape(-1, sub_k_sf.shape[-2], 4)
+                    sub_v_sf = sub_v_sf.reshape(-1, sub_v_sf.shape[-2], 4)
 
-        return o.reshape(B, N, H, D)
+                    # s = q @ k
+                    s = nvfp4_matmul(sub_q, sub_k, sub_q_sf, sub_k_sf,
+                                     qk_alpha)
+
+                    s = s.to(torch.float32)
+                    s = s / math.sqrt(D)
+
+                    # softmax
+                    max_new = torch.max(
+                        torch.max(s, dim=-1, keepdim=True).values, max)
+                    p = torch.exp(s - max_new)
+                    sum_exp_new = torch.sum(p, dim=-1, keepdim=True)
+
+                    # update
+                    o = torch.exp(max - max_new) * o
+                    sum_exp = torch.exp(max - max_new) * sum_exp + sum_exp_new
+                    max = max_new
+
+                    # qunatize
+                    p = p.to(torch.bfloat16)
+                    p_fp4, p_sf, p_alpha = quantize(p, 0, 1, alpha=alpha)
+
+                    # o = p @ v
+                    o = nvfp4_matmul(
+                        p_fp4, sub_v, p_sf, sub_v_sf,
+                        torch.full([], 1, dtype=torch.float32,
+                                   device="cuda")).to(torch.float32) + o
+
+                o = o * v_alpha / alpha
+                o = o / sum_exp
+                OUT[b, :, h, :] = o.to(torch.bfloat16)
+
+        print("get_ref o:")
+        print(OUT[0, :4, 0, :8])
+
+        return OUT
 
     def get_ref1(q, k, v, B, N, H, D):
         s = torch.matmul(q, k.transpose(-2, -1)).to(torch.float32)
@@ -139,8 +134,8 @@ def test_attention_bench(B, N, H, D):
 
         o = torch.matmul(p, v)
 
-        print("o ref1:")
-        print(o)
+        # print("o ref1:")
+        # print(o)
 
         return o.reshape(B, N, H, D)
 
@@ -149,39 +144,21 @@ def test_attention_bench(B, N, H, D):
             1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
 
         print("o sdp:")
-        print(o)
+        print(o[0, :4, 0, :8])
 
         return o
 
-    def get_ac4k(q, k, v, B, N, H, D):
-        ## new2
-        q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
-
-        k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
-
-        qk_alpha = q_alpha * k_alpha
-
-        v_fp4, v_sf, v_alpha = quantize(v, 3, 1, swizzle=True)
-
-        o = torch.empty((B, H, N, D), dtype=torch.bfloat16, device="cuda")
-        o = nvfp4_attention(q_fp4, k_fp4, v_fp4, q_sf, k_sf, v_sf, qk_alpha,
-                            v_alpha, o)
-        o = o.transpose(1, 2).contiguous()
+    def get_ac4k(q, k, v):
+        o = nvfp4_attention(q, k, v)
 
         print("o ac4k:")
-        print(o)
+        print(o[0, :4, 0, :8])
 
         return o
 
     # o_ref = get_ref(q, k, v, B, N, H, D)
-    # o_ref1 = get_ref1(q, k, v, B, N, H, D)
-    # o_ref = get_ref(q, k, v, B, N, H, D)
     o_sdp = get_sdp(q, k, v)
-    o = get_ac4k(q, k, v, B, N, H, D)
-
-    # torch.save(o, "{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
-    # o_backup = loaded_x = torch.load("{}x{}x{}x{}a12dae.pt".format(B, N, H, D))
-    # torch.testing.assert_close(o.view(torch.uint16), o_backup.view(torch.uint16))
+    o = get_ac4k(q, k, v)
 
     similarity = cosine_similarity_4d_global(o, o_sdp)
     print(f"o vs o_sdp 整体余弦相似度: {similarity:.4f}")
@@ -197,3 +174,6 @@ if __name__ == "__main__":
     torch.manual_seed(9567)
     test_attention_bench(1, 64, 1, 128)
     test_attention_bench(2, 128, 3, 128)
+    test_attention_bench(1, 33, 1, 128)
+    test_attention_bench(10, 330, 12, 100)
+    test_attention_bench(1, 444, 1, 88)

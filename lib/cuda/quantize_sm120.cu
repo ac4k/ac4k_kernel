@@ -88,7 +88,7 @@ __global__ void quantize_sm120_kernel(
   /// [xx, xx, cross_dim_align, reduce_dim_align / 2] x NVFP4x2
   int64_t out_dim0 = in_dim0;
   int64_t out_dim1 = in_dim1;
-  int64_t out_dim2 = align_up(in_dim2, CROSS_DIM_ALIGN_SIZE);
+  int64_t out_dim2 = in_dim2;
   int64_t out_dim3 = align_up(in_dim3, REDUCE_DIM_ALIGN_SIZE) / 2;
   int64_t out_stride3 = 1;
   int64_t out_stride2 = out_stride3 * out_dim3;
@@ -224,9 +224,8 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                   "out must be the same shape as in");
     }
   }
-  TORCH_CHECK(out_shape[in_shape.size() - 2] ==
-                  align_up(cross_dim_size, CROSS_DIM_ALIGN_SIZE),
-              "meet invalid reduce dim size");
+  TORCH_CHECK(out_shape[in_shape.size() - 2] == cross_dim_size,
+              "meet invalid cross dim size");
   TORCH_CHECK(out_shape[in_shape.size() - 1] ==
                   align_up(reduce_dim_size, REDUCE_DIM_ALIGN_SIZE) / 2,
               "meet invalid reduce dim size");

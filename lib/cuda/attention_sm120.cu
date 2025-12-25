@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <c10/cuda/CUDAGuard.h>
 #include <cmath>
 #include <cuda.h>
@@ -45,14 +46,14 @@ constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 /// Block level tile size
 constexpr int TILE_DOT_BLOCK_M = 128;
 constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
-constexpr int TILE_DOT0_BLOCK_N = 64;
+constexpr int TILE_DOT0_BLOCK_N = 128;
 constexpr int TILE_DOT0_BLOCK_K = 128;
 constexpr int TILE_DOT1_BLOCK_M = TILE_DOT0_BLOCK_M;
 constexpr int TILE_DOT1_BLOCK_N = 128;
 constexpr int TILE_DOT1_BLOCK_K = TILE_DOT0_BLOCK_N;
 
 /// Warp level tile size
-constexpr int TILE_DOT0_WARP_M = 32;
+constexpr int TILE_DOT0_WARP_M = 16;
 constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
 constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
 constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
@@ -96,7 +97,7 @@ const int STAGE = 2;
 //===----------------------------------------------------------------------===//
 
 const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
-const int PRODUCER_THREAD_NUM = 32;
+const int PRODUCER_THREAD_NUM = 128;
 
 //===----------------------------------------------------------------------===//
 // Create tma tensor map
@@ -247,6 +248,18 @@ __forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
 }
 
 //===----------------------------------------------------------------------===//
+// Heterogeneous allocation of registers for producer & consumer.
+//===----------------------------------------------------------------------===//
+
+template <uint32_t RegCount> __forceinline__ __device__ void reg_alloc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+//===----------------------------------------------------------------------===//
 // Convert 8xfloat32 to 8xNVFP4 (represented as one uint32_t)
 //===----------------------------------------------------------------------===//
 
@@ -344,8 +357,23 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
+//===----------------------------------------------------------------------===//
+// Fast exp
+//===----------------------------------------------------------------------===//
+
+__forceinline__ __device__ float fast_exp(float x, float scaled) {
+  constexpr float LOG2E_F = 1.4426950408889634f;
+  scaled = scaled * LOG2E_F;
+  return exp2f(x * LOG2E_F - scaled);
+}
+
+__forceinline__ __device__ float fast_exp(float x) {
+  constexpr float LOG2E_F = 1.4426950408889634f;
+  return exp2f(x * LOG2E_F);
+}
+
 template <CUtensorMapSwizzle Swizzle>
-__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     void nvfp4_mha_fwd_kernel(
         BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
         int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
@@ -366,15 +394,15 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         const __grid_constant__ CUtensorMap q_sf_tensor_map,
         const __grid_constant__ CUtensorMap k_sf_tensor_map,
         const __grid_constant__ CUtensorMap v_sf_tensor_map) {
-  int block_b = blockIdx.x;                    // batch
+  int block_b = blockIdx.z;                    // batch
   int block_h = blockIdx.y;                    // head
-  int block_n = blockIdx.z * TILE_DOT_BLOCK_M; // seq
+  int block_n = blockIdx.x * TILE_DOT_BLOCK_M; // seq
 
   int tid = threadIdx.x;
   int lane_id = tid % 32;
   int warp_id = tid / 32;
   bool is_consumer = tid < CONSUMER_THREAD_NUM;
-  bool is_producer = tid >= CONSUMER_THREAD_NUM;
+  bool is_producer = !is_consumer;
 
   // dot0 = q @ k
   // dot1 = p @ v
@@ -394,43 +422,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   int warp_dot0_n = 0;
   int warp_dot1_m = warp_id * TILE_DOT1_WARP_M;
   int warp_dot1_n = 0;
-
-  //===--------------------------------------------------------------------===//
-  // Define fragment
-  //===--------------------------------------------------------------------===//
-
-  /// Q
-  AFrag_NVFP4_16x64 q_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                          [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
-  uint32_t q_sf_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                    [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
-  /// max(row max of S=Q @ K)
-  float max0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  float max1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  /// l（sum of exp)
-  float l0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  float l1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-#pragma unroll
-  for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-    max0[i] = -INFINITY;
-    max1[i] = -INFINITY;
-    l0[i] = 0.0f;
-    l1[i] = 0.0f;
-  }
-  /// o: P @ V
-  DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
-                       [TILE_DOT1_WARP_N / TILE_ATOMIC_N];
-#pragma unroll
-  for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-    for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-      for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-        /// Clear o fragment
-        o_frag[i][j].data[k] = 0.0f;
-      }
-    }
-  }
 
   //===--------------------------------------------------------------------===//
   // Define shared memory for q, k and v
@@ -471,7 +462,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
   __shared__ __align__(8) uint64_t empty_bar[STAGE];
   __shared__ __align__(8) uint64_t full_bar[STAGE];
-  if (is_producer) {
+  if (is_producer && lane_id == 0) {
 #pragma unroll
     for (int i = 0; i < STAGE; ++i) {
       init_barrier(&empty_bar[i], WARP_NUM);
@@ -485,60 +476,63 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   // Producer
   //===--------------------------------------------------------------------===//
 
-  if (is_producer && tid == CONSUMER_THREAD_NUM) {
-    int stage = 0;
-    int phase = 0;
+  if (is_producer) {
+    reg_dealloc<24>();
+    if (tid == CONSUMER_THREAD_NUM) {
+      int stage = 0;
+      int phase = 0;
 
-    /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
-
-    /// Acquire
-    wait(&empty_bar[stage], phase);
-    load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
-                  block_b, block_h, block_dot_m, 0);
-    load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, block_dot_m);
-    load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    /// Commit
-    expect_bytes(&full_bar[stage],
-                 TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                     TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
-                     TILE_V_SF_BLOCK_SIZE);
-
-    ++stage;
-
-    /// Next
-    for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
-         dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
-      if (stage == STAGE) {
-        stage = 0;
-        phase ^= 1;
-      }
+      /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
 
       /// Acquire
       wait(&empty_bar[stage], phase);
-
-      /// TMA K/V and K_SF/V_SF
+      load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
+                    block_b, block_h, block_dot_m, 0);
+      load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, block_dot_m);
       load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                    block_b, block_h, dot0_n, 0);
+                    block_b, block_h, 0, 0);
       load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
-                    &full_bar[stage], block_b, block_h, 0, dot0_n);
+                    &full_bar[stage], block_b, block_h, 0, 0);
       load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                    block_b, block_h, 0, dot0_n / ELES_PER_NVFP4x2);
+                    block_b, block_h, 0, 0);
       load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
-                    &full_bar[stage], block_b, block_h,
-                    dot0_n / (BLOCK_SIZE * 4), 0);
-
+                    &full_bar[stage], block_b, block_h, 0, 0);
       /// Commit
-      expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                                         TILE_K_SF_BLOCK_SIZE +
-                                         TILE_V_SF_BLOCK_SIZE);
+      expect_bytes(&full_bar[stage],
+                   TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                       TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
+                       TILE_V_SF_BLOCK_SIZE);
+
+      ++stage;
+
+      /// Next
+      for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
+           dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
+        if (stage == STAGE) {
+          stage = 0;
+          phase ^= 1;
+        }
+
+        /// Acquire
+        wait(&empty_bar[stage], phase);
+
+        /// TMA K/V and K_SF/V_SF
+        load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
+                      block_b, block_h, dot0_n, 0);
+        load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
+                      &full_bar[stage], block_b, block_h, 0, dot0_n);
+        load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
+                      block_b, block_h, 0, dot0_n / ELES_PER_NVFP4x2);
+        load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
+                      &full_bar[stage], block_b, block_h,
+                      dot0_n / (BLOCK_SIZE * 4), 0);
+
+        /// Commit
+        expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                                           TILE_K_SF_BLOCK_SIZE +
+                                           TILE_V_SF_BLOCK_SIZE);
+      }
     }
   } // end if (is_producer)
 
@@ -546,11 +540,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   // Consumer
   //===--------------------------------------------------------------------===//
 
-  if (is_consumer) {
+  else {
+    reg_alloc<200>();
     if (lane_id == 0) {
 #pragma unroll
       for (int i = 0; i < STAGE; ++i) {
         arrive(&empty_bar[i], 1);
+      }
+    }
+
+    //===------------------------------------------------------------------===//
+    // Define fragment
+    //===------------------------------------------------------------------===//
+
+    /// Q
+    AFrag_NVFP4_16x64 q_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                            [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
+    uint32_t q_sf_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                      [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
+    /// max(row max of S=Q @ K)
+    float max0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float max1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    /// l（sum of exp)
+    float l0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float l1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+#pragma unroll
+    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+      max0[i] = -INFINITY;
+      max1[i] = -INFINITY;
+      l0[i] = 0.0f;
+      l1[i] = 0.0f;
+    }
+    /// o: P @ V
+    DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
+                         [TILE_DOT1_WARP_N / TILE_ATOMIC_N];
+#pragma unroll
+    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+        for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+          /// Clear o fragment
+          o_frag[i][j].data[k] = 0.0f;
+        }
       }
     }
 
@@ -611,17 +643,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       /// S
       DFrag_F32_16x8 s_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
                            [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
-#pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-          for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-            /// Clear s fragment
-            s_frag[i][j].data[k] = 0.0f;
-          }
-        }
-      }
 
       /// Step 0: S = Q @ K
       ///      16x64x128=> 16*8*2=256 cycles
@@ -672,20 +693,33 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             }
 
             /// Dot0
-            fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
-                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
-                k_frag.data[0], k_frag.data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            if (dot0_k == 0) {
+              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+                  k_frag.data[0], k_frag.data[1], 0, 0, 0, 0,
+                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            } else {
+              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
+                  k_frag.data[0], k_frag.data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
+                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+            }
           } // end loop dot0_atomic_n
         } // end loop dot0_atomic_m
       } // end loop dot0_k
@@ -736,10 +770,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_ATOMIC_N; ++j) {
-          p_frag[i][j].data[0] = expf(s_frag[i][j].data[0] - max_new0[i]);
-          p_frag[i][j].data[1] = expf(s_frag[i][j].data[1] - max_new0[i]);
-          p_frag[i][j].data[2] = expf(s_frag[i][j].data[2] - max_new1[i]);
-          p_frag[i][j].data[3] = expf(s_frag[i][j].data[3] - max_new1[i]);
+          p_frag[i][j].data[0] = fast_exp(s_frag[i][j].data[0], max_new0[i]);
+          p_frag[i][j].data[1] = fast_exp(s_frag[i][j].data[1], max_new0[i]);
+          p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
+          p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
         } // end loop j
       } // end loop i
 
@@ -763,9 +797,20 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
+        /// Fix exp sum
+        /// redundant p is exp(0 - max)
+        /// total redundant exp sum is exp(-max) * (align_up(N,
+        /// TILE_DOT0_BLOCK_N) - N)
+        if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+          l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+                       fast_exp(max_new0[i]);
+          l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+                       fast_exp(max_new1[i]);
+        }
+
         // Update l
-        l0[i] = expf(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
-        l1[i] = expf(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+        l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
+        l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
 
       /// Step 4: o = expf(max - max_new) * o
@@ -775,10 +820,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-          o_frag[i][j].data[0] *= expf(max0[i] - max_new0[i]);
-          o_frag[i][j].data[1] *= expf(max0[i] - max_new0[i]);
-          o_frag[i][j].data[2] *= expf(max1[i] - max_new1[i]);
-          o_frag[i][j].data[3] *= expf(max1[i] - max_new1[i]);
+          o_frag[i][j].data[0] *= fast_exp(max0[i], max_new0[i]);
+          o_frag[i][j].data[1] *= fast_exp(max0[i], max_new0[i]);
+          o_frag[i][j].data[2] *= fast_exp(max1[i], max_new1[i]);
+          o_frag[i][j].data[3] *= fast_exp(max1[i], max_new1[i]);
         }
       }
 /// Update max
@@ -890,23 +935,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
     /// Step 9: Write back to O
 
+    if (block_dot_m + warp_dot0_m + TILE_DOT0_WARP_M <= Nq &&
+        block_dot_n + warp_dot0_n + TILE_DOT1_WARP_N <= Dv) {
 #pragma unroll
-    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
-      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
 #pragma unroll
-        for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-          int thread_m =
-              i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
-          // map m to O's N(seq)
-          int m = block_dot_m + warp_dot1_m + thread_m;
-          int thread_n =
-              j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
-          // map n to O's D(emb)
-          int n = block_dot_n + warp_dot1_n + thread_n;
-          auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
-                         block_h * o_h_stride + n * o_d_stride;
-          *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+            int thread_m =
+                i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
+            // map m to O's N(seq)
+            int m = block_dot_m + warp_dot1_m + thread_m;
+            int thread_n =
+                j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
+            // map n to O's D(emb)
+            int n = block_dot_n + warp_dot1_n + thread_n;
+            auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                           block_h * o_h_stride + n * o_d_stride;
+            *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+            int thread_m =
+                i * TILE_ATOMIC_M + o_frag[i][j].get_row_with_reg(lane_id, idx);
+            // map m to O's N(seq)
+            int m = block_dot_m + warp_dot1_m + thread_m;
+            int thread_n =
+                j * TILE_ATOMIC_N + o_frag[i][j].get_col_with_reg(lane_id, idx);
+            // map n to O's D(emb)
+            int n = block_dot_n + warp_dot1_n + thread_n;
+            if (m < Nq && n < Dv) {
+              auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                             block_h * o_h_stride + n * o_d_stride;
+              *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+            }
+          }
         }
       }
     }
@@ -929,16 +1000,20 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
                    torch::Tensor &k, torch::Tensor &k_sf, torch::Tensor &v,
                    torch::Tensor &v_sf, torch::Tensor &alpha0,
-                   torch::Tensor &alpha1) {
+                   torch::Tensor &alpha1, int64_t Dqk) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Byte, "Q must be pack to uint8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
   int64_t B = q.size(0);
   int64_t H = q.size(1);
   int64_t Nq = q.size(2);
-  int64_t Dqk = q.size(3) * ELES_PER_NVFP4x2;
+  TORCH_CHECK(q.size(3) == align_up(Dqk, BLOCK_SIZE * 4) / ELES_PER_NVFP4x2,
+              "q.size(3) must be ",
+              align_up(Dqk, BLOCK_SIZE * 4) / ELES_PER_NVFP4x2, " but see ",
+              q.size(3));
   /// TODO(need remove limit)
-  TORCH_CHECK(Dqk == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
+  TORCH_CHECK(Dqk <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
+              HEAD_DIM_ALIGN_SIZE);
   CHECK_INPUT(q_sf, at::ScalarType::Float8_e4m3fn,
               "q_sf must be a f8e4m3 tensor");
   TORCH_CHECK(q_sf.dim() == 5, "Q_SF must be a 5D tensor");
@@ -961,8 +1036,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(k.size(0) == B, "K must have the same batch size as Q");
   TORCH_CHECK(k.size(1) == H, "K must have the same head number as Q");
   int64_t Nkv = k.size(2);
-  TORCH_CHECK(k.size(3) * ELES_PER_NVFP4x2 == Dqk,
-              "K must have the same dim as Q");
+  TORCH_CHECK(k.size(3) == q.size(3), "K must have the same dim as Q");
   CHECK_INPUT(k_sf, at::ScalarType::Float8_e4m3fn,
               "K_SF must be a f8e4m3 tensor");
   TORCH_CHECK(k_sf.dim() == 5, "k_sf must be a 5D tensor");
@@ -988,7 +1062,8 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(v.size(3) * ELES_PER_NVFP4x2 == align_up(Nkv, BLOCK_SIZE * 4),
               "V must have the same sequence length as K");
   /// TODO(need remove limit)
-  TORCH_CHECK(Dv == HEAD_DIM_ALIGN_SIZE, "Dqk must be 128");
+  TORCH_CHECK(Dv <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
+              HEAD_DIM_ALIGN_SIZE);
   CHECK_INPUT(v_sf, at::ScalarType::Float8_e4m3fn,
               "V_SF must be a f8e4m3 tensor");
   TORCH_CHECK(v_sf.dim() == 5, "V_SF must be a 5D tensor");
@@ -1020,7 +1095,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(alpha1.dim() == 0, "alpha1 must be a scalar");
 
   /// TMA descriptor
-  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_NONE;
+  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
   CUtensorMap q_tensor_map = create_4d_tensor_map<
       1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
       CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
@@ -1073,7 +1148,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   /// Launch kernel
-  dim3 grid(B, H, ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)));
+  dim3 grid(ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)), H, B);
   dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
   kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<BF16 *>(o.data_ptr()),

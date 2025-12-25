@@ -8,7 +8,7 @@ namespace ac4k {
 void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
                    torch::Tensor &k, torch::Tensor &k_sf, torch::Tensor &v,
                    torch::Tensor &v_sf, torch::Tensor &alpha0,
-                   torch::Tensor &alpha1);
+                   torch::Tensor &alpha1, int64_t Dqk);
 
 void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                     torch::Tensor const &in,
