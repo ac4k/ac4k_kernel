@@ -97,7 +97,7 @@ const int STAGE = 2;
 //===----------------------------------------------------------------------===//
 
 const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
-const int PRODUCER_THREAD_NUM = 32;
+const int PRODUCER_THREAD_NUM = 128;
 
 //===----------------------------------------------------------------------===//
 // Create tma tensor map
@@ -477,7 +477,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
   //===--------------------------------------------------------------------===//
 
   if (is_producer) {
-    // reg_dealloc<24>();
+    reg_dealloc<24>();
     if (tid == CONSUMER_THREAD_NUM) {
       int stage = 0;
       int phase = 0;
@@ -541,7 +541,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
   //===--------------------------------------------------------------------===//
 
   else {
-    // reg_alloc<200>();
+    reg_alloc<200>();
     if (lane_id == 0) {
 #pragma unroll
       for (int i = 0; i < STAGE; ++i) {
