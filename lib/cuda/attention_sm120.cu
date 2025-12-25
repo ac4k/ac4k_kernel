@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <c10/cuda/CUDAGuard.h>
 #include <cmath>
 #include <cuda.h>
@@ -381,9 +382,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         const __grid_constant__ CUtensorMap q_sf_tensor_map,
         const __grid_constant__ CUtensorMap k_sf_tensor_map,
         const __grid_constant__ CUtensorMap v_sf_tensor_map) {
-  int block_b = blockIdx.x;                    // batch
+  int block_b = blockIdx.z;                    // batch
   int block_h = blockIdx.y;                    // head
-  int block_n = blockIdx.z * TILE_DOT_BLOCK_M; // seq
+  int block_n = blockIdx.x * TILE_DOT_BLOCK_M; // seq
 
   int tid = threadIdx.x;
   int lane_id = tid % 32;
@@ -1078,7 +1079,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   TORCH_CHECK(alpha1.dim() == 0, "alpha1 must be a scalar");
 
   /// TMA descriptor
-  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_NONE;
+  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
   CUtensorMap q_tensor_map = create_4d_tensor_map<
       1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
       CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
@@ -1131,7 +1132,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   /// Launch kernel
-  dim3 grid(B, H, ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)));
+  dim3 grid(ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)), H, B);
   dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
   kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<BF16 *>(o.data_ptr()),
