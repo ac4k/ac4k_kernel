@@ -148,8 +148,7 @@ def nvfp4_quantize(input: torch.Tensor,
                              dtype=torch.uint8,
                              device=input.device)
     if sf is None:
-        # FIXME: fix zero memset
-        sf = torch.zeros(sf_shape,
+        sf = torch.empty(sf_shape,
                          dtype=torch.float8_e4m3fn,
                          device=input.device)
 

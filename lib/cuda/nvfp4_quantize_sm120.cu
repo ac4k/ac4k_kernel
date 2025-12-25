@@ -84,6 +84,7 @@ __global__ void nvfp4_quantize_sm120_kernel(
   int64_t sf_stride2 = sf_stride3 * align_up(in_dim2, CROSS_DIM_ALIGN_SIZE);
   int64_t sf_stride1 = sf_stride2 * ceil_div(in_dim3, REDUCE_DIM_ALIGN_SIZE);
   int64_t sf_stride0 = sf_stride1 * in_dim1;
+
   /// OUT stride
   /// [xx, xx, cross_dim_align, reduce_dim_align / 2] x NVFP4x2
   int64_t out_dim0 = in_dim0;
@@ -99,84 +100,86 @@ __global__ void nvfp4_quantize_sm120_kernel(
 
   for (int dim0 = 0; dim0 < out_dim0; ++dim0) {
     int dim1 = blockIdx.z;
-    int dim2 = (blockIdx.y * TILE_BLOCK_NON_QUANTIZE_DIM +
-                threadIdx.y * TILE_THREAD_NON_QUANTIZE_DIM) %
-               in_dim2;
+    int dim2 = blockIdx.y * TILE_BLOCK_NON_QUANTIZE_DIM +
+               threadIdx.y * TILE_THREAD_NON_QUANTIZE_DIM;
     int dim3 = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
                threadIdx.x * TILE_THREAD_QUANTIZE_DIM;
 
     BF16 bf16[TILE_THREAD_QUANTIZE_DIM];
-    /// TODO: need opt load
-    if constexpr (Swizzle) {
+    uint8_t sfu8 = 0;
+    if (dim2 < in_dim2) {
+      /// TODO: need opt load
+      if constexpr (Swizzle) {
 #pragma unroll
-      for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
-        int group_id = threadIdx.x / THREAD_NUM_PER_GROUP;
-        int tid_in_group = threadIdx.x % THREAD_NUM_PER_GROUP;
-        int dim3 = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
-                   group_id * GROUP_SIZE + 2 * tid_in_group + i / 2 * 8 +
-                   (i % 2);
-        if (dim3 < in_dim3) {
-          bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
-                       dim2 * in_stride2 + dim3 * in_stride3];
-        } else {
-          reinterpret_cast<uint16_t *>(bf16)[i] = 0;
+        for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
+          int group_id = threadIdx.x / THREAD_NUM_PER_GROUP;
+          int tid_in_group = threadIdx.x % THREAD_NUM_PER_GROUP;
+          int dim3 = blockIdx.x * TILE_BLOCK_QUANTIZE_DIM +
+                     group_id * GROUP_SIZE + 2 * tid_in_group + i / 2 * 8 +
+                     (i % 2);
+          if (dim3 < in_dim3) {
+            bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
+                         dim2 * in_stride2 + dim3 * in_stride3];
+          } else {
+            reinterpret_cast<uint16_t *>(bf16)[i] = 0;
+          }
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
+          if (dim3 + i < in_dim3) {
+            bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
+                         dim2 * in_stride2 + (dim3 + i) * in_stride3];
+          } else {
+            reinterpret_cast<uint16_t *>(bf16)[i] = 0;
+          }
         }
       }
-    } else {
+
+      __nv_bfloat162 *bf16x2 = reinterpret_cast<__nv_bfloat162 *>(bf16);
+      // mas(abs)
+      auto max_local = __habs2(bf16x2[0]);
 #pragma unroll
-      for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM; ++i) {
-        if (dim3 + i < in_dim3) {
-          bf16[i] = in[dim0 * in_stride0 + dim1 * in_stride1 +
-                       dim2 * in_stride2 + (dim3 + i) * in_stride3];
-        } else {
-          reinterpret_cast<uint16_t *>(bf16)[i] = 0;
-        }
+      for (int i = 1; i < TILE_THREAD_QUANTIZE_DIM / 2; ++i) {
+        max_local = __hmax2(max_local, __habs2(bf16x2[i]));
       }
-    }
+      max_local = __hmax2(__shfl_xor_sync(0xffffffff, max_local, 1), max_local);
 
-    __nv_bfloat162 *bf16x2 = reinterpret_cast<__nv_bfloat162 *>(bf16);
-    // mas(abs)
-    auto max_local = __habs2(bf16x2[0]);
+      /// max(abs)
+      float max = __bfloat162float(__hmax(max_local.x, max_local.y));
+
+      /// SF
+      float sf_value = alpha * (max * 0.16666666666666666f);
+      {
+        __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
+        sfu8 = static_cast<uint16_t>(tmp.__x);
+        sf_value = static_cast<float>(tmp);
+      }
+
+      float out_scale =
+          sf_value != 0 ? alpha * reciprocal_approximate_ftz(sf_value) : 0.0f;
+
+      float2 f32x2[TILE_THREAD_QUANTIZE_DIM / 2];
 #pragma unroll
-    for (int i = 1; i < TILE_THREAD_QUANTIZE_DIM / 2; ++i) {
-      max_local = __hmax2(max_local, __habs2(bf16x2[i]));
-    }
-    max_local = __hmax2(__shfl_xor_sync(0xffffffff, max_local, 1), max_local);
+      for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM / 2; i++) {
+        f32x2[i] = __bfloat1622float2(bf16x2[i]);
+        f32x2[i].x *= out_scale;
+        f32x2[i].y *= out_scale;
+      }
 
-    /// max(abs)
-    float max = __bfloat162float(__hmax(max_local.x, max_local.y));
+      NVFP4x8 e2m1x8 = fp32_vec_to_e2m1(f32x2);
+      *reinterpret_cast<NVFP4x8 *>(out + dim0 * out_stride0 +
+                                   dim1 * out_stride1 + dim2 * out_stride2 +
+                                   dim3 / 2 * out_stride3) = e2m1x8;
+    } // end if (dim2 < in_dim2)
 
-    /// SF
-    float sf_value = alpha * (max * 0.16666666666666666f);
-    uint8_t sfu8;
-    {
-      __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
-      sfu8 = static_cast<uint16_t>(tmp.__x);
-      sf_value = static_cast<float>(tmp);
-    }
     if (threadIdx.x % 2 == 0) {
       reinterpret_cast<uint8_t *>(&sf[dim0 * sf_stride0 + dim1 * sf_stride1 +
                                       dim3 / BLOCK_SIZE / PACK_SF * sf_stride2 +
                                       dim2 * sf_stride3])[threadIdx.x / 2] =
           sfu8;
     }
-
-    float out_scale =
-        sf_value != 0 ? alpha * reciprocal_approximate_ftz(sf_value) : 0.0f;
-
-    float2 f32x2[TILE_THREAD_QUANTIZE_DIM / 2];
-#pragma unroll
-    for (int i = 0; i < TILE_THREAD_QUANTIZE_DIM / 2; i++) {
-      f32x2[i] = __bfloat1622float2(bf16x2[i]);
-      f32x2[i].x *= out_scale;
-      f32x2[i].y *= out_scale;
-    }
-
-    NVFP4x8 e2m1x8 = fp32_vec_to_e2m1(f32x2);
-    *reinterpret_cast<NVFP4x8 *>(out + dim0 * out_stride0 + dim1 * out_stride1 +
-                                 dim2 * out_stride2 + dim3 / 2 * out_stride3) =
-        e2m1x8;
-  }
+  } // end dim0 loop
 }
 
 /// OUT layout
@@ -189,6 +192,7 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                           torch::Tensor const &rcp_global_scale,
                           uint32_t cross_dim, uint32_t reduce_dim,
                           bool swizzle) {
+  static_assert(TILE_BLOCK_NON_QUANTIZE_DIM <= CROSS_DIM_ALIGN_SIZE);
   static_assert(TILE_BLOCK_QUANTIZE_DIM == REDUCE_DIM_ALIGN_SIZE);
   /// Check in
   std::vector<int64_t> in_shape;
@@ -265,8 +269,11 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  dim3 grid(ceil_div(reduce_dim_size, TILE_BLOCK_QUANTIZE_DIM),
-            ceil_div(out_shape[2], TILE_BLOCK_NON_QUANTIZE_DIM), out_shape[1]);
+  dim3 grid(align_up(reduce_dim_size, REDUCE_DIM_ALIGN_SIZE) /
+                TILE_BLOCK_QUANTIZE_DIM,
+            align_up(cross_dim_size, CROSS_DIM_ALIGN_SIZE) /
+                TILE_BLOCK_NON_QUANTIZE_DIM,
+            out_shape[1]);
   dim3 block(TILE_BLOCK_QUANTIZE_DIM / TILE_THREAD_QUANTIZE_DIM,
              TILE_BLOCK_NON_QUANTIZE_DIM / TILE_THREAD_NON_QUANTIZE_DIM);
   if (swizzle) {
