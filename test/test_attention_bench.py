@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-from ac4k_kernel.ops import nvfp4_matmul, nvfp4_attention, quantize
+from ac4k_kernel.ops import nvfp4_matmul, nvfp4_attention, nvfp4_quantize
 
 
 def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
@@ -50,9 +50,9 @@ def test_attention_bench(B, N, H, D, layout):
         return tensor
 
     def get_ref(q, k, v, B, N, H, D):
-        q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
-        k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
-        v_fp4, v_sf, v_alpha = quantize(v, 3, 1)
+        q_fp4, q_sf, q_alpha = nvfp4_quantize(q, 1, 3)
+        k_fp4, k_sf, k_alpha = nvfp4_quantize(k, 1, 3)
+        v_fp4, v_sf, v_alpha = nvfp4_quantize(v, 3, 1)
         qk_alpha = q_alpha * k_alpha
 
         OUT = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
@@ -116,7 +116,7 @@ def test_attention_bench(B, N, H, D, layout):
 
                     # qunatize
                     p = p.to(torch.bfloat16)
-                    p_fp4, p_sf, p_alpha = quantize(p, 0, 1, alpha=alpha)
+                    p_fp4, p_sf, p_alpha = nvfp4_quantize(p, 0, 1, alpha=alpha)
 
                     # o = p @ v
                     o = nvfp4_matmul(
@@ -149,7 +149,7 @@ def test_attention_bench(B, N, H, D, layout):
 
     # o_ref = get_ref(q, k, v, B, N, H, D)
     o_sdp = get_sdp(q, k, v, layout)
-    print("o ac4k:")
+    print("o sdp:")
     print(o_sdp[0, :4, 0, :8])
 
     o = get_ac4k(q, k, v, layout)

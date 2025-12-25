@@ -61,8 +61,8 @@ setup(
                 'lib/cuda/nvfp4_matmul_sm120.cu',
                 'lib/cuda/_internal_nvfp4_matmul_sm120.cu',
                 'lib/cuda/nvfp4_quant_sm120.cu',
-                'lib/cuda/attention_sm120.cu',
-                'lib/cuda/quantize_sm120.cu',
+                'lib/cuda/nvfp4_attention_sm120.cu',
+                'lib/cuda/nvfp4_quantize_sm120.cu',
                 'lib/cuda/rope_3d_apply.cu'
             ],
             include_dirs=[

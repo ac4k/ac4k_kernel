@@ -73,7 +73,7 @@ __forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
 }
 
 template <bool Swizzle>
-__global__ void quantize_sm120_kernel(
+__global__ void nvfp4_quantize_sm120_kernel(
     NVFP4x2 *out, uint32_t *sf, const BF16 *in, const float *rcp_global_scale,
     int64_t in_dim0, int64_t in_dim1, int64_t /* cross-dim-size */ in_dim2,
     int64_t /* reduce-dim-size */ in_dim3, int64_t in_stride0,
@@ -184,10 +184,11 @@ __global__ void quantize_sm120_kernel(
 ///
 /// SF layout
 /// [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x E4M3
-void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
-                    torch::Tensor const &in,
-                    torch::Tensor const &rcp_global_scale, uint32_t cross_dim,
-                    uint32_t reduce_dim, bool swizzle) {
+void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
+                          torch::Tensor const &in,
+                          torch::Tensor const &rcp_global_scale,
+                          uint32_t cross_dim, uint32_t reduce_dim,
+                          bool swizzle) {
   static_assert(TILE_BLOCK_QUANTIZE_DIM == REDUCE_DIM_ALIGN_SIZE);
   /// Check in
   std::vector<int64_t> in_shape;
@@ -269,7 +270,7 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
   dim3 block(TILE_BLOCK_QUANTIZE_DIM / TILE_THREAD_QUANTIZE_DIM,
              TILE_BLOCK_NON_QUANTIZE_DIM / TILE_THREAD_NON_QUANTIZE_DIM);
   if (swizzle) {
-    quantize_sm120_kernel<true><<<grid, block, 0, stream>>>(
+    nvfp4_quantize_sm120_kernel<true><<<grid, block, 0, stream>>>(
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
         reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),
@@ -278,7 +279,7 @@ void quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
         in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
         in_stride[cross_dim], in_stride[reduce_dim]);
   } else {
-    quantize_sm120_kernel<false><<<grid, block, 0, stream>>>(
+    nvfp4_quantize_sm120_kernel<false><<<grid, block, 0, stream>>>(
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
         reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),

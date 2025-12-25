@@ -59,23 +59,23 @@ def nvfp4_quant(input: torch.Tensor, input_global_scale: torch.Tensor):
 
 
 @lru_cache(maxsize=1)
-def _load_cuda_quantize():
+def _load_cuda_nvfp4_quantize():
     try:
-        from ._cuda_ops import quantize_sm120
-        return quantize_sm120
+        from ._cuda_ops import nvfp4_quantize_sm120
+        return nvfp4_quantize_sm120
     except ImportError as e:
         raise ImportError(
-            "CUDA operator 'quantize_sm120' failed to load. "
+            "CUDA operator 'nvfp4_quantize_sm120' failed to load. "
             "Possible reasons: CUDA not available, or module not compiled."
         ) from e
 
 
-def quantize(input: torch.Tensor,
-             cross_dim,
-             reduce_dim,
-             swizzle=False,
-             output=None,
-             sf=None):
+def nvfp4_quantize(input: torch.Tensor,
+                   cross_dim,
+                   reduce_dim,
+                   swizzle=False,
+                   output=None,
+                   sf=None):
     """
     Quantize input tensor from bfloat16 to nvfp4.
     Args:
@@ -95,7 +95,7 @@ def quantize(input: torch.Tensor,
     CROSS_DIM_ALIGN_SIZE = 16
     REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF
 
-    quantize_sm120 = _load_cuda_quantize()
+    quantize_kernel = _load_cuda_nvfp4_quantize()
 
     def ceil_div(x, y):
         return (x + y - 1) // y
@@ -153,6 +153,6 @@ def quantize(input: torch.Tensor,
                          dtype=torch.float8_e4m3fn,
                          device=input.device)
 
-    quantize_sm120(output, sf, input, alpha, cross_dim, reduce_dim, swizzle)
+    quantize_kernel(output, sf, input, alpha, cross_dim, reduce_dim, swizzle)
 
     return output, sf, global_scale
