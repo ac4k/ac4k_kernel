@@ -73,7 +73,6 @@ def _load_cuda_quantize():
 def quantize(input: torch.Tensor,
              cross_dim,
              reduce_dim,
-             alpha=None,
              swizzle=False,
              output=None,
              sf=None):
@@ -108,10 +107,8 @@ def quantize(input: torch.Tensor,
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
     # alpha = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(
     #     torch.abs(input.view(-1))).to(torch.float32))
-    if alpha is None:
-        alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
-                 torch.amax(torch.abs(input.view(-1)), dim=-1)).to(
-                     torch.float32)
+    alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
+             torch.amax(torch.abs(input.view(-1)), dim=-1)).to(torch.float32)
     global_scale = 1 / alpha
 
     # refine dim
