@@ -44,7 +44,7 @@ constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 //===----------------------------------------------------------------------===//
 
 /// Block level tile size
-constexpr int TILE_DOT_BLOCK_M = 64;
+constexpr int TILE_DOT_BLOCK_M = 128;
 constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
 constexpr int TILE_DOT0_BLOCK_N = 128;
 constexpr int TILE_DOT0_BLOCK_K = 128;
@@ -248,6 +248,18 @@ __forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
 }
 
 //===----------------------------------------------------------------------===//
+// Heterogeneous allocation of registers for producer & consumer.
+//===----------------------------------------------------------------------===//
+
+template <uint32_t RegCount> __forceinline__ __device__ void reg_alloc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+//===----------------------------------------------------------------------===//
 // Convert 8xfloat32 to 8xNVFP4 (represented as one uint32_t)
 //===----------------------------------------------------------------------===//
 
@@ -361,7 +373,7 @@ __forceinline__ __device__ float fast_exp(float x) {
 }
 
 template <CUtensorMapSwizzle Swizzle>
-__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     void nvfp4_mha_fwd_kernel(
         BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
         int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
@@ -390,7 +402,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   int lane_id = tid % 32;
   int warp_id = tid / 32;
   bool is_consumer = tid < CONSUMER_THREAD_NUM;
-  bool is_producer = tid >= CONSUMER_THREAD_NUM;
+  bool is_producer = !is_consumer;
 
   // dot0 = q @ k
   // dot1 = p @ v
@@ -410,43 +422,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   int warp_dot0_n = 0;
   int warp_dot1_m = warp_id * TILE_DOT1_WARP_M;
   int warp_dot1_n = 0;
-
-  //===--------------------------------------------------------------------===//
-  // Define fragment
-  //===--------------------------------------------------------------------===//
-
-  /// Q
-  AFrag_NVFP4_16x64 q_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                          [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
-  uint32_t q_sf_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
-                    [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
-  /// max(row max of S=Q @ K)
-  float max0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  float max1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  /// l（sum of exp)
-  float l0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-  float l1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
-#pragma unroll
-  for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
-    max0[i] = -INFINITY;
-    max1[i] = -INFINITY;
-    l0[i] = 0.0f;
-    l1[i] = 0.0f;
-  }
-  /// o: P @ V
-  DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
-                       [TILE_DOT1_WARP_N / TILE_ATOMIC_N];
-#pragma unroll
-  for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
-#pragma unroll
-    for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-#pragma unroll
-      for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-        /// Clear o fragment
-        o_frag[i][j].data[k] = 0.0f;
-      }
-    }
-  }
 
   //===--------------------------------------------------------------------===//
   // Define shared memory for q, k and v
@@ -487,7 +462,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
   __shared__ __align__(8) uint64_t empty_bar[STAGE];
   __shared__ __align__(8) uint64_t full_bar[STAGE];
-  if (is_producer) {
+  if (is_producer && lane_id == 0) {
 #pragma unroll
     for (int i = 0; i < STAGE; ++i) {
       init_barrier(&empty_bar[i], WARP_NUM);
@@ -501,60 +476,63 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   // Producer
   //===--------------------------------------------------------------------===//
 
-  if (is_producer && tid == CONSUMER_THREAD_NUM) {
-    int stage = 0;
-    int phase = 0;
+  if (is_producer) {
+    // reg_dealloc<24>();
+    if (tid == CONSUMER_THREAD_NUM) {
+      int stage = 0;
+      int phase = 0;
 
-    /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
-
-    /// Acquire
-    wait(&empty_bar[stage], phase);
-    load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
-                  block_b, block_h, block_dot_m, 0);
-    load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, block_dot_m);
-    load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map, &full_bar[stage],
-                  block_b, block_h, 0, 0);
-    /// Commit
-    expect_bytes(&full_bar[stage],
-                 TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                     TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
-                     TILE_V_SF_BLOCK_SIZE);
-
-    ++stage;
-
-    /// Next
-    for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
-         dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
-      if (stage == STAGE) {
-        stage = 0;
-        phase ^= 1;
-      }
+      /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
 
       /// Acquire
       wait(&empty_bar[stage], phase);
-
-      /// TMA K/V and K_SF/V_SF
+      load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
+                    block_b, block_h, block_dot_m, 0);
+      load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, block_dot_m);
       load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                    block_b, block_h, dot0_n, 0);
+                    block_b, block_h, 0, 0);
       load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
-                    &full_bar[stage], block_b, block_h, 0, dot0_n);
+                    &full_bar[stage], block_b, block_h, 0, 0);
       load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                    block_b, block_h, 0, dot0_n / ELES_PER_NVFP4x2);
+                    block_b, block_h, 0, 0);
       load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
-                    &full_bar[stage], block_b, block_h,
-                    dot0_n / (BLOCK_SIZE * 4), 0);
-
+                    &full_bar[stage], block_b, block_h, 0, 0);
       /// Commit
-      expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                                         TILE_K_SF_BLOCK_SIZE +
-                                         TILE_V_SF_BLOCK_SIZE);
+      expect_bytes(&full_bar[stage],
+                   TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                       TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
+                       TILE_V_SF_BLOCK_SIZE);
+
+      ++stage;
+
+      /// Next
+      for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
+           dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
+        if (stage == STAGE) {
+          stage = 0;
+          phase ^= 1;
+        }
+
+        /// Acquire
+        wait(&empty_bar[stage], phase);
+
+        /// TMA K/V and K_SF/V_SF
+        load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
+                      block_b, block_h, dot0_n, 0);
+        load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
+                      &full_bar[stage], block_b, block_h, 0, dot0_n);
+        load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
+                      block_b, block_h, 0, dot0_n / ELES_PER_NVFP4x2);
+        load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
+                      &full_bar[stage], block_b, block_h,
+                      dot0_n / (BLOCK_SIZE * 4), 0);
+
+        /// Commit
+        expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
+                                           TILE_K_SF_BLOCK_SIZE +
+                                           TILE_V_SF_BLOCK_SIZE);
+      }
     }
   } // end if (is_producer)
 
@@ -562,11 +540,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   // Consumer
   //===--------------------------------------------------------------------===//
 
-  if (is_consumer) {
+  else {
+    // reg_alloc<200>();
     if (lane_id == 0) {
 #pragma unroll
       for (int i = 0; i < STAGE; ++i) {
         arrive(&empty_bar[i], 1);
+      }
+    }
+
+    //===------------------------------------------------------------------===//
+    // Define fragment
+    //===------------------------------------------------------------------===//
+
+    /// Q
+    AFrag_NVFP4_16x64 q_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                            [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
+    uint32_t q_sf_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
+                      [TILE_DOT0_WARP_K / TILE_ATOMIC_K];
+    /// max(row max of S=Q @ K)
+    float max0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float max1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    /// l（sum of exp)
+    float l0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+    float l1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
+#pragma unroll
+    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
+      max0[i] = -INFINITY;
+      max1[i] = -INFINITY;
+      l0[i] = 0.0f;
+      l1[i] = 0.0f;
+    }
+    /// o: P @ V
+    DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_ATOMIC_M]
+                         [TILE_DOT1_WARP_N / TILE_ATOMIC_N];
+#pragma unroll
+    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
+#pragma unroll
+      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
+#pragma unroll
+        for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+          /// Clear o fragment
+          o_frag[i][j].data[k] = 0.0f;
+        }
       }
     }
 
