@@ -1,4 +1,4 @@
-from ac4k_kernel.ops import quantize
+from ac4k_kernel.ops import nvfp4_quantize
 
 from functools import lru_cache
 import torch
@@ -16,22 +16,37 @@ def _load_cuda_nvfp4_mha():
         ) from e
 
 
-def nvfp4_attention(q, k, v, out=None):
+def nvfp4_attention(q, k, v, layout="BNHD", out=None):
+    assert layout in ["BNHD", "BHND"], "Unsupported layout: {}".format(layout)
+
     _nvfp4_mha_sm120 = _load_cuda_nvfp4_mha()
 
-    B, Nq, H, Dqk = q.shape
-    _, _, _, Dv = v.shape
+    B, Dqk = q.shape[0], q.shape[-1]
+    Dv = v.shape[-1]
+    if layout == "BNHD":
+        Nq, H = q.shape[1], q.shape[2]
+    else:
+        H, Nq = q.shape[1], q.shape[2]
 
-    q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
-    k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
-    v_fp4, v_sf, v_alpha = quantize(v, 3, 1, swizzle=True)
+    N_dim = 1 if layout == "BNHD" else 2
+    q_fp4, q_sf, q_alpha = nvfp4_quantize(q, N_dim, 3)
+    k_fp4, k_sf, k_alpha = nvfp4_quantize(k, N_dim, 3)
+    v_fp4, v_sf, v_alpha = nvfp4_quantize(v, 3, N_dim, swizzle=True)
 
+    # Alloc output tensor
     if out is None:
-        out = torch.empty((B, H, Nq, Dv), dtype=torch.bfloat16, device="cuda")
+        out_shape = (B, Nq, H, Dv) if layout == "BNHD" else (B, H, Nq, Dv)
+        out = torch.empty(out_shape, dtype=torch.bfloat16, device="cuda")
 
-    _nvfp4_mha_sm120(out, q_fp4, q_sf, k_fp4, k_sf, v_fp4, v_sf,
-                     q_alpha * k_alpha, v_alpha, Dqk)
+    # Permute to BHND
+    if layout == "BNHD":
+        out = out.permute(0, 2, 1, 3)
 
-    out = out.transpose(1, 2).contiguous()
+    _nvfp4_mha_sm120(out, q_fp4, q_sf, q_alpha, k_fp4, k_sf, k_alpha, v_fp4,
+                     v_sf, v_alpha, Dqk)
+
+    # Permute back to origin layout
+    if layout == "BNHD":
+        out = out.permute(0, 2, 1, 3)
 
     return out

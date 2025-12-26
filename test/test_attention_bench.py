@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-from ac4k_kernel.ops import nvfp4_matmul, nvfp4_attention, quantize
+from ac4k_kernel.ops import nvfp4_matmul, nvfp4_attention, nvfp4_quantize
 
 
 def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
@@ -23,10 +23,17 @@ def cosine_similarity_4d_global(tensor1, tensor2, eps=1e-8):
     return similarity.item()  # 返回标量值
 
 
-def test_attention_bench(B, N, H, D):
-    q = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
-    k = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
-    v = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+def test_attention_bench(B, N, H, D, layout):
+    assert layout in ["BHND", "BNHD"], "Unsupported layout {}".format(layout)
+
+    if layout == "BNHD":
+        q = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+        k = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+        v = torch.randn((B, N, H, D), dtype=torch.bfloat16, device="cuda")
+    else:
+        q = torch.randn((B, H, N, D), dtype=torch.bfloat16, device="cuda")
+        k = torch.randn((B, H, N, D), dtype=torch.bfloat16, device="cuda")
+        v = torch.randn((B, H, N, D), dtype=torch.bfloat16, device="cuda")
 
     def ceil_div(a, b):
         return (a + b - 1) // b
@@ -43,9 +50,9 @@ def test_attention_bench(B, N, H, D):
         return tensor
 
     def get_ref(q, k, v, B, N, H, D):
-        q_fp4, q_sf, q_alpha = quantize(q, 1, 3)
-        k_fp4, k_sf, k_alpha = quantize(k, 1, 3)
-        v_fp4, v_sf, v_alpha = quantize(v, 3, 1)
+        q_fp4, q_sf, q_alpha = nvfp4_quantize(q, 1, 3)
+        k_fp4, k_sf, k_alpha = nvfp4_quantize(k, 1, 3)
+        v_fp4, v_sf, v_alpha = nvfp4_quantize(v, 3, 1)
         qk_alpha = q_alpha * k_alpha
 
         OUT = torch.empty((B, N, H, D), dtype=torch.bfloat16, device="cuda")
@@ -109,7 +116,7 @@ def test_attention_bench(B, N, H, D):
 
                     # qunatize
                     p = p.to(torch.bfloat16)
-                    p_fp4, p_sf, p_alpha = quantize(p, 0, 1, alpha=alpha)
+                    p_fp4, p_sf, p_alpha = nvfp4_quantize(p, 0, 1, alpha=alpha)
 
                     # o = p @ v
                     o = nvfp4_matmul(
@@ -126,39 +133,28 @@ def test_attention_bench(B, N, H, D):
 
         return OUT
 
-    def get_ref1(q, k, v, B, N, H, D):
-        s = torch.matmul(q, k.transpose(-2, -1)).to(torch.float32)
-        s = s / math.sqrt(D)
-
-        p = torch.softmax(s, dim=-1).to(torch.bfloat16)
-
-        o = torch.matmul(p, v)
-
-        # print("o ref1:")
-        # print(o)
-
-        return o.reshape(B, N, H, D)
-
-    def get_sdp(q, k, v):
-        o = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(
-            1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
-
-        print("o sdp:")
-        print(o[0, :4, 0, :8])
+    def get_ac4k(q, k, v, layout):
+        o = nvfp4_attention(q, k, v, layout=layout)
 
         return o
 
-    def get_ac4k(q, k, v):
-        o = nvfp4_attention(q, k, v)
-
-        print("o ac4k:")
-        print(o[0, :4, 0, :8])
-
-        return o
+    def get_sdp(q, k, v, layout):
+        if layout == "BHND":
+            return F.scaled_dot_product_attention(q, k, v)
+        else:
+            return F.scaled_dot_product_attention(q.transpose(1, 2),
+                                                  k.transpose(1, 2),
+                                                  v.transpose(1, 2)).transpose(
+                                                      1, 2).contiguous()
 
     # o_ref = get_ref(q, k, v, B, N, H, D)
-    o_sdp = get_sdp(q, k, v)
-    o = get_ac4k(q, k, v)
+    o_sdp = get_sdp(q, k, v, layout)
+    print("o sdp:")
+    print(o_sdp[0, :4, 0, :8])
+
+    o = get_ac4k(q, k, v, layout)
+    print("o ac4k:")
+    print(o[0, :4, 0, :8])
 
     similarity = cosine_similarity_4d_global(o, o_sdp)
     print(f"o vs o_sdp 整体余弦相似度: {similarity:.4f}")
@@ -172,8 +168,10 @@ def test_attention_bench(B, N, H, D):
 
 if __name__ == "__main__":
     torch.manual_seed(9567)
-    test_attention_bench(1, 64, 1, 128)
-    test_attention_bench(2, 128, 3, 128)
-    test_attention_bench(1, 33, 1, 128)
-    test_attention_bench(10, 330, 12, 100)
-    test_attention_bench(1, 444, 1, 88)
+    test_attention_bench(1, 64, 1, 128, "BNHD")
+    test_attention_bench(2, 128, 3, 128, "BNHD")
+    test_attention_bench(1, 33, 1, 128, "BNHD")
+    test_attention_bench(10, 330, 12, 100, "BNHD")
+    test_attention_bench(1, 444, 1, 88, "BNHD")
+
+    test_attention_bench(2, 111, 2, 100, "BHND")

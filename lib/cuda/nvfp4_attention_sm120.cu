@@ -24,7 +24,13 @@
   CHECK_TH_CUDA(x, m);                                                         \
   CHECK_CONTIGUOUS(x, m);                                                      \
   CHECK_TYPE(x, st, m)
-#define CHECK_OUTPUT(x, st, m) CHECK_INPUT(x, st, m)
+#define CHECK_OUTPUT(x, st, m)                                                 \
+  CHECK_TH_CUDA(x, m);                                                         \
+  CHECK_TYPE(x, st, m)
+#define CHECK_SCALAR(x, st, m)                                                 \
+  CHECK_TH_CUDA(x, m);                                                         \
+  CHECK_TYPE(x, st, m);                                                        \
+  TORCH_CHECK(x.dim() == 0, m)
 
 namespace ac4k {
 
@@ -374,21 +380,12 @@ __forceinline__ __device__ float fast_exp(float x) {
 
 template <CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
-    void nvfp4_mha_fwd_kernel(
+    void nvfp4_mha_fwd_sm120_kernel(
         BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
-        int64_t o_d_stride, const NVFP4x2 *Q, int64_t q_b_stride,
-        int64_t q_n_stride, int64_t q_h_stride, int64_t q_d_stride,
-        const E4M3 *Q_SF, int64_t q_sf_quantize_stride,
-        int64_t q_sf_non_quantize_stride, const NVFP4x2 *K, int64_t k_b_stride,
-        int64_t k_n_stride, int64_t k_h_stride, int64_t k_d_stride,
-        const E4M3 *K_SF, int64_t k_sf_quantize_stride,
-        int64_t k_sf_non_quantize_stride, const NVFP4x2 *V, int64_t v_b_stride,
-        int64_t v_h_stride, int64_t v_d_stride, int64_t v_n_stride,
-        const E4M3 *V_SF, int64_t v_sf_quantize_stride,
-        int64_t v_sf_non_quantize_stride, const float *alpha0,
-        const float *alpha1, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
-        int64_t Dqk, int64_t Dv, float qk_norm,
-        const __grid_constant__ CUtensorMap q_tensor_map,
+        int64_t o_d_stride, const float *q_global_scale,
+        const float *k_global_scale, const float *v_global_scale, int64_t B,
+        int64_t H, int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv,
+        float qk_norm, const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
         const __grid_constant__ CUtensorMap q_sf_tensor_map,
@@ -726,7 +723,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
       /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
       ///         8 * 4 = 32 cycles
-      float qk_scale = *alpha0 * qk_norm;
+      float qk_scale = (*q_global_scale) * (*k_global_scale) * qk_norm;
 #pragma unroll
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
@@ -924,8 +921,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     for (int i = 0; i < TILE_DOT1_WARP_M / TILE_ATOMIC_M; ++i) {
 #pragma unroll
       for (int j = 0; j < TILE_DOT1_WARP_N / TILE_ATOMIC_N; ++j) {
-        float scale0 = (1.0f / l0[i]) * (1.0f / (448 * 6)) * *alpha1;
-        float scale1 = (1.0f / l1[i]) * (1.0f / (448 * 6)) * *alpha1;
+        float scale0 = (1.0f / l0[i]) * (1.0f / (448 * 6)) * *v_global_scale;
+        float scale1 = (1.0f / l1[i]) * (1.0f / (448 * 6)) * *v_global_scale;
         o_frag[i][j].data[0] *= scale0;
         o_frag[i][j].data[1] *= scale0;
         o_frag[i][j].data[2] *= scale1;
@@ -986,21 +983,25 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
 //===--------------------------------------------------------------------===//
 // ac4k mha attention with nvfp4 acceleration
-// Q:     [B,   H,    Nq,     Dqk/2]xNVFP4
-// K:     [B,   H,    Nkv,    Dqk/2]xNVFP4
-// V:     [B,   H,    Dv,     Nkv/2]xNVFP4
-// O:     [B,   H,    Nq,     Dv]xNVFP4
-// Q_SF:  [B,   H,    Dqk/64, Nq,   4]xF8
-// K_SF:  [B,   H,    Dqk/64, Nkv,  4]xF8
-// V_SF:  [B,   H,    Dv/64,  Nkv,  4]xF8
-// alpha0: Q @ K global scale
-// alpha1: V global scale
+// Q               :[B,   H,    Nq,     Dqk/2]xNVFP4
+// K               :[B,   H,    Nkv,    Dqk/2]xNVFP4
+// V               :[B,   H,    Dv,     Nkv/2]xNVFP4
+// O               :[B,   H,    Nq,     Dv]xNVFP4
+// Q_SF            :[B,   H,    Dqk/64, Nq,   4]xF8
+// K_SF            :[B,   H,    Dqk/64, Nkv,  4]xF8
+// V_SF            :[B,   H,    Dv/64,  Nkv,  4]xF8
+// Q_GLOBAL_SCALE  :F32
+// K_GLOBAL_SCALE  :F32
+// V_GLOBAL_SCALE  :F32
+// Dqk             : Head dim size for Q and K
 //===--------------------------------------------------------------------===//
 
-void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
-                   torch::Tensor &k, torch::Tensor &k_sf, torch::Tensor &v,
-                   torch::Tensor &v_sf, torch::Tensor &alpha0,
-                   torch::Tensor &alpha1, int64_t Dqk) {
+void nvfp4_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
+                         torch::Tensor &q_sf, torch::Tensor &q_global_scale,
+                         torch::Tensor &k, torch::Tensor &k_sf,
+                         torch::Tensor &k_global_scale, torch::Tensor &v,
+                         torch::Tensor &v_sf, torch::Tensor &v_global_scale,
+                         int64_t Dqk) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Byte, "Q must be pack to uint8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
@@ -1029,6 +1030,8 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
               "==", align_up(Nq, CROSS_DIM_ALIGN_SIZE));
   TORCH_CHECK(q_sf.size(4) == 4, "Meet invalid q_sf size(4) with ",
               q_sf.size(4), "==", 4);
+  CHECK_SCALAR(q_global_scale, at::ScalarType::Float,
+               "q_global_scale must be a float tensor");
 
   /// CHECK K & K_SF
   CHECK_INPUT(k, at::ScalarType::Byte, "K must be pack to uint8 tensor");
@@ -1052,6 +1055,8 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
               "==", align_up(Nkv, CROSS_DIM_ALIGN_SIZE));
   TORCH_CHECK(k_sf.size(4) == 4, "Meet invalid k_sf size(4) with ",
               k_sf.size(4), "==", 4);
+  CHECK_SCALAR(k_global_scale, at::ScalarType::Float,
+               "k_global_scale must be a float tensor");
 
   /// CHECK V & V_SF
   CHECK_INPUT(v, at::ScalarType::Byte, "V must be pack to uint8 tensor");
@@ -1079,20 +1084,16 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
               "==", align_up(Dv, CROSS_DIM_ALIGN_SIZE));
   TORCH_CHECK(v_sf.size(4) == 4, "Meet invalid v_sf size(4) with ",
               v_sf.size(4), "==", 4);
+  CHECK_SCALAR(v_global_scale, at::ScalarType::Float,
+               "v_global_scale must be a float tensor");
 
   /// CHECK O
-  CHECK_INPUT(o, at::ScalarType::BFloat16, "O must be a bfloat16 tensor");
+  CHECK_OUTPUT(o, at::ScalarType::BFloat16, "O must be a bfloat16 tensor");
   TORCH_CHECK(o.dim() == 4, "O must be a 4D tensor");
   TORCH_CHECK(o.size(0) == B, "O must have the same batch size as Q");
   TORCH_CHECK(o.size(1) == H, "O must have the same head number as Q");
   TORCH_CHECK(o.size(2) == Nq, "O must have the same sequence length as Q");
   TORCH_CHECK(o.size(3) == Dv, "O must have the same dim as V");
-
-  /// CHECK alpha0 & alpha1
-  CHECK_INPUT(alpha0, at::ScalarType::Float, "alpha0 must be a float tensor");
-  TORCH_CHECK(alpha0.dim() == 0, "alpha0 must be a scalar");
-  CHECK_INPUT(alpha1, at::ScalarType::Float, "alpha1 must be a float tensor");
-  TORCH_CHECK(alpha1.dim() == 0, "alpha1 must be a scalar");
 
   /// TMA descriptor
   const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
@@ -1135,7 +1136,7 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
       static_cast<uint64_t>(v_sf.size(2)), static_cast<uint64_t>(v_sf.size(3)));
 
   /// Set dynamic shared memory size
-  auto *kernel = nvfp4_mha_fwd_kernel<SWIZZLE>;
+  auto *kernel = nvfp4_mha_fwd_sm120_kernel<SWIZZLE>;
   size_t smem_size =
       TILE_Q_BLOCK_SIZE +
       (TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE + TILE_Q_SF_BLOCK_SIZE +
@@ -1156,19 +1157,12 @@ void nvfp4_mha_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
       /* o h stride */ o.stride(1),
       /* o n stride */ o.stride(2),
       /* o d stride */ o.stride(3),
-      reinterpret_cast<const NVFP4x2 *>(q.data_ptr()), q.stride(0), q.stride(1),
-      q.stride(2), q.stride(3), reinterpret_cast<const E4M3 *>(q_sf.data_ptr()),
-      q_sf.stride(0), q_sf.stride(1),
-      reinterpret_cast<const NVFP4x2 *>(k.data_ptr()), k.stride(0), k.stride(1),
-      k.stride(2), k.stride(3), reinterpret_cast<const E4M3 *>(k_sf.data_ptr()),
-      k_sf.stride(0), k_sf.stride(1),
-      reinterpret_cast<const NVFP4x2 *>(v.data_ptr()), v.stride(0), v.stride(1),
-      v.stride(2), v.stride(3), reinterpret_cast<const E4M3 *>(v_sf.data_ptr()),
-      v_sf.stride(0), v_sf.stride(1),
-      reinterpret_cast<const float *>(alpha0.data_ptr()),
-      reinterpret_cast<const float *>(alpha1.data_ptr()), B, H, Nq, Nkv, Dqk,
-      Dv, 1.0f / std::sqrt(static_cast<float>(Dqk)), q_tensor_map, k_tensor_map,
-      v_tensor_map, q_sf_tensor_map, k_sf_tensor_map, v_sf_tensor_map);
+      reinterpret_cast<const float *>(q_global_scale.data_ptr()),
+      reinterpret_cast<const float *>(k_global_scale.data_ptr()),
+      reinterpret_cast<const float *>(v_global_scale.data_ptr()), B, H, Nq, Nkv,
+      Dqk, Dv, 1.0f / std::sqrt(static_cast<float>(Dqk)), q_tensor_map,
+      k_tensor_map, v_tensor_map, q_sf_tensor_map, k_sf_tensor_map,
+      v_sf_tensor_map);
 }
 
 } // namespace ac4k

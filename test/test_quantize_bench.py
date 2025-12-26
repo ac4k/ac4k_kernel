@@ -4,7 +4,7 @@ import random
 from functools import reduce
 import operator
 
-from ac4k_kernel.ops import nvfp4_quant, quantize
+from ac4k_kernel.ops import nvfp4_quant, nvfp4_quantize
 from utils import get_global_scale
 
 
@@ -87,7 +87,10 @@ def test_quantize_bench(shape, cross_dim, reduce_dim, swizzle=False):
     origin_cross_dim_size = input.shape[cross_dim]
     origin_reduce_dim_size = input.shape[reduce_dim]
 
-    output, sf, _ = quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
+    output, sf, _ = nvfp4_quantize(input,
+                                   cross_dim,
+                                   reduce_dim,
+                                   swizzle=swizzle)
     # reshape output
     output = output.reshape(-1, origin_cross_dim_size,
                             align_up(origin_reduce_dim_size, 64) // 2)

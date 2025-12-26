@@ -18,11 +18,11 @@ PYBIND11_MODULE(_cuda_ops, m) {
         "CUDA-accelerated nvfp4_quant_sm120.");
 
   /// MHA forward
-  m.def("nvfp4_mha_fwd_sm120", &ac4k::nvfp4_mha_fwd,
-        "CUDA-accelerated mha fwd with nvfp4.");
+  m.def("nvfp4_mha_fwd_sm120", &ac4k::nvfp4_mha_fwd_sm120,
+        "CUDA-accelerated mha fwd with nvfp4 precision.");
 
-  /// quantize
-  m.def("quantize_sm120", &ac4k::quantize_sm120,
+  /// Quantize
+  m.def("nvfp4_quantize_sm120", &ac4k::nvfp4_quantize_sm120,
         "CUDA-accelerated bfloat16 to nvfp4 quantize.");
 
   /// RoPE 3D apply

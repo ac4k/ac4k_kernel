@@ -1,5 +1,46 @@
 import torch
 from functools import lru_cache
+import triton
+import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+    ],
+    key=['N'],
+)
+@triton.jit
+def _triton_abs_max_kernel(x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask, other=0)
+    abs_x = tl.abs(x)
+    block_max = tl.max(abs_x, 0).to(tl.float32)
+    out_ptrs = out_ptr + tl.zeros((BLOCK_SIZE, ), dtype=tl.int32)
+    tl.atomic_max(out_ptrs, block_max, mask=(tl.arange(0, BLOCK_SIZE) == 0))
+
+
+def _abs_max(x: torch.Tensor) -> torch.Tensor:
+    x_flat = x.flatten()
+    n_elements = x_flat.numel()
+
+    def grid(META):
+        return (triton.cdiv(n_elements, META['BLOCK_SIZE']), )
+
+    global_max_abs = torch.zeros((), dtype=torch.float32, device="cuda")
+    _triton_abs_max_kernel[grid](x_flat, global_max_abs, n_elements)
+
+    return global_max_abs
 
 
 @lru_cache(maxsize=1)
@@ -59,23 +100,23 @@ def nvfp4_quant(input: torch.Tensor, input_global_scale: torch.Tensor):
 
 
 @lru_cache(maxsize=1)
-def _load_cuda_quantize():
+def _load_cuda_nvfp4_quantize():
     try:
-        from ._cuda_ops import quantize_sm120
-        return quantize_sm120
+        from ._cuda_ops import nvfp4_quantize_sm120
+        return nvfp4_quantize_sm120
     except ImportError as e:
         raise ImportError(
-            "CUDA operator 'quantize_sm120' failed to load. "
+            "CUDA operator 'nvfp4_quantize_sm120' failed to load. "
             "Possible reasons: CUDA not available, or module not compiled."
         ) from e
 
 
-def quantize(input: torch.Tensor,
-             cross_dim,
-             reduce_dim,
-             swizzle=False,
-             output=None,
-             sf=None):
+def nvfp4_quantize(input: torch.Tensor,
+                   cross_dim,
+                   reduce_dim,
+                   swizzle=False,
+                   output=None,
+                   sf=None):
     """
     Quantize input tensor from bfloat16 to nvfp4.
     Args:
@@ -95,7 +136,7 @@ def quantize(input: torch.Tensor,
     CROSS_DIM_ALIGN_SIZE = 16
     REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF
 
-    quantize_sm120 = _load_cuda_quantize()
+    quantize_kernel = _load_cuda_nvfp4_quantize()
 
     def ceil_div(x, y):
         return (x + y - 1) // y
@@ -105,10 +146,10 @@ def quantize(input: torch.Tensor,
 
     FLOAT4_E2M1_MAX = 6.0
     FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    # alpha = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / (torch.amax(
-    #     torch.abs(input.view(-1))).to(torch.float32))
+    # Opt: use f32 abs max
+    # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
     alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
-             torch.amax(torch.abs(input.view(-1)), dim=-1)).to(torch.float32)
+             (_abs_max(input).to(torch.bfloat16))).to(torch.float32)
     global_scale = 1 / alpha
 
     # refine dim
@@ -148,11 +189,10 @@ def quantize(input: torch.Tensor,
                              dtype=torch.uint8,
                              device=input.device)
     if sf is None:
-        # FIXME: fix zero memset
-        sf = torch.zeros(sf_shape,
+        sf = torch.empty(sf_shape,
                          dtype=torch.float8_e4m3fn,
                          device=input.device)
 
-    quantize_sm120(output, sf, input, alpha, cross_dim, reduce_dim, swizzle)
+    quantize_kernel(output, sf, input, alpha, cross_dim, reduce_dim, swizzle)
 
     return output, sf, global_scale
