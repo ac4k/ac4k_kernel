@@ -505,9 +505,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                   c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
                   c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
             } // end loop atomic_n
-          } // end loop atomic_m
-        } // end loop atomic_k
-      } // end loop warp_k
+          }   // end loop atomic_m
+        }     // end loop atomic_k
+      }       // end loop warp_k
 
       if (lane_id == 0) {
         arrive(&empty_bar[stage], 1);
@@ -534,8 +534,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
              ++idx) {
           c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
         } // end loop idx
-      } // end loop atomic_n_cnt
-    } // end loop atomic_m_cnt
+      }   // end loop atomic_n_cnt
+    }     // end loop atomic_m_cnt
 
     //===------------------------------------------------------------------===//
     // Apply bias
@@ -561,8 +561,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                   __bfloat162float(bias[n]);
             }
           } // end loop idx
-        } // end loop atomic_n_cnt
-      } // end loop atomic_m_cnt
+        }   // end loop atomic_n_cnt
+      }     // end loop atomic_m_cnt
     }
 
     //===------------------------------------------------------------------===//
@@ -578,23 +578,43 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 #pragma unroll
         for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
              ++atomic_n_cnt) {
-#pragma unroll
-          for (int idx = 0;
-               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
-               ++idx) {
-            int thread_m = atomic_m_cnt * TILE_ATOMIC_M +
-                           c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(
-                               lane_id, idx);
+          __nv_bfloat162 out;
+          __nv_bfloat16 *out_bf16 = reinterpret_cast<__nv_bfloat16 *>(&out);
+          {
+            out_bf16[0] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
+            out_bf16[1] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
+
+            int thread_m =
+                atomic_m_cnt * TILE_ATOMIC_M +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 0);
             int m = block_m + warp_m + thread_m;
-            int thread_n = atomic_n_cnt * TILE_ATOMIC_N +
-                           c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
-                               lane_id, idx);
+            int thread_n =
+                atomic_n_cnt * TILE_ATOMIC_N +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 0);
             int n = block_n + warp_n + thread_n;
-            D[m * N + n] = __float2bfloat16_rn(
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
-          } // end loop idx
+            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+          }
+
+          {
+            out_bf16[0] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
+            out_bf16[1] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
+
+            int thread_m =
+                atomic_m_cnt * TILE_ATOMIC_M +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 2);
+            int m = block_m + warp_m + thread_m;
+            int thread_n =
+                atomic_n_cnt * TILE_ATOMIC_N +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 2);
+            int n = block_n + warp_n + thread_n;
+            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+          }
         } // end loop atomic_n_cnt
-      } // end loop atomic_m_cnt
+      }   // end loop atomic_m_cnt
     } else {
       // Meet out-of-range
 
@@ -638,8 +658,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             D[m * N + n] = __float2bfloat16_rn(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
           } // end loop idx
-        } // end loop atomic_n_cnt
-      } // end loop atomic_m_cnt
+        }   // end loop atomic_n_cnt
+      }     // end loop atomic_m_cnt
     }
   } // end if consumer
 }
