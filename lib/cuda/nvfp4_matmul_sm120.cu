@@ -34,6 +34,8 @@ constexpr int ELES_PER_NVFP4x2 = 2;
 // Define tile size for block level, warp level and atomic level
 //===----------------------------------------------------------------------===//
 
+const int GROUP_SIZE_M = 16;
+
 /// Block level tile size
 const int TILE_BLOCK_M = 128;
 const int TILE_BLOCK_N = 128;
@@ -260,6 +262,29 @@ load_sf_async(void *dst, void const *const tma_map, uint64_t *bar,
 }
 
 //===----------------------------------------------------------------------===//
+// Program ID
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ int2 get_program_id(int M, int N) {
+  /// Program ID
+  int pid = blockIdx.x;
+  /// Number of program ids along the M axis
+  int num_pid_m = ceil_div(M, TILE_BLOCK_M);
+  /// Number of programs ids along the N axis
+  int num_pid_n = ceil_div(N, TILE_BLOCK_N);
+  int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
+  int group_id = pid / num_pid_in_group;
+  int first_pid_m = group_id * GROUP_SIZE_M;
+  int group_size_m = (num_pid_m - first_pid_m) < GROUP_SIZE_M
+                         ? num_pid_m - first_pid_m
+                         : GROUP_SIZE_M;
+  int pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m);
+  int pid_n = (pid % num_pid_in_group) / group_size_m;
+
+  return make_int2(pid_m, pid_n);
+}
+
+//===----------------------------------------------------------------------===//
 // Matrix matmul kernel
 // D bf16 dtype
 // A/B nvfp4 dtype
@@ -286,8 +311,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   bool is_consumer = tid < CONSUMER_THREAD_NUM;
   bool is_producer = tid >= CONSUMER_THREAD_NUM;
 
-  int block_m = blockIdx.y * TILE_BLOCK_M;
-  int block_n = blockIdx.x * TILE_BLOCK_N;
+  int2 pid = get_program_id(M, N);
+  int block_m = pid.x * TILE_BLOCK_M;
+  int block_n = pid.y * TILE_BLOCK_N;
   int warp_id = tid / 32;
   int warp_id_m = warp_id / WARP_N_NUM;
   int warp_id_n = warp_id % WARP_N_NUM;
@@ -505,9 +531,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                   c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
                   c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
             } // end loop atomic_n
-          }   // end loop atomic_m
-        }     // end loop atomic_k
-      }       // end loop warp_k
+          } // end loop atomic_m
+        } // end loop atomic_k
+      } // end loop warp_k
 
       if (lane_id == 0) {
         arrive(&empty_bar[stage], 1);
@@ -534,8 +560,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
              ++idx) {
           c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
         } // end loop idx
-      }   // end loop atomic_n_cnt
-    }     // end loop atomic_m_cnt
+      } // end loop atomic_n_cnt
+    } // end loop atomic_m_cnt
 
     //===------------------------------------------------------------------===//
     // Apply bias
@@ -561,8 +587,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                   __bfloat162float(bias[n]);
             }
           } // end loop idx
-        }   // end loop atomic_n_cnt
-      }     // end loop atomic_m_cnt
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
     }
 
     //===------------------------------------------------------------------===//
@@ -614,7 +640,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
           }
         } // end loop atomic_n_cnt
-      }   // end loop atomic_m_cnt
+      } // end loop atomic_m_cnt
     } else {
       // Meet out-of-range
 
@@ -658,8 +684,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             D[m * N + n] = __float2bfloat16_rn(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
           } // end loop idx
-        }   // end loop atomic_n_cnt
-      }     // end loop atomic_m_cnt
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
     }
   } // end if consumer
 }
@@ -737,7 +763,7 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   TORCH_CHECK(alpha.dim() == 0, "alpha must be a scalar");
 
   /// Grid & Block dim3
-  dim3 grid(ceil_div(N, TILE_BLOCK_N), ceil_div(M, TILE_BLOCK_M));
+  dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
   dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
 
   /// Set dynamic shared memory size
@@ -749,9 +775,8 @@ void nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
   CHECK_CUDA_ERROR(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-  /// Get stream
-  at::cuda::CUDAGuard device_guard{(char)A.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  /// Get CUDA stream
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   /// TMA descriptor
   CUtensorMap a_tensor_map =
