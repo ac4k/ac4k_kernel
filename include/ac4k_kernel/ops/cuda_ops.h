@@ -18,6 +18,10 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                           uint32_t cross_dim, uint32_t reduce_dim,
                           bool swizzle);
 
+void fp8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
+                        torch::Tensor const &in, torch::Tensor const &scale_max,
+                        uint32_t cross_dim, uint32_t reduce_dim, bool swizzle);
+
 void nvfp4_quant_sm120(torch::Tensor &output, torch::Tensor &output_sf,
                        torch::Tensor const &input,
                        torch::Tensor const &input_global_scale);

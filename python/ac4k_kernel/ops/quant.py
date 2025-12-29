@@ -111,14 +111,27 @@ def _load_cuda_nvfp4_quantize():
         ) from e
 
 
-def nvfp4_quantize(input: torch.Tensor,
-                   cross_dim,
-                   reduce_dim,
-                   swizzle=False,
-                   output=None,
-                   sf=None):
+@lru_cache(maxsize=1)
+def _load_cuda_fp8_quantize():
+    try:
+        from ._cuda_ops import fp8_quantize_sm120
+        return fp8_quantize_sm120
+    except ImportError as e:
+        raise ImportError(
+            "CUDA operator 'fp8_quantize_sm120' failed to load. "
+            "Possible reasons: CUDA not available, or module not compiled."
+        ) from e
+
+
+def quantize(input: torch.Tensor,
+             cross_dim,
+             reduce_dim,
+             precision="nvfp4",
+             swizzle=False,
+             output=None,
+             sf=None):
     """
-    Quantize input tensor from bfloat16 to nvfp4.
+    Quantize input tensor from bfloat16 to fp8e4m3/nvfp4.
     Args:
         input: The input tensor to be quantized to nvfp4.
         cross_dim: M or N dimension in the input tensor.
@@ -129,14 +142,7 @@ def nvfp4_quantize(input: torch.Tensor,
     """
 
     assert input.ndim >= 2 and input.ndim <= 4, "input tensor must be 2D, 3D or 4D"
-
-    BLOCK_SIZE = 16
-    NVFP4_ELES_PER_BYTE = 2
-    PACK_SF = 4
-    CROSS_DIM_ALIGN_SIZE = 16
-    REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF
-
-    quantize_kernel = _load_cuda_nvfp4_quantize()
+    assert precision in ["nvfp4", "fp8e4m3"]
 
     def ceil_div(x, y):
         return (x + y - 1) // y
@@ -144,55 +150,108 @@ def nvfp4_quantize(input: torch.Tensor,
     def align_up(x, y):
         return ceil_div(x, y) * y
 
-    FLOAT4_E2M1_MAX = 6.0
-    FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    # Opt: use f32 abs max
-    # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
-    alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
-             (_abs_max(input).to(torch.bfloat16))).to(torch.float32)
-    global_scale = 1 / alpha
-
-    # refine dim
+    # Refine dim
     if cross_dim < 0:
         cross_dim += input.ndim
     if reduce_dim < 0:
         reduce_dim += input.ndim
     assert cross_dim != reduce_dim, "cross_dim and reduce_dim must be different"
 
-    # shape inference for out and sf
-    input_shape = input.shape
-    # out
-    # out layout: [xx, xx, cross_dim_align, reduce_dim_align / 2] x u8
-    output_shape = []
-    for i in range(len(input_shape)):
-        if i != cross_dim and i != reduce_dim:
-            output_shape.append(input_shape[i])
-    output_shape.append(input_shape[cross_dim])
-    output_shape.append(
-        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
-        NVFP4_ELES_PER_BYTE)
-    # sf
-    # sf layout: [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x f8
-    sf_shape = []
-    for i in range(len(input_shape)):
-        if i != cross_dim and i != reduce_dim:
-            sf_shape.append(input_shape[i])
-    sf_shape.append(
-        align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
-        (BLOCK_SIZE * PACK_SF))
-    sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
-    sf_shape.append(4)
+    if precision == "fp8e4m3":
+        quantize_kernel = _load_cuda_fp8_quantize()
 
-    # alloc buffer for output and sf
-    if output is None:
-        output = torch.empty(output_shape,
-                             dtype=torch.uint8,
+        CROSS_DIM_ALIGN_SIZE = 16
+        REDUCE_DIM_ALIGN_SIZE = 16
+
+        # shape inference for out and sf
+        input_shape = input.shape
+        # out
+        # out layout: [xx, xx, cross_dim, reduce_dim_align] x f8
+        output_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                output_shape.append(input_shape[i])
+        output_shape.append(input_shape[cross_dim])
+        output_shape.append(
+            align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE))
+        # sf
+        # sf layout: [xx, xx, cross_dim_align] x f32
+        sf_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                sf_shape.append(input_shape[i])
+        sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
+
+        # alloc buffer for output and sf
+        if output is None:
+            output = torch.empty(output_shape,
+                                 dtype=torch.float8_e4m3fn,
+                                 device=input.device)
+        if sf is None:
+            sf = torch.empty(sf_shape,
+                             dtype=torch.float32,
                              device=input.device)
-    if sf is None:
-        sf = torch.empty(sf_shape,
-                         dtype=torch.float8_e4m3fn,
-                         device=input.device)
 
-    quantize_kernel(output, sf, input, alpha, cross_dim, reduce_dim, swizzle)
+        max_scale = torch.full([],
+                               2.25,
+                               dtype=torch.float32,
+                               device=input.device)
+        quantize_kernel(output, sf, input, max_scale, cross_dim, reduce_dim,
+                        swizzle)
 
-    return output, sf, global_scale
+        return output, sf
+    else:
+        quantize_kernel = _load_cuda_nvfp4_quantize()
+
+        BLOCK_SIZE = 16
+        NVFP4_ELES_PER_BYTE = 2
+        PACK_SF = 4
+        CROSS_DIM_ALIGN_SIZE = 16
+        REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF
+        FLOAT4_E2M1_MAX = 6.0
+        FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+        # Opt: use f32 abs max
+        # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
+        alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
+                 (_abs_max(input).to(torch.bfloat16))).to(torch.float32)
+        global_scale = 1 / alpha
+
+        # shape inference for out and sf
+        input_shape = input.shape
+        # out
+        # out layout: [xx, xx, cross_dim, reduce_dim_align / 2] x u8
+        output_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                output_shape.append(input_shape[i])
+        output_shape.append(input_shape[cross_dim])
+        output_shape.append(
+            align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
+            NVFP4_ELES_PER_BYTE)
+        # sf
+        # sf layout: [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x f8
+        sf_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                sf_shape.append(input_shape[i])
+        sf_shape.append(
+            align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
+            (BLOCK_SIZE * PACK_SF))
+        sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
+        sf_shape.append(4)
+
+        # alloc buffer for output and sf
+        if output is None:
+            output = torch.empty(output_shape,
+                                 dtype=torch.uint8,
+                                 device=input.device)
+        if sf is None:
+            sf = torch.empty(sf_shape,
+                             dtype=torch.float8_e4m3fn,
+                             device=input.device)
+
+        quantize_kernel(output, sf, input, alpha, cross_dim, reduce_dim,
+                        swizzle)
+
+        return output, sf, global_scale

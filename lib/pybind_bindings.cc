@@ -24,6 +24,8 @@ PYBIND11_MODULE(_cuda_ops, m) {
   /// Quantize
   m.def("nvfp4_quantize_sm120", &ac4k::nvfp4_quantize_sm120,
         "CUDA-accelerated bfloat16 to nvfp4 quantize.");
+  m.def("fp8_quantize_sm120", &ac4k::fp8_quantize_sm120,
+        "CUDA-accelerated fp8_quantize_sm120.");
 
   /// RoPE 3D apply
   m.def("rope_3d_apply", &ac4k::rope_3d_apply,

@@ -1,4 +1,4 @@
-from ac4k_kernel.ops import nvfp4_quantize
+from ac4k_kernel.ops import quantize
 
 from functools import lru_cache
 import torch
@@ -29,9 +29,9 @@ def nvfp4_attention(q, k, v, layout="BNHD", out=None):
         H, Nq = q.shape[1], q.shape[2]
 
     N_dim = 1 if layout == "BNHD" else 2
-    q_fp4, q_sf, q_alpha = nvfp4_quantize(q, N_dim, 3)
-    k_fp4, k_sf, k_alpha = nvfp4_quantize(k, N_dim, 3)
-    v_fp4, v_sf, v_alpha = nvfp4_quantize(v, 3, N_dim, swizzle=True)
+    q_fp4, q_sf, q_alpha = quantize(q, N_dim, 3)
+    k_fp4, k_sf, k_alpha = quantize(k, N_dim, 3)
+    v_fp4, v_sf, v_alpha = quantize(v, 3, N_dim, swizzle=True)
 
     # Alloc output tensor
     if out is None:
