@@ -33,7 +33,6 @@ using BF16 = __nv_bfloat16;
 using BF16x2 = __nv_bfloat162;
 using NVFP4x2 = uint8_t;
 using NVFP4x8 = uint32_t;
-using E4M3 = uint8_t;
 using F8E4M3 = uint8_t;
 using F8E4M3x4 = uint32_t;
 

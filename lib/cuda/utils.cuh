@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mma.cuh"
+
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -93,6 +95,38 @@ struct AFrag_NVFP4_16x64 {
   }
 };
 
+struct AFrag_FP8_16x32 {
+  using REG_TYPE = uint32_t;
+  static constexpr int THREADS_PER_CHUNK = 4;
+  static constexpr int BITS_PER_ELEMENT = 8;
+  static constexpr int REGISTERS_PER_THREAD = 4;
+  static constexpr int ELES_PER_REGISTER = 32 / BITS_PER_ELEMENT;
+  static constexpr int ELES_PER_THREAD =
+      ELES_PER_REGISTER * REGISTERS_PER_THREAD;
+
+  REG_TYPE data[REGISTERS_PER_THREAD];
+
+  __forceinline__ __device__ size_t get_row_with_ele(int tid, int ele_id) {
+    int group_id = tid / THREADS_PER_CHUNK;
+    return group_id + 8 * ((ele_id / ELES_PER_REGISTER) % 2);
+  }
+
+  __forceinline__ __device__ size_t get_col_with_ele(int tid, int ele_id) {
+    return ELES_PER_REGISTER * (tid % 4) + (ele_id % ELES_PER_REGISTER) +
+           16 * (ele_id / 8);
+  }
+
+  __forceinline__ __device__ size_t get_row_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_row_with_ele(tid, ele_id);
+  }
+
+  __forceinline__ __device__ size_t get_col_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_col_with_ele(tid, ele_id);
+  }
+};
+
 struct BFrag_NVFP4_64x8 {
   using REG_TYPE = uint32_t;
   static constexpr int THREADS_PER_CHUNK = 4;
@@ -126,6 +160,36 @@ struct BFrag_NVFP4_64x8 {
   }
 };
 
+struct BFrag_FP8_32x8 {
+  using REG_TYPE = uint32_t;
+  static constexpr int THREADS_PER_CHUNK = 4;
+  static constexpr int BITS_PER_ELEMENT = 8;
+  static constexpr int REGISTERS_PER_THREAD = 2;
+  static constexpr int ELES_PER_REGISTER = 32 / BITS_PER_ELEMENT;
+  static constexpr int ELES_PER_THREAD =
+      ELES_PER_REGISTER * REGISTERS_PER_THREAD;
+
+  REG_TYPE data[REGISTERS_PER_THREAD];
+
+  __forceinline__ __device__ size_t get_row_with_ele(int tid, int ele_id) {
+    return (ele_id % 8) + (tid % 4) * 8;
+  }
+
+  __forceinline__ __device__ size_t get_col_with_ele(int tid, int ele_id) {
+    return tid / THREADS_PER_CHUNK;
+  }
+
+  __forceinline__ __device__ size_t get_row_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_row_with_ele(tid, ele_id);
+  }
+
+  __forceinline__ __device__ size_t get_col_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_col_with_ele(tid, ele_id);
+  }
+};
+
 struct DFrag_F32_16x8 {
   using REG_TYPE = float;
   static constexpr int THREADS_PER_CHUNK = 4;
@@ -135,6 +199,35 @@ struct DFrag_F32_16x8 {
   static constexpr int ELES_PER_THREAD =
       ELES_PER_REGISTER * REGISTERS_PER_THREAD;
 
+  REG_TYPE data[REGISTERS_PER_THREAD];
+
+  __forceinline__ __device__ size_t get_row_with_ele(int tid, int ele_id) {
+    return (tid / THREADS_PER_CHUNK) + 8 * (ele_id / 2);
+  }
+
+  __forceinline__ __device__ size_t get_col_with_ele(int tid, int ele_id) {
+    return 2 * (tid % 4) + (ele_id % 2);
+  }
+
+  __forceinline__ __device__ size_t get_row_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_row_with_ele(tid, ele_id);
+  }
+
+  __forceinline__ __device__ size_t get_col_with_reg(int tid, int reg_id) {
+    int ele_id = reg_id * ELES_PER_REGISTER;
+    return get_col_with_ele(tid, ele_id);
+  }
+};
+
+struct DFrag_F16_16x8 {
+  using REG_TYPE = uint32_t;
+  static constexpr int THREADS_PER_CHUNK = 4;
+  static constexpr int BITS_PER_ELEMENT = 16;
+  static constexpr int REGISTERS_PER_THREAD = 2;
+  static constexpr int ELES_PER_REGISTER = 32 / BITS_PER_ELEMENT;
+  static constexpr int ELES_PER_THREAD =
+      ELES_PER_REGISTER * REGISTERS_PER_THREAD;
   REG_TYPE data[REGISTERS_PER_THREAD];
 
   __forceinline__ __device__ size_t get_row_with_ele(int tid, int ele_id) {

@@ -20,6 +20,9 @@ PYBIND11_MODULE(_cuda_ops, m) {
   /// MHA forward
   m.def("nvfp4_mha_fwd_sm120", &ac4k::nvfp4_mha_fwd_sm120,
         "CUDA-accelerated mha fwd with nvfp4 precision.");
+  m.def("qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120",
+        &ac4k::qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120,
+        "CUDA-accelerated mha fwd with qk nvfp4 and pv fp16(f32) precision.");
 
   /// Quantize
   m.def("nvfp4_quantize_sm120", &ac4k::nvfp4_quantize_sm120,
