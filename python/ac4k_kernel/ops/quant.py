@@ -126,6 +126,7 @@ def _load_cuda_fp8_quantize():
 def quantize(input: torch.Tensor,
              cross_dim,
              reduce_dim,
+             max_scale=None,
              precision="nvfp4",
              swizzle=False,
              output=None,
@@ -162,6 +163,7 @@ def quantize(input: torch.Tensor,
 
         CROSS_DIM_ALIGN_SIZE = 16
         REDUCE_DIM_ALIGN_SIZE = 16
+        MAX_SCALE = 2.25
 
         # shape inference for out and sf
         input_shape = input.shape
@@ -192,8 +194,10 @@ def quantize(input: torch.Tensor,
                              dtype=torch.float32,
                              device=input.device)
 
+        if max_scale is None:
+            max_scale = MAX_SCALE
         max_scale = torch.full([],
-                               2.25,
+                               max_scale,
                                dtype=torch.float32,
                                device=input.device)
         quantize_kernel(output, sf, input, max_scale, cross_dim, reduce_dim,
@@ -213,8 +217,10 @@ def quantize(input: torch.Tensor,
 
         # Opt: use f32 abs max
         # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
-        alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
-                 (_abs_max(input).to(torch.bfloat16))).to(torch.float32)
+        if max_scale is None:
+            max_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX
+        alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
+            torch.float32)
         global_scale = 1 / alpha
 
         # shape inference for out and sf

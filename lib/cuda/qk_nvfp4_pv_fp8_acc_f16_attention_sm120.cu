@@ -1015,9 +1015,9 @@ void qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120(
               v_sf.size(0), "==", B);
   TORCH_CHECK(v_sf.size(1) == H, "Meet invalid v_sf size(1) with ",
               v_sf.size(1), "==", H);
-  TORCH_CHECK(v_sf.size(3) == ceil_div(Dv, 16),
+  TORCH_CHECK(v_sf.size(2) == align_up(Dv, 16),
               "Meet invalid v_sf size(2) with ", v_sf.size(2),
-              "==", ceil_div(Dv, 16));
+              "==", align_up(Dv, 16));
 
   /// CHECK O
   CHECK_OUTPUT(o, at::ScalarType::BFloat16, "O must be a bfloat16 tensor");

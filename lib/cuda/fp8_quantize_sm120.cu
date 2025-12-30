@@ -36,10 +36,10 @@ using NVFP4x8 = uint32_t;
 using F8E4M3 = uint8_t;
 using F8E4M3x4 = uint32_t;
 
-constexpr int TILE_BLOCK_REDUCE_DIM = 128;
+constexpr int TILE_BLOCK_REDUCE_DIM = 64;
 constexpr int TILE_BLOCK_CROSS_DIM = 16;
 
-constexpr int TILE_THREAD_REDUCE_DIM = 8;
+constexpr int TILE_THREAD_REDUCE_DIM = 4;
 constexpr int TILE_THREAD_CROSS_DIM = 1;
 
 constexpr int CROSS_DIM_ALIGN_SIZE = 16;
@@ -98,7 +98,7 @@ __global__ void fp8_quantize_sm120_kernel(
   int dim0 = blockIdx.z;
   int dim1 = blockIdx.y;
   int dim2 =
-      blockIdx.y * TILE_BLOCK_CROSS_DIM + threadIdx.y * TILE_THREAD_CROSS_DIM;
+      blockIdx.x * TILE_BLOCK_CROSS_DIM + threadIdx.y * TILE_THREAD_CROSS_DIM;
 
   /// Step 0: get abs max per reduce dimension
   /// local abs max
@@ -106,7 +106,7 @@ __global__ void fp8_quantize_sm120_kernel(
   clear(local_abs_max);
   for (int i = tid * TILE_THREAD_REDUCE_DIM;
        i < align_up(in_dim3, TILE_BLOCK_REDUCE_DIM);
-       i += blockDim.x * TILE_THREAD_REDUCE_DIM) {
+       i += TILE_BLOCK_REDUCE_DIM /* blockDim.x * TILE_THREAD_REDUCE_DIM */) {
     BF16 in_bf16[TILE_THREAD_REDUCE_DIM];
 #pragma unroll
     for (int j = 0; j < TILE_THREAD_REDUCE_DIM; ++j) {
@@ -129,10 +129,11 @@ __global__ void fp8_quantize_sm120_kernel(
 
   /// abs max per reduce dimension
   /// Cross-lane max
-  float abs_max = __bfloat162float(__hmax(local_abs_max.x, local_abs_max.y));
   for (int i = 1; i < TILE_BLOCK_REDUCE_DIM / TILE_THREAD_REDUCE_DIM; i *= 2) {
-    abs_max = __shfl_down_sync(0xffffffff, abs_max, i);
+    local_abs_max =
+        __hmax2(__shfl_xor_sync(0xffffffff, local_abs_max, i), local_abs_max);
   }
+  float abs_max = __bfloat162float(__hmax(local_abs_max.x, local_abs_max.y));
 
   float scale = abs_max / (*scale_max);
 
@@ -145,11 +146,27 @@ __global__ void fp8_quantize_sm120_kernel(
     float recp_scale = (*scale_max) / abs_max;
     for (int i = tid * TILE_THREAD_REDUCE_DIM;
          i < align_up(in_dim3, REDUCE_DIM_ALIGN_SIZE);
-         i += blockDim.x * TILE_THREAD_REDUCE_DIM) {
+         i += TILE_BLOCK_REDUCE_DIM /* blockDim.x * TILE_THREAD_REDUCE_DIM */) {
       BF16 in_bf16[TILE_THREAD_REDUCE_DIM];
+
 #pragma unroll
       for (int j = 0; j < TILE_THREAD_REDUCE_DIM; ++j) {
-        int dim3 = i + j;
+        int dim3 = 0;
+        if constexpr (Swizzle) {
+          /// Swizzle for each reduce dimension
+          /// reduce dimension reshape: [-1, 2, 4, 2]
+          /// reduce dimension permute: [0, 2, 1, 3]
+          constexpr int GROUP_SIZE = 16;
+          constexpr int THREAD_NUM_PER_GROUP =
+              GROUP_SIZE / TILE_THREAD_REDUCE_DIM;
+          int group_id = threadIdx.x / THREAD_NUM_PER_GROUP;
+          int tid_in_group = threadIdx.x % THREAD_NUM_PER_GROUP;
+          dim3 = align_down(i, TILE_BLOCK_REDUCE_DIM) + group_id * GROUP_SIZE +
+                 2 * tid_in_group + j / 2 * 8 + (j % 2);
+        } else {
+          dim3 = i + j;
+        }
+
         if (dim3 < in_dim3) {
           in_bf16[j] = in[dim0 * in_stride0 + dim1 * in_stride1 +
                           dim2 * in_stride2 + dim3 * in_stride3];
@@ -265,14 +282,25 @@ void fp8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
   dim3 block(TILE_BLOCK_REDUCE_DIM / TILE_THREAD_REDUCE_DIM,
              TILE_BLOCK_CROSS_DIM, TILE_THREAD_CROSS_DIM);
 
-  fp8_quantize_sm120_kernel<false><<<grid, block, 0, stream>>>(
-      reinterpret_cast<F8E4M3 *>(out.data_ptr()),
-      reinterpret_cast<float *>(sf.data_ptr()),
-      reinterpret_cast<const BF16 *>(in.data_ptr()),
-      reinterpret_cast<const float *>(scale_max.data_ptr()), out_shape[0],
-      out_shape[1], cross_dim_size, reduce_dim_size,
-      in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
-      in_stride[cross_dim], in_stride[reduce_dim]);
+  if (swizzle) {
+    fp8_quantize_sm120_kernel<true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<F8E4M3 *>(out.data_ptr()),
+        reinterpret_cast<float *>(sf.data_ptr()),
+        reinterpret_cast<const BF16 *>(in.data_ptr()),
+        reinterpret_cast<const float *>(scale_max.data_ptr()), out_shape[0],
+        out_shape[1], cross_dim_size, reduce_dim_size,
+        in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
+        in_stride[cross_dim], in_stride[reduce_dim]);
+  } else {
+    fp8_quantize_sm120_kernel<false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<F8E4M3 *>(out.data_ptr()),
+        reinterpret_cast<float *>(sf.data_ptr()),
+        reinterpret_cast<const BF16 *>(in.data_ptr()),
+        reinterpret_cast<const float *>(scale_max.data_ptr()), out_shape[0],
+        out_shape[1], cross_dim_size, reduce_dim_size,
+        in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
+        in_stride[cross_dim], in_stride[reduce_dim]);
+  }
 }
 
 } // namespace ac4k
