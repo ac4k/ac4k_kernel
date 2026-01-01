@@ -12,6 +12,8 @@ PYBIND11_MODULE(_cuda_ops, m) {
         "CUDA-accelerated nvfp4_matmul_sm120.");
   m.def("_internal_nvfp4_matmul_sm120", &ac4k::_internal_nvfp4_matmul_sm120,
         "Internal testing function.");
+  m.def("nvfp4_dot_scale_sm120", &ac4k::nvfp4_dot_scale_sm120,
+        "CUDA-accelerated nvfp4_dot_scale_sm120.");
 
   /// Quantization
   m.def("nvfp4_quant_sm120", &ac4k::nvfp4_quant_sm120,
@@ -20,10 +22,19 @@ PYBIND11_MODULE(_cuda_ops, m) {
   /// MHA forward
   m.def("nvfp4_mha_fwd_sm120", &ac4k::nvfp4_mha_fwd_sm120,
         "CUDA-accelerated mha fwd with nvfp4 precision.");
+  m.def("qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120",
+        &ac4k::qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120,
+        "CUDA-accelerated mha fwd with qk nvfp4 and pv fp8 precision.");
+  m.def("qk_int8_pv_fp8_mha_fwd_sm120", &ac4k::qk_int8_pv_fp8_mha_fwd_sm120,
+        "CUDA-accelerated mha fwd with qk int8 and pv fp8 precision.");
 
   /// Quantize
   m.def("nvfp4_quantize_sm120", &ac4k::nvfp4_quantize_sm120,
         "CUDA-accelerated bfloat16 to nvfp4 quantize.");
+  m.def("fp8_quantize_sm120", &ac4k::fp8_quantize_sm120,
+        "CUDA-accelerated fp8_quantize_sm120.");
+  m.def("int8_quantize_sm120", &ac4k::int8_quantize_sm120,
+        "CUDA-accelerated int8_quantize_sm120.");
 
   /// RoPE 3D apply
   m.def("rope_3d_apply", &ac4k::rope_3d_apply,

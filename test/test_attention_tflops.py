@@ -1,4 +1,4 @@
-from ac4k_kernel.ops import nvfp4_attention
+from ac4k_kernel.ops import attention
 
 import torch
 
@@ -14,14 +14,14 @@ def test_performance(B, N, H, D, warmup_runs: int = 5, repeat: int = 10):
 
     print("Warming up...")
     for _ in range(warmup_runs):
-        nvfp4_attention(q, k, v)
+        attention(q, k, v, precision="nvfp4+fp8e4m3")
 
     torch.cuda.synchronize()  # Make sure the warmup is done
 
     print("Running benchmark...")
     start_event.record()
     for _ in range(repeat):
-        nvfp4_attention(q, k, v)
+        attention(q, k, v, precision="int8+fp8e4m3")
     end_event.record()
     torch.cuda.synchronize()  # Wait for the events to be recorded
 
