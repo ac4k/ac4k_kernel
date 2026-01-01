@@ -101,7 +101,9 @@ constexpr int TILE_V_SF_BLOCK_SIZE = TILE_V_SF_BLOCK_ELES * sizeof(float);
 // constexpr float P_SCALE_MAX = 65504 / TILE_DOT0_BLOCK_N / V_SCALE_MAX / 1.5;
 
 constexpr float V_SCALE_MAX = 2.25f;
-constexpr float P_SCALE_MAX = 224.0f;
+constexpr float P_SCALE_MAX = 1.0f;
+// #define S_FP8_OFFSET 8.807f
+#define S_FP8_OFFSET 7.5f
 
 //===----------------------------------------------------------------------===//
 // Define mutiple buffer stage
@@ -274,6 +276,12 @@ template <uint32_t RegCount> __forceinline__ __device__ void reg_alloc() {
 
 template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
   asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+__forceinline__ __device__ float ptx_exp2(float x) {
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
 }
 
 //===----------------------------------------------------------------------===//
@@ -521,10 +529,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     float l1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
 #pragma unroll
     for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
-      max0[i] = -INFINITY;
-      max1[i] = -INFINITY;
-      l0[i] = 0.0f;
-      l1[i] = 0.0f;
+      // max0[i] = -INFINITY;
+      // max1[i] = -INFINITY;
+      max0[i] = -5000000.0f;
+      max1[i] = -5000000.0f;
+      l0[i] = 1.0f;
+      l1[i] = 1.0f;
     }
     /// o: P @ V
     DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
@@ -670,14 +680,14 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
       /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
       ///         8 * 4 = 32 cycles
-      float qk_scale = (*q_global_scale) * (*k_global_scale) * qk_norm;
+      float qk_scale = (*q_global_scale) * (*k_global_scale);
 #pragma unroll
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
 #pragma unroll
           for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-            s_frag[i][j].data[k] *= qk_scale;
+            s_frag[i][j].data[k] = s_frag[i][j].data[k] * qk_scale;
           }
         }
       }
@@ -696,12 +706,84 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
             for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
               int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
               if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
-                s_frag[i][j].data[k] = -INFINITY;
+                s_frag[i][j].data[k] = -5000000.0f;
               }
             }
           }
         }
       }
+
+      //       /// Step 1: S = S * alpha0(nvfp4 global scale) *
+      //       qk_norm(rsqrt(dk))
+      //       ///         8 * 4 = 32 cycles
+      //       float qk_scale = (*q_global_scale) * (*k_global_scale) * qk_norm;
+      //       float softmax_scale = qk_scale * 1.4426950408889634f;
+      // #pragma unroll
+      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      // #pragma unroll
+      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
+      //         {
+      // #pragma unroll
+      //           for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+      //             s_frag[i][j].data[k] = s_frag[i][j].data[k] * softmax_scale
+      //             - S_FP8_OFFSET;
+      //           }
+      //         }
+      //       }
+
+      //       /// mask to inf
+      //       if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+      // #pragma unroll
+      //         for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
+      //              dot0_atomic_m += TILE_DOT0_ATOMIC_M) {
+      //           int i = dot0_atomic_m / TILE_DOT0_ATOMIC_M;
+      // #pragma unroll
+      //           for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
+      //                dot0_atomic_n += TILE_DOT0_ATOMIC_N) {
+      //             int j = dot0_atomic_n / TILE_DOT0_ATOMIC_N;
+      // #pragma unroll
+      //             for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k)
+      //             {
+      //               int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
+      //               if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+      //                 s_frag[i][j].data[k] = -INFINITY;
+      //                 // s_frag[i][j].data[k] = -5000000.0f;
+      //               }
+      //             }
+      //           }
+      //         }
+      //       }
+
+      //       /// Step 2: max = rowmax(S): 40 cycles
+      //       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+      //       float max_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+      // #pragma unroll
+      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      //         max_new0[i] = max0[i];
+      //         max_new1[i] = max1[i];
+      // #pragma unroll
+      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
+      //         {
+      //           max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
+      //           max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
+      //           max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
+      //           max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
+      //         } // end loop j
+      //         max_new0[i] =
+      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1),
+      //             max_new0[i]);
+      //         max_new0[i] =
+      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2),
+      //             max_new0[i]);
+      //         max_new1[i] =
+      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1),
+      //             max_new1[i]);
+      //         max_new1[i] =
+      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2),
+      //             max_new1[i]);
+      //       } // end loop i
+
+      float softmax_scale = qk_norm * 1.4426950408889634f;
 
       /// Step 2: max = rowmax(S): 40 cycles
       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
@@ -712,10 +794,14 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         max_new1[i] = max1[i];
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
-          max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
-          max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
-          max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
+          max_new0[i] = fmaxf(
+              max_new0[i], s_frag[i][j].data[0] * softmax_scale - S_FP8_OFFSET);
+          max_new0[i] = fmaxf(
+              max_new0[i], s_frag[i][j].data[1] * softmax_scale - S_FP8_OFFSET);
+          max_new1[i] = fmaxf(
+              max_new1[i], s_frag[i][j].data[2] * softmax_scale - S_FP8_OFFSET);
+          max_new1[i] = fmaxf(
+              max_new1[i], s_frag[i][j].data[3] * softmax_scale - S_FP8_OFFSET);
         } // end loop j
         max_new0[i] =
             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
@@ -735,12 +821,28 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          p_frag[i][j].data[0] = fast_exp(s_frag[i][j].data[0], max_new0[i]);
-          p_frag[i][j].data[1] = fast_exp(s_frag[i][j].data[1], max_new0[i]);
-          p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
-          p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
+          // p_frag[i][j].data[0] = fast_exp(s_frag[i][j].data[0], max_new0[i]);
+          // p_frag[i][j].data[1] = fast_exp(s_frag[i][j].data[1], max_new0[i]);
+          // p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
+          // p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
+          p_frag[i][j].data[0] =
+              ptx_exp2(s_frag[i][j].data[0] * softmax_scale - max_new0[i]);
+          p_frag[i][j].data[1] =
+              ptx_exp2(s_frag[i][j].data[1] * softmax_scale - max_new0[i]);
+          p_frag[i][j].data[2] =
+              ptx_exp2(s_frag[i][j].data[2] * softmax_scale - max_new1[i]);
+          p_frag[i][j].data[3] =
+              ptx_exp2(s_frag[i][j].data[3] * softmax_scale - max_new1[i]);
         } // end loop j
       } // end loop i
+
+      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
+      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+      //   printf("p_frag[0]0][0]=%f, p_frag[0]0][1]=%f, p_frag[0]0][2]=%f,
+      //   p_frag[0]0][3]=%f\n",
+      //         p_frag[0][0].data[0], p_frag[0][0].data[1],
+      //         p_frag[0][0].data[2], p_frag[0][0].data[3]);
+      // }
 
       /// Step 4: l = sum(p)
       ///         14 + 4 * 2 + 2 * 7 = 36 cycles
@@ -774,8 +876,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         // }
 
         // Update l
-        l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
-        l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
+        // l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
+        // l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
+        l0[i] = ptx_exp2(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
+        l1[i] = ptx_exp2(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
 
       // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
@@ -813,10 +917,14 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          o_frag[i][j].data[0] *= fast_exp(max0[i], max_new0[i]);
-          o_frag[i][j].data[1] *= fast_exp(max0[i], max_new0[i]);
-          o_frag[i][j].data[2] *= fast_exp(max1[i], max_new1[i]);
-          o_frag[i][j].data[3] *= fast_exp(max1[i], max_new1[i]);
+          // o_frag[i][j].data[0] *= fast_exp(max0[i], max_new0[i]);
+          // o_frag[i][j].data[1] *= fast_exp(max0[i], max_new0[i]);
+          // o_frag[i][j].data[2] *= fast_exp(max1[i], max_new1[i]);
+          // o_frag[i][j].data[3] *= fast_exp(max1[i], max_new1[i]);
+          o_frag[i][j].data[0] *= exp2(max0[i] - max_new0[i]);
+          o_frag[i][j].data[1] *= exp2(max0[i] - max_new0[i]);
+          o_frag[i][j].data[2] *= exp2(max1[i] - max_new1[i]);
+          o_frag[i][j].data[3] *= exp2(max1[i] - max_new1[i]);
         }
       }
 /// Update max
@@ -1138,7 +1246,7 @@ void qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120(
   /// TMA descriptor
   const auto SwizzleQ = CU_TENSOR_MAP_SWIZZLE_64B;
   const auto SwizzleK = CU_TENSOR_MAP_SWIZZLE_64B;
-  const auto SwizzleV = CU_TENSOR_MAP_SWIZZLE_NONE;
+  const auto SwizzleV = CU_TENSOR_MAP_SWIZZLE_128B;
   CUtensorMap q_tensor_map = create_4d_tensor_map<
       1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
       CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SwizzleQ>(
