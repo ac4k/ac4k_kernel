@@ -278,27 +278,6 @@ template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
   asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
-__forceinline__ __device__ float ptx_exp2(float x) {
-  float y;
-  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-//===----------------------------------------------------------------------===//
-// Fast exp
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float fast_exp(float x, float scaled) {
-  constexpr float LOG2E_F = 1.4426950408889634f;
-  scaled = scaled * LOG2E_F;
-  return exp2f(x * LOG2E_F - scaled);
-}
-
-__forceinline__ __device__ float fast_exp(float x) {
-  constexpr float LOG2E_F = 1.4426950408889634f;
-  return exp2f(x * LOG2E_F);
-}
-
 //===----------------------------------------------------------------------===//
 // Convert 4xfloat32 to 4xFP8 (represented as one uint32_t)
 //===----------------------------------------------------------------------===//
@@ -826,13 +805,13 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
           // p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
           // p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
           p_frag[i][j].data[0] =
-              ptx_exp2(s_frag[i][j].data[0] * softmax_scale - max_new0[i]);
+              exp2f(s_frag[i][j].data[0] * softmax_scale - max_new0[i]);
           p_frag[i][j].data[1] =
-              ptx_exp2(s_frag[i][j].data[1] * softmax_scale - max_new0[i]);
+              exp2f(s_frag[i][j].data[1] * softmax_scale - max_new0[i]);
           p_frag[i][j].data[2] =
-              ptx_exp2(s_frag[i][j].data[2] * softmax_scale - max_new1[i]);
+              exp2f(s_frag[i][j].data[2] * softmax_scale - max_new1[i]);
           p_frag[i][j].data[3] =
-              ptx_exp2(s_frag[i][j].data[3] * softmax_scale - max_new1[i]);
+              exp2f(s_frag[i][j].data[3] * softmax_scale - max_new1[i]);
         } // end loop j
       } // end loop i
 
@@ -878,8 +857,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         // Update l
         // l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
         // l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
-        l0[i] = ptx_exp2(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
-        l1[i] = ptx_exp2(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+        l0[i] = exp2f(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
+        l1[i] = exp2f(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
 
       // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&

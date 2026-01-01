@@ -1,5 +1,6 @@
 #pragma once
 
+#include "math.cuh"
 #include "mma.cuh"
 
 #include <cstdint>

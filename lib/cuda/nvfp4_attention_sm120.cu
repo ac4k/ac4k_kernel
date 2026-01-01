@@ -363,21 +363,6 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
-//===----------------------------------------------------------------------===//
-// Fast exp
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float fast_exp(float x, float scaled) {
-  constexpr float LOG2E_F = 1.4426950408889634f;
-  scaled = scaled * LOG2E_F;
-  return exp2f(x * LOG2E_F - scaled);
-}
-
-__forceinline__ __device__ float fast_exp(float x) {
-  constexpr float LOG2E_F = 1.4426950408889634f;
-  return exp2f(x * LOG2E_F);
-}
-
 template <CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     void nvfp4_mha_fwd_sm120_kernel(

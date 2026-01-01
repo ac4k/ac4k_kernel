@@ -45,20 +45,6 @@ constexpr int TILE_THREAD_CROSS_DIM = 1;
 constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 constexpr int REDUCE_DIM_ALIGN_SIZE = 16;
 
-static __device__ __forceinline__ F8E4M3x4 floatx4_to_e4m3x4(float4 in) {
-  F8E4M3x4 val;
-  asm volatile("{\n"
-               ".reg .b16 lo;\n"
-               ".reg .b16 hi;\n"
-               "cvt.rn.satfinite.e4m3x2.f32   lo, %2, %1;\n"
-               "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
-               "mov.b32 %0, {lo, hi};\n"
-               "}"
-               : "=r"(val)
-               : "f"(in.x), "f"(in.y), "f"(in.z), "f"(in.w));
-  return val;
-}
-
 static __device__ __forceinline__ void clear(BF16 &in) {
   reinterpret_cast<uint16_t *>(&in)[0] = 0;
 }
@@ -182,12 +168,12 @@ __global__ void fp8_quantize_sm120_kernel(
         in_f32[j] = __bfloat162float(in_bf16[j]) * recp_scale;
       }
 
-      // floatx4_to_e4m3x4
+      /// Convert to FP8E4M3
       float4 *in_f32x4 = reinterpret_cast<float4 *>(in_f32);
 #pragma unroll
       for (int j = 0;
            j < TILE_THREAD_REDUCE_DIM / (sizeof(float4) / sizeof(float)); ++j) {
-        F8E4M3x4 out_f8x4 = floatx4_to_e4m3x4(in_f32x4[j]);
+        F8E4M3x4 out_f8x4 = fp32x4_to_e4m3x4(in_f32x4[j]);
 
         auto *out_f8x4_ptr = reinterpret_cast<F8E4M3x4 *>(
             out + dim0 * out_stride0 + dim1 * out_stride1 + dim2 * out_stride2 +
