@@ -1,0 +1,771 @@
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda.h>
+#include <cuda/barrier>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+#include <torch/all.h>
+
+#include "ac4k_kernel/ops/cuda_ops.h"
+#include "utils.cuh"
+
+#define CHECK_TYPE(x, st, m)                                                   \
+  TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
+#define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x, m)                                                 \
+  TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
+#define CHECK_INPUT(x, st, m)                                                  \
+  CHECK_TH_CUDA(x, m);                                                         \
+  CHECK_CONTIGUOUS(x, m);                                                      \
+  CHECK_TYPE(x, st, m)
+#define CHECK_OUTPUT(x, st, m) CHECK_INPUT(x, st, m)
+
+namespace ac4k {
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
+
+using NVFP4x2 = uint8_t;
+using E4M3 = uint8_t;
+constexpr int ELES_PER_NVFP4x2 = 2;
+constexpr int BLOCK_SIZE = 16;
+
+//===----------------------------------------------------------------------===//
+// Define tile size for block level, warp level and atomic level
+//===----------------------------------------------------------------------===//
+
+const int GROUP_SIZE_M = 16;
+
+/// Block level tile size
+const int TILE_BLOCK_M = 128;
+const int TILE_BLOCK_N = 128;
+const int TILE_BLOCK_K = 128;
+const int TILE_BLOCK_PACK_K = TILE_BLOCK_K / ELES_PER_NVFP4x2;
+const int TILE_BLOCK_A_ELES = TILE_BLOCK_M * TILE_BLOCK_K;
+const int TILE_BLOCK_B_ELES = TILE_BLOCK_N * TILE_BLOCK_K;
+const int TILE_IN_ELES = TILE_BLOCK_A_ELES + TILE_BLOCK_B_ELES;
+const int TILE_BLOCK_A_SF_ELES = TILE_BLOCK_M * TILE_BLOCK_K / 64;
+const int TILE_BLOCK_B_SF_ELES = TILE_BLOCK_N * TILE_BLOCK_K / 64;
+
+/// Warp level tile size
+const int TILE_WARP_M = 64;
+const int TILE_WARP_N = 64;
+const int TILE_WARP_K = 64;
+const int TILE_WARP_PACK_K = TILE_WARP_K / ELES_PER_NVFP4x2;
+
+/// Atomic level tile size
+/// mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+const int TILE_ATOMIC_M = 16;
+const int TILE_ATOMIC_N = 8;
+const int TILE_ATOMIC_K = 64;
+const int TILE_ATOMIC_PACK_K = TILE_ATOMIC_K / ELES_PER_NVFP4x2;
+
+const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
+const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
+const int WARP_NUM = WARP_M_NUM * WARP_N_NUM;
+
+//===----------------------------------------------------------------------===//
+// Define mutiple buffer stage
+//===----------------------------------------------------------------------===//
+
+const int STAGE = 2;
+
+//===----------------------------------------------------------------------===//
+// Consumer & Producer
+//===----------------------------------------------------------------------===//
+
+const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
+const int PRODUCER_THREAD_NUM = 32;
+
+//===----------------------------------------------------------------------===//
+// TMA
+//===----------------------------------------------------------------------===//
+
+template <int Dim0, int Dim1, int Dim2, int Dim3, CUtensorMapDataType DataType,
+          typename T, CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+static __forceinline__ CUtensorMap create_4d_tensor_map(const T *gmem_ptr,
+                                                        uint64_t global_dim0,
+                                                        uint64_t global_dim1,
+                                                        uint64_t global_dim2,
+                                                        uint64_t global_dim3) {
+  int BPE = sizeof(T);
+
+  CUtensorMap template_tensor_map{};
+  void *gmem_address = (void *)gmem_ptr;
+  uint64_t gmem_prob_shape[5] = {global_dim3, global_dim2, global_dim1,
+                                 global_dim0, 1};
+  uint64_t gmem_prob_stride[5] = {
+      static_cast<uint64_t>(BPE), static_cast<uint64_t>(BPE * global_dim3),
+      static_cast<uint64_t>(BPE * global_dim3 * global_dim2),
+      static_cast<uint64_t>(BPE * global_dim3 * global_dim2 * global_dim1), 0};
+  uint32_t smem_box_shape[5] = {
+      static_cast<uint32_t>(Dim3), static_cast<uint32_t>(Dim2),
+      static_cast<uint32_t>(Dim1), static_cast<uint32_t>(Dim0), 1};
+  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+  CHECK_CUDA_DRIVER_ERROR(cuTensorMapEncodeTiled(
+      &template_tensor_map, DataType, 4, gmem_address, gmem_prob_shape,
+      gmem_prob_stride + 1, smem_box_shape, smem_box_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+  return template_tensor_map;
+}
+
+__device__ static __forceinline__ void
+load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
+              int off1, int off2, int off3) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(tma_map);
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+  asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::"
+               "complete_tx::bytes"
+               " [%0], [%1, {%3, %4, %5, %6}], [%2];"
+               :
+               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(off3),
+                 "r"(off2), "r"(off1), "r"(off0)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
+// Swizzle
+//===----------------------------------------------------------------------===//
+
+template <CUtensorMapSwizzle Swizzle = CU_TENSOR_MAP_SWIZZLE_NONE>
+struct SwizzleIndexMap {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    return col;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_128B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    int int4_row = row;
+    int int4_col = col * bpe / sizeof(int4);
+    return ((int4_row % 8) ^ int4_col) * sizeof(int4) / bpe;
+  }
+};
+
+template <> struct SwizzleIndexMap<CU_TENSOR_MAP_SWIZZLE_64B> {
+  __forceinline__ static __device__ int get_row(int row, int col, int bpe) {
+    return row;
+  }
+
+  __forceinline__ static __device__ int get_col(int row, int col, int bpe) {
+    // int index = (row * 64 + col * bpe) / sizeof(int4);
+    // // int new_row = index / (128 / sizeof(int4));
+    // int new_row = row * 64 / 128;
+    // int new_col = index % (128 / sizeof(int4));
+    // int row_swiz = new_row;
+    // int col_swiz = (row_swiz % 4) ^ new_col;
+    // int index_swiz = (row_swiz * 128 + col_swiz * sizeof(int4)) / bpe;
+    // return index_swiz % (64 / bpe);
+
+    int new_row = row * 64 / 128;
+    int new_col = col * bpe / sizeof(int4);
+    int row_swiz = new_row;
+    int col_swiz = (row_swiz % 4) ^ new_col;
+    return col_swiz * sizeof(int4) / bpe;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Mbarrier
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ void init_barrier(uint64_t *bar, int count) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
+               "r"(count));
+}
+
+__device__ static __forceinline__ void expect_bytes(uint64_t *bar,
+                                                    uint32_t bytes) {
+  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n" ::
+          "r"(bar_ptr),
+      "r"(bytes));
+}
+
+__device__ static __forceinline__ void wait(uint64_t *bar, int phase) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n"
+      ".reg .pred                P1;\n"
+      "LAB_WAIT:\n"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+      "@P1                       bra.uni DONE;\n"
+      "bra.uni                   LAB_WAIT;\n"
+      "DONE:\n"
+      "}\n" ::"r"(mbar_ptr),
+      "r"(phase));
+}
+
+__device__ static __forceinline__ void arrive(uint64_t *bar,
+                                              uint32_t count = 1) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+               :
+               : "r"(mbar_ptr), "r"(count)
+               : "memory");
+}
+
+//===----------------------------------------------------------------------===//
+// Program ID
+//===----------------------------------------------------------------------===//
+
+__device__ static __forceinline__ int2 get_program_id(int M, int N) {
+  /// Program ID
+  int pid = blockIdx.x;
+  /// Number of program ids along the M axis
+  int num_pid_m = ceil_div(M, TILE_BLOCK_M);
+  /// Number of programs ids along the N axis
+  int num_pid_n = ceil_div(N, TILE_BLOCK_N);
+  int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
+  int group_id = pid / num_pid_in_group;
+  int first_pid_m = group_id * GROUP_SIZE_M;
+  int group_size_m = (num_pid_m - first_pid_m) < GROUP_SIZE_M
+                         ? num_pid_m - first_pid_m
+                         : GROUP_SIZE_M;
+  int pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m);
+  int pid_n = (pid % num_pid_in_group) / group_size_m;
+
+  return make_int2(pid_m, pid_n);
+}
+
+//===----------------------------------------------------------------------===//
+// Matrix matmul kernel
+// D bf16 dtype
+// A/B nvfp4 dtype
+// accumulator dtype:float
+// A shape:MxK stride:Kx1 matrix, row major
+// B shape:KxN stride:1xK matrix, col major
+// C shape:MxN stride:Nx1 matrix, row major
+//===----------------------------------------------------------------------===//
+
+template <CUtensorMapSwizzle Swizzle>
+__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+    void nvfp4_dot_scale_sm120_kernel(
+        __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
+        const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
+        int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
+        const __grid_constant__ CUtensorMap b_tensor_map,
+        const __grid_constant__ CUtensorMap a_sf_tensor_map,
+        const __grid_constant__ CUtensorMap b_sf_tensor_map) {
+  //===--------------------------------------------------------------------===//
+  // Distribute for block, warp
+  //===--------------------------------------------------------------------===//
+
+  int tid = threadIdx.x;
+  bool is_consumer = tid < CONSUMER_THREAD_NUM;
+  bool is_producer = tid >= CONSUMER_THREAD_NUM;
+
+  int2 pid = get_program_id(M, N);
+  int block_m = pid.x * TILE_BLOCK_M;
+  int block_n = pid.y * TILE_BLOCK_N;
+
+  int warp_id = tid / 32;
+  int warp_id_m = warp_id / WARP_N_NUM;
+  int warp_id_n = warp_id % WARP_N_NUM;
+  int warp_m = warp_id_m * TILE_WARP_M;
+  int warp_n = warp_id_n * TILE_WARP_N;
+  int lane_id = tid % 32;
+
+  //===--------------------------------------------------------------------===//
+  // Define fragment for a, b and c operand
+  //===--------------------------------------------------------------------===//
+
+  /// Each thread has a copy of this tile
+  AFrag_NVFP4_16x64 a_frag;
+  BFrag_NVFP4_64x8 b_frag;
+  DFrag_F32_16x8 c_frag[TILE_WARP_M / TILE_ATOMIC_M]
+                       [TILE_WARP_N / TILE_ATOMIC_N];
+
+#pragma unroll
+  for (int row = 0; row < TILE_WARP_M / TILE_ATOMIC_M; ++row) {
+#pragma unroll
+    for (int col = 0; col < TILE_WARP_N / TILE_ATOMIC_N; ++col) {
+#pragma unroll
+      for (int i = 0; i < c_frag[row][col].REGISTERS_PER_THREAD; ++i) {
+        /// Init c fragment with 0.0
+        c_frag[row][col].data[i] = 0.0f;
+      }
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Define shared memory for a and b operand
+  //===--------------------------------------------------------------------===//
+
+  extern __shared__ __align__(1024) NVFP4x2 smem[];
+  NVFP4x2 *a_shared = smem;
+  NVFP4x2 *b_shared = a_shared + STAGE * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2;
+  uint32_t *a_sf_shared = reinterpret_cast<uint32_t *>(
+      b_shared + STAGE * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2);
+  uint32_t *b_sf_shared = a_sf_shared + STAGE * TILE_BLOCK_A_SF_ELES;
+
+  //===--------------------------------------------------------------------===//
+  // Define brrier for a and b tma
+  //===--------------------------------------------------------------------===//
+
+  __shared__ __align__(8) uint64_t empty_bar[STAGE];
+  __shared__ __align__(8) uint64_t full_bar[STAGE];
+  if (is_producer) {
+#pragma unroll
+    for (int i = 0; i < STAGE; ++i) {
+      init_barrier(&empty_bar[i], WARP_NUM);
+      init_barrier(&full_bar[i], 1);
+    }
+  }
+  asm volatile("barrier.cluster.arrive;\n" : :);
+  asm volatile("barrier.cluster.wait;\n" : :);
+
+  //===--------------------------------------------------------------------===//
+  // Producer
+  //===--------------------------------------------------------------------===//
+
+  if (is_producer && tid == CONSUMER_THREAD_NUM) {
+    for (int block_k = 0, stage = 0, phase = 0; block_k < K;
+         block_k += TILE_BLOCK_K, ++stage) {
+      int block_k_pack = block_k / ELES_PER_NVFP4x2;
+
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
+
+      wait(&empty_bar[stage], phase);
+
+      /// TMA A
+      load_4d_async(a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2,
+                    &a_tensor_map, &full_bar[stage], 0, 0, block_m,
+                    block_k_pack);
+      /// TMA B
+      load_4d_async(b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2,
+                    &b_tensor_map, &full_bar[stage], 0, 0, block_n,
+                    block_k_pack);
+      /// TMA A_SF
+      load_4d_async(a_sf_shared + stage * TILE_BLOCK_A_SF_ELES,
+                    &a_sf_tensor_map, &full_bar[stage], 0, 0, block_k / 64,
+                    block_m);
+      /// TMA B_SF
+      load_4d_async(b_sf_shared + stage * TILE_BLOCK_B_SF_ELES,
+                    &b_sf_tensor_map, &full_bar[stage], 0, 0, block_k / 64,
+                    block_n);
+
+      expect_bytes(&full_bar[stage],
+                   TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) +
+                       (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) *
+                           sizeof(uint32_t));
+    } // end loop block_k
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Consumer
+  //===--------------------------------------------------------------------===//
+
+  if (is_consumer) {
+    if (lane_id == 0) {
+#pragma unroll
+      for (int i = 0; i < STAGE; ++i) {
+        arrive(&empty_bar[i], 1);
+      }
+    }
+
+    //===------------------------------------------------------------------===//
+    // Loop
+    //===------------------------------------------------------------------===//
+
+    for (int block_k = 0, stage = 0, phase = 0; block_k < K;
+         block_k += TILE_BLOCK_K, ++stage) {
+      if (stage == STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
+
+      wait(&full_bar[stage], phase);
+
+#pragma unroll
+      for (int warp_k = 0; warp_k < TILE_BLOCK_K; warp_k += TILE_WARP_K) {
+#pragma unroll
+        for (int atomic_k = 0; atomic_k < TILE_WARP_K;
+             atomic_k += TILE_ATOMIC_K) {
+#pragma unroll
+          for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+               ++atomic_m_cnt) {
+            int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
+
+            /// SF A
+            uint32_t sfa0 = 0;
+            if (lane_id % 4 < 2) {
+              int row =
+                  warp_m + atomic_m + ((lane_id % 4) % 2) * 8 + (lane_id / 4);
+              int col = warp_k + atomic_k;
+              sfa0 = a_sf_shared[stage * TILE_BLOCK_A_SF_ELES +
+                                 col / 64 * TILE_BLOCK_M + row];
+            }
+
+            /// Load shared to fragment for A operand
+            int *a_regs = (int *)a_frag.data;
+            int a_shared_row = warp_m + atomic_m + (lane_id % 16);
+            int a_shared_col =
+                (warp_k + atomic_k + (lane_id / 16) * 32) / ELES_PER_NVFP4x2;
+            int a_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                a_shared_row, a_shared_col, sizeof(NVFP4x2));
+            int a_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                a_shared_row, a_shared_col, sizeof(NVFP4x2));
+            uint32_t a_addr = __cvta_generic_to_shared(
+                a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 +
+                a_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                a_shared_col_swiz);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(a_regs[0]), "=r"(a_regs[1]), "=r"(a_regs[2]),
+                           "=r"(a_regs[3])
+                         : "r"(a_addr));
+
+#pragma unroll
+            for (int atomic_n_cnt = 0;
+                 atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N; ++atomic_n_cnt) {
+              int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+
+              /// SF B
+              uint32_t sfb0 = 0;
+              if (lane_id % 4 == 0) {
+                int row = warp_n + atomic_n + (lane_id / 4);
+                int col = warp_k + atomic_k;
+                sfb0 = b_sf_shared[stage * TILE_BLOCK_B_SF_ELES +
+                                   col / 64 * TILE_BLOCK_N + row];
+              }
+
+              /// Load shared to fragment for B operand
+              int *b_regs = (int *)b_frag.data;
+              int b_shared_row = warp_n + atomic_n + (lane_id % 8);
+              int b_shared_col =
+                  (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
+                  ELES_PER_NVFP4x2;
+              int b_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
+              int b_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
+              uint32_t b_addr = __cvta_generic_to_shared(
+                  b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2 +
+                  b_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                  b_shared_col_swiz);
+              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                           "{%0, %1}, [%2];"
+                           : "=r"(b_regs[0]), "=r"(b_regs[1])
+                           : "r"(b_addr));
+
+              /// Apply mma
+              fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
+                  a_frag.data[1], a_frag.data[2], a_frag.data[3],
+                  b_frag.data[0], b_frag.data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
+            } // end loop atomic_n
+          } // end loop atomic_m
+        } // end loop atomic_k
+      } // end loop warp_k
+
+      if (lane_id == 0) {
+        arrive(&empty_bar[stage], 1);
+      }
+    } // end loop block_k
+
+    //===------------------------------------------------------------------===//
+    // Epilogue
+    //===------------------------------------------------------------------===//
+
+    //===------------------------------------------------------------------===//
+    // Apply alpha
+    //===------------------------------------------------------------------===//
+
+#pragma unroll
+    for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+         ++atomic_m_cnt) {
+#pragma unroll
+      for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+           ++atomic_n_cnt) {
+#pragma unroll
+        for (int idx = 0;
+             idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+             ++idx) {
+          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
+        } // end loop idx
+      } // end loop atomic_n_cnt
+    } // end loop atomic_m_cnt
+
+    //===------------------------------------------------------------------===//
+    // Apply bias
+    //===------------------------------------------------------------------===//
+
+    if (bias) {
+#pragma unroll
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+#pragma unroll
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+#pragma unroll
+          for (int idx = 0;
+               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+               ++idx) {
+            int thread_n = atomic_n_cnt * TILE_ATOMIC_N +
+                           c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
+                               lane_id, idx);
+            int n = block_n + warp_n + thread_n;
+            if (n < N) {
+              c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
+                  __bfloat162float(bias[n]);
+            }
+          } // end loop idx
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
+    }
+
+    //===------------------------------------------------------------------===//
+    // Write back to D
+    //===------------------------------------------------------------------===//
+
+    if (block_m + TILE_BLOCK_M <= M && block_n + TILE_BLOCK_N <= N) {
+      // Not out-of-range
+
+#pragma unroll
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+#pragma unroll
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+          __nv_bfloat162 out;
+          __nv_bfloat16 *out_bf16 = reinterpret_cast<__nv_bfloat16 *>(&out);
+          {
+            out_bf16[0] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
+            out_bf16[1] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
+
+            int thread_m =
+                atomic_m_cnt * TILE_ATOMIC_M +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 0);
+            int m = block_m + warp_m + thread_m;
+            int thread_n =
+                atomic_n_cnt * TILE_ATOMIC_N +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 0);
+            int n = block_n + warp_n + thread_n;
+            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+          }
+
+          {
+            out_bf16[0] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
+            out_bf16[1] =
+                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
+
+            int thread_m =
+                atomic_m_cnt * TILE_ATOMIC_M +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 2);
+            int m = block_m + warp_m + thread_m;
+            int thread_n =
+                atomic_n_cnt * TILE_ATOMIC_N +
+                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 2);
+            int n = block_n + warp_n + thread_n;
+            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+          }
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
+    } else {
+      // Meet out-of-range
+
+      // Check warp
+      if (block_m + warp_m >= M || block_n + warp_n >= N) {
+        return;
+      }
+
+#pragma unroll
+      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+           ++atomic_m_cnt) {
+        int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
+        if (block_m + warp_m + atomic_m >= M) {
+          break;
+        }
+
+#pragma unroll
+        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+             ++atomic_n_cnt) {
+          int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+          if (block_n + warp_n + atomic_n >= N) {
+            break;
+          }
+
+#pragma unroll
+          for (int idx = 0;
+               idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
+               ++idx) {
+            int thread_m =
+                atomic_m + c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(
+                               lane_id, idx);
+            int m = block_m + warp_m + thread_m;
+            int thread_n =
+                atomic_n + c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
+                               lane_id, idx);
+            int n = block_n + warp_n + thread_n;
+            if (m >= M || n >= N) {
+              continue;
+            }
+
+            D[m * N + n] = __float2bfloat16_rn(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
+          } // end loop idx
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
+    }
+  } // end if consumer
+}
+
+void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
+                           torch::Tensor const &B, torch::Tensor const &A_sf,
+                           torch::Tensor const &B_sf,
+                           torch::Tensor const &alpha,
+                           c10::optional<torch::Tensor> const &bias) {
+  /// Check type
+  CHECK_INPUT(A_sf, at::ScalarType::Float8_e4m3fn, "scale_a");
+  CHECK_INPUT(B_sf, at::ScalarType::Float8_e4m3fn, "scale_b");
+  CHECK_INPUT(alpha, at::ScalarType::Float, "alpha");
+
+  CHECK_INPUT(A, at::ScalarType::Byte, "a");
+  CHECK_INPUT(B, at::ScalarType::Byte, "b");
+  CHECK_INPUT(D, at::ScalarType::BFloat16, "d");
+
+  /// Check rank
+  TORCH_CHECK(A.dim() == 2, "a must be a matrix");
+  TORCH_CHECK(B.dim() == 2, "b must be a matrix");
+  TORCH_CHECK(D.dim() == 2, "d must be a matrix");
+
+  /// Get shape
+  auto const M = D.sizes()[0];
+  auto const N = D.sizes()[1];
+  auto const K = A.sizes()[1] * 2;
+
+  /// Check shape, stride
+  /// Check A operand: shape:MxK stride:Kx1
+  TORCH_CHECK(A.sizes()[0] == M, "A shape[0] must be ", M);
+  TORCH_CHECK(A.sizes()[1] == K / 2, "A shape[1] must be ", K / 2);
+  TORCH_CHECK(A.stride(0) == K / 2, "A stride[0] must be ", K / 2);
+  TORCH_CHECK(A.stride(1) == 1, "A stride[1] must be 1");
+
+  /// Check B operand: shape:NxK stride:Kx1
+  TORCH_CHECK(B.sizes()[0] == N, "B shape[0] must be ", N);
+  TORCH_CHECK(B.sizes()[1] == K / 2, "B shape[1] must be ", K / 2);
+  TORCH_CHECK(B.stride(0) == K / 2, "B stride[0] must be ", K / 2);
+  TORCH_CHECK(B.stride(1) == 1, "B stride[1] must be ", 1);
+
+  /// Check scale_a operand
+  TORCH_CHECK(A_sf.dim() == 3, "scale_a must be a matrix");
+  TORCH_CHECK(A_sf.sizes()[0] == ceil_div(K, 64),
+              "meet invalid scale_a shape[0]");
+  TORCH_CHECK(A_sf.sizes()[1] == align_up(M, 16),
+              "meet invalid scale_a shape[1]");
+  TORCH_CHECK(A_sf.sizes()[2] == 4, "meet invalid scale_a shape[2]");
+
+  /// Check scale_b operand
+  TORCH_CHECK(B_sf.dim() == 3, "scale_a must be b matrix");
+  TORCH_CHECK(B_sf.sizes()[0] == ceil_div(K, 64),
+              "meet invalid scale_b shape[0]");
+  TORCH_CHECK(B_sf.sizes()[1] == align_up(N, 16),
+              "meet invalid scale_b shape[1]");
+  TORCH_CHECK(B_sf.sizes()[2] == 4, "meet invalid scale_b shape[2]");
+
+  /// Check bias
+  if (bias.has_value()) {
+    CHECK_INPUT(bias.value(), at::ScalarType::BFloat16, "bias");
+    TORCH_CHECK(bias.value().dim() == 2, "bias must be a matrix");
+    TORCH_CHECK(bias.value().sizes()[0] == 1, "bias shape[0] must be 1");
+    TORCH_CHECK(bias.value().sizes()[1] == N, "bias shape[1] must be ", N);
+    TORCH_CHECK(bias.value().stride(0) == N, "bias stride[0] must be ", N);
+    TORCH_CHECK(bias.value().stride(1) == 1, "bias stride[1] must be 1");
+  }
+
+  /// Check alpha
+  CHECK_INPUT(alpha, at::ScalarType::Float, "a");
+  TORCH_CHECK(alpha.dim() == 0, "alpha must be a scalar");
+
+  /// Grid & Block dim3
+  dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
+  dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+
+  /// Set dynamic shared memory size
+  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
+  auto *kernel = nvfp4_dot_scale_sm120_kernel<SWIZZLE>;
+  size_t smem_size =
+      TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
+      (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) * STAGE;
+  CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  /// Get CUDA stream
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  /// TMA descriptor
+  CUtensorMap a_tensor_map =
+      create_4d_tensor_map<1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                           NVFP4x2, SWIZZLE>(
+          reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
+  CUtensorMap b_tensor_map =
+      create_4d_tensor_map<1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                           NVFP4x2, SWIZZLE>(
+          reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
+  CUtensorMap a_sf_tensor_map =
+      create_4d_tensor_map<1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
+                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                           uint32_t>(
+          reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(A_sf.size(0)),
+          static_cast<uint64_t>(A_sf.size(1)));
+  CUtensorMap b_sf_tensor_map =
+      create_4d_tensor_map<1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
+                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                           uint32_t>(
+          reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(B_sf.size(0)),
+          static_cast<uint64_t>(B_sf.size(1)));
+
+  /// Launch kernel
+  kernel<<<grid, block, smem_size, stream>>>(
+      reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
+      reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+      reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+      reinterpret_cast<const E4M3 *>(A_sf.data_ptr()),
+      reinterpret_cast<const E4M3 *>(B_sf.data_ptr()),
+      reinterpret_cast<const float *>(alpha.data_ptr()),
+      bias.has_value()
+          ? reinterpret_cast<const __nv_bfloat16 *>(bias.value().data_ptr())
+          : nullptr,
+      M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map, b_sf_tensor_map);
+}
+
+} // namespace ac4k

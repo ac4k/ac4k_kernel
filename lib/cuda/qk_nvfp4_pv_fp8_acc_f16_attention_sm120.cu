@@ -590,7 +590,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                            [TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N];
 
       /// Step 0: S = Q @ K
-      ///      16x64x128=> 16*8*2=256 cycles
 
 #pragma unroll
       for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K;
@@ -658,7 +657,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop dot0_k
 
       /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
-      ///         8 * 4 = 32 cycles
       float qk_scale = (*q_global_scale) * (*k_global_scale);
 #pragma unroll
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
@@ -692,79 +690,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         }
       }
 
-      //       /// Step 1: S = S * alpha0(nvfp4 global scale) *
-      //       qk_norm(rsqrt(dk))
-      //       ///         8 * 4 = 32 cycles
-      //       float qk_scale = (*q_global_scale) * (*k_global_scale) * qk_norm;
-      //       float softmax_scale = qk_scale * 1.4426950408889634f;
-      // #pragma unroll
-      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
-      // #pragma unroll
-      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
-      //         {
-      // #pragma unroll
-      //           for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-      //             s_frag[i][j].data[k] = s_frag[i][j].data[k] * softmax_scale
-      //             - S_FP8_OFFSET;
-      //           }
-      //         }
-      //       }
-
-      //       /// mask to inf
-      //       if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
-      // #pragma unroll
-      //         for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
-      //              dot0_atomic_m += TILE_DOT0_ATOMIC_M) {
-      //           int i = dot0_atomic_m / TILE_DOT0_ATOMIC_M;
-      // #pragma unroll
-      //           for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
-      //                dot0_atomic_n += TILE_DOT0_ATOMIC_N) {
-      //             int j = dot0_atomic_n / TILE_DOT0_ATOMIC_N;
-      // #pragma unroll
-      //             for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k)
-      //             {
-      //               int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
-      //               if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
-      //                 s_frag[i][j].data[k] = -INFINITY;
-      //                 // s_frag[i][j].data[k] = -5000000.0f;
-      //               }
-      //             }
-      //           }
-      //         }
-      //       }
-
-      //       /// Step 2: max = rowmax(S): 40 cycles
-      //       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-      //       float max_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-      // #pragma unroll
-      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
-      //         max_new0[i] = max0[i];
-      //         max_new1[i] = max1[i];
-      // #pragma unroll
-      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
-      //         {
-      //           max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[0]);
-      //           max_new0[i] = fmaxf(max_new0[i], s_frag[i][j].data[1]);
-      //           max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[2]);
-      //           max_new1[i] = fmaxf(max_new1[i], s_frag[i][j].data[3]);
-      //         } // end loop j
-      //         max_new0[i] =
-      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1),
-      //             max_new0[i]);
-      //         max_new0[i] =
-      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2),
-      //             max_new0[i]);
-      //         max_new1[i] =
-      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1),
-      //             max_new1[i]);
-      //         max_new1[i] =
-      //             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2),
-      //             max_new1[i]);
-      //       } // end loop i
-
       float softmax_scale = qk_norm * 1.4426950408889634f;
 
-      /// Step 2: max = rowmax(S): 40 cycles
+      /// Step 2: max = rowmax(S)
       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
       float max_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
 #pragma unroll
@@ -793,17 +721,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop i
 
       /// Step 3: p = exp(S - max)
-      ///         160 cycles
       DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M]
                            [TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N];
 #pragma unroll
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          // p_frag[i][j].data[0] = fast_exp(s_frag[i][j].data[0], max_new0[i]);
-          // p_frag[i][j].data[1] = fast_exp(s_frag[i][j].data[1], max_new0[i]);
-          // p_frag[i][j].data[2] = fast_exp(s_frag[i][j].data[2], max_new1[i]);
-          // p_frag[i][j].data[3] = fast_exp(s_frag[i][j].data[3], max_new1[i]);
           p_frag[i][j].data[0] =
               exp2f(s_frag[i][j].data[0] * softmax_scale - max_new0[i]);
           p_frag[i][j].data[1] =
@@ -815,16 +738,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         } // end loop j
       } // end loop i
 
-      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
-      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //   printf("p_frag[0]0][0]=%f, p_frag[0]0][1]=%f, p_frag[0]0][2]=%f,
-      //   p_frag[0]0][3]=%f\n",
-      //         p_frag[0][0].data[0], p_frag[0][0].data[1],
-      //         p_frag[0][0].data[2], p_frag[0][0].data[3]);
-      // }
-
       /// Step 4: l = sum(p)
-      ///         14 + 4 * 2 + 2 * 7 = 36 cycles
       float l_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
       float l_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
 #pragma unroll
@@ -843,63 +757,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
-        // /// Fix exp sum
-        // /// redundant p is exp(0 - max)
-        // /// total redundant exp sum is exp(-max) * (align_up(N,
-        // /// TILE_DOT0_BLOCK_N) - N)
-        // if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
-        //   l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
-        //                fast_exp(max_new0[i]);
-        //   l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
-        //                fast_exp(max_new1[i]);
-        // }
-
         // Update l
-        // l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
-        // l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
         l0[i] = exp2f(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
         l1[i] = exp2f(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
 
-      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
-      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //   printf("l_new0=%f, l_new1=%f, l0=%f, l1=%f\n",
-      //          l_new0[0], l_new1[0], l0[0], l1[0]);
-      // }
-
-      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      //     printf("max_new0=%f, max_new1=%f, max0=%f, max1=%f\n", max_new0[0],
-      //            max_new1[0], max0[0], max1[0]);
-      //     printf("l_new0=%f, l_new1=%f, l0=%f, l1=%f\n", l_new0[0],
-      //     l_new1[0],
-      //            l0[0], l1[0]);
-      //   }
-
-      //     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      //       #pragma unroll
-      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
-      // #pragma unroll
-      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
-      //         {
-      //           printf("p_frag[%d][%d].data[0] = %f\t", i, j,
-      //           p_frag[i][j].data[0]); printf("p_frag[%d][%d].data[1] =
-      //           %f\t", i, j, p_frag[i][j].data[1]);
-      //         } // end loop j
-      //         printf("\n");
-      //       } // end loop i
-      //     }
-
       /// Step 4: o = expf(max - max_new) * o
-      ///         4 * 8 + 2 = 34
 
 #pragma unroll
       for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
         for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          // o_frag[i][j].data[0] *= fast_exp(max0[i], max_new0[i]);
-          // o_frag[i][j].data[1] *= fast_exp(max0[i], max_new0[i]);
-          // o_frag[i][j].data[2] *= fast_exp(max1[i], max_new1[i]);
-          // o_frag[i][j].data[3] *= fast_exp(max1[i], max_new1[i]);
           o_frag[i][j].data[0] *= exp2(max0[i] - max_new0[i]);
           o_frag[i][j].data[1] *= exp2(max0[i] - max_new0[i]);
           o_frag[i][j].data[2] *= exp2(max1[i] - max_new1[i]);
@@ -913,27 +781,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         max1[i] = max_new1[i];
       }
 
-      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
-      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //   printf("max0=%f, max1=%f, max_new0=%f, max_new1=%f\n",
-      //          max0[0], max1[0], max_new0[0], max_new1[0]);
-      // }
-
       /// Step 5: quantize P from f32 to fp8e4m3
       AFrag_FP8_16x32 p_fp8_frag[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
                                 [TILE_DOT1_WARP_K / TILE_DOT1_ATOMIC_K];
       convert_to_fp8(p_frag, p_fp8_frag);
 
-      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
-      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //       printf("tid=%d p_frag[0]=%f, p_frag[1]=%f, p_frag[2]=%f,
-      //       p_frag[3]=%f\n", threadIdx.x, p_frag[0][0].data[0],
-      //       p_frag[0][0].data[1], p_frag[0][0].data[2],
-      //       p_frag[0][0].data[3]);
-      //     }
-
       /// Step 6: o = P @ V
-      ///         256 cycles
       int dot1_k = dot0_n;
       DFrag_F16_16x8 o_f16[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
                           [TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N];
@@ -969,17 +822,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                            : "r"(v_addr));
             }
 
-            // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
-            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            //   printf("tid=%d, v_frag[0]=%x, v_frag[1]=%x\n", threadIdx.x,
-            //   v_frag.data[0], v_frag.data[1]);
-            // }
-            // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
-            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            //   printf("tid=%d, v_frag[0]=%x, v_frag[1]=%x\n", threadIdx.x,
-            //   v_frag.data[0], v_frag.data[1]);
-            // }
-
             /// Dot1: P @ V
             if (dot1_atomic_k == 0) {
               mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
@@ -992,23 +834,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                   p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
                   v_frag.data);
             }
-
-            // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
-            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            //     __half *in_u16 = reinterpret_cast<__half
-            //     *>(o_f16[0][0].data);
-            //   printf("tid=%d, dot1_atomic_k=%d, dot1_atomic_m=%d,
-            //   dot1_atomic_n=%d, o_f16[0]=%f, o_f16[1]=%f, o_f16[2]=%f,
-            //   o_f16[3]=%f\n",
-            //          threadIdx.x,
-            //          dot1_atomic_k,
-            //          dot1_atomic_m,
-            //          dot1_atomic_n,
-            //          __half2float(in_u16[0]),
-            //          __half2float(in_u16[1]),
-            //          __half2float(in_u16[2]),
-            //          __half2float(in_u16[3]));
-            // }
           } // end loop dot1_atomic_n
         } // end loop dot1_atomic_m
       } // end loop dot1_atomic_k
@@ -1026,15 +851,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
           }
         }
       }
-
-      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
-      //           blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-      //   printf("o_frag[0]=%f, o_frag[1]=%f, o_frag[2]=%f, o_frag[3]=%f\n",
-      //           o_frag[0][0].data[0],
-      //           o_frag[0][0].data[1],
-      //           o_frag[0][0].data[2],
-      //           o_frag[0][0].data[3]);
-      // }
 
       /// Release
       if (lane_id == 0) {

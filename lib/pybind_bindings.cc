@@ -12,6 +12,8 @@ PYBIND11_MODULE(_cuda_ops, m) {
         "CUDA-accelerated nvfp4_matmul_sm120.");
   m.def("_internal_nvfp4_matmul_sm120", &ac4k::_internal_nvfp4_matmul_sm120,
         "Internal testing function.");
+  m.def("nvfp4_dot_scale_sm120", &ac4k::nvfp4_dot_scale_sm120,
+        "CUDA-accelerated nvfp4_dot_scale_sm120.");
 
   /// Quantization
   m.def("nvfp4_quant_sm120", &ac4k::nvfp4_quant_sm120,

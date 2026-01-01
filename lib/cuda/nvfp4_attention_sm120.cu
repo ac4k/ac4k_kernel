@@ -627,7 +627,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                            [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
 
       /// Step 0: S = Q @ K
-      ///      16x64x128=> 16*8*2=256 cycles
 
 #pragma unroll
       for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K;
@@ -707,7 +706,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop dot0_k
 
       /// Step 1: S = S * alpha0(nvfp4 global scale) * qk_norm(rsqrt(dk))
-      ///         8 * 4 = 32 cycles
       float qk_scale = (*q_global_scale) * (*k_global_scale) * qk_norm;
 #pragma unroll
       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_ATOMIC_M; ++i) {
@@ -720,7 +718,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         }
       }
 
-      /// Step 2: max = rowmax(S): 40 cycles
+      /// Step 2: max = rowmax(S)
       float max_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
       float max_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
@@ -745,7 +743,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop i
 
       /// Step 3: p = exp(S - max)
-      ///         160 cycles
       DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_ATOMIC_M]
                            [TILE_DOT0_WARP_N / TILE_ATOMIC_N];
 #pragma unroll
@@ -760,7 +757,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop i
 
       /// Step 4: l = sum(p)
-      ///         14 + 4 * 2 + 2 * 7 = 36 cycles
       float l_new0[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
       float l_new1[TILE_DOT0_WARP_M / TILE_ATOMIC_M];
 #pragma unroll
@@ -823,7 +819,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       convert_to_nvfp4(p_frag, p_fp4_frag, p_fp4_sf_frag);
 
       /// Step 6: o = P @ V
-      ///         256 cycles
       int dot1_k = dot0_n;
 
 #pragma unroll
