@@ -97,6 +97,12 @@ constexpr int TILE_Q_SF_BLOCK_SIZE = TILE_Q_SF_BLOCK_ELES * sizeof(F8E4M3);
 constexpr int TILE_K_SF_BLOCK_SIZE = TILE_K_SF_BLOCK_ELES * sizeof(F8E4M3);
 constexpr int TILE_V_SF_BLOCK_SIZE = TILE_V_SF_BLOCK_ELES * sizeof(float);
 
+// constexpr float V_SCALE_MAX = 2.25;
+// constexpr float P_SCALE_MAX = 65504 / TILE_DOT0_BLOCK_N / V_SCALE_MAX / 1.5;
+
+constexpr float V_SCALE_MAX = 2.25f;
+constexpr float P_SCALE_MAX = 224.0f;
+
 //===----------------------------------------------------------------------===//
 // Define mutiple buffer stage
 //===----------------------------------------------------------------------===//
@@ -318,9 +324,10 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
         F8E4M3x4 out_f8x4 = floatx4_to_e4m3x4(
-            p_f32_in[n0][i].data[j * 2], p_f32_in[n0][i].data[j * 2 + 1],
-            p_f32_in[n0][i + 1].data[j * 2],
-            p_f32_in[n0][i + 1].data[j * 2 + 1]);
+            p_f32_in[n0][i].data[j * 2] * P_SCALE_MAX,
+            p_f32_in[n0][i].data[j * 2 + 1] * P_SCALE_MAX,
+            p_f32_in[n0][i + 1].data[j * 2] * P_SCALE_MAX,
+            p_f32_in[n0][i + 1].data[j * 2 + 1] * P_SCALE_MAX);
         p_fp8_out[n0][i * 8 / 32].data[j + 2 * ((i / 2) % 2)] = out_f8x4;
       } // end loop j
     } // end loop i
@@ -378,12 +385,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
   extern __shared__ __align__(1024) char smem[];
   NVFP4x2 *q_shared = reinterpret_cast<NVFP4x2 *>(smem);
-  NVFP4x2 *k_shared = q_shared + TILE_Q_BLOCK_SIZE;
-  F8E4M3 *v_shared =
-      reinterpret_cast<F8E4M3 *>(k_shared + TILE_K_BLOCK_SIZE * STAGE);
+  NVFP4x2 *k_shared = q_shared + TILE_Q_BLOCK_ELES / ELES_PER_NVFP4x2;
+  F8E4M3 *v_shared = reinterpret_cast<F8E4M3 *>(
+      k_shared + TILE_K_BLOCK_ELES / ELES_PER_NVFP4x2 * STAGE);
   F8E4M3 *q_sf_shared =
-      reinterpret_cast<F8E4M3 *>(v_shared + TILE_V_BLOCK_SIZE * STAGE);
-  F8E4M3 *k_sf_shared = q_sf_shared + TILE_Q_SF_BLOCK_ELES * STAGE;
+      reinterpret_cast<F8E4M3 *>(v_shared + TILE_V_BLOCK_ELES * STAGE);
+  F8E4M3 *k_sf_shared = q_sf_shared + TILE_Q_SF_BLOCK_ELES;
   float *v_sf_shared =
       reinterpret_cast<float *>(k_sf_shared + TILE_K_SF_BLOCK_ELES * STAGE);
   auto get_q_stage_mem = [&](int stage) {
@@ -394,10 +401,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     return k_shared + TILE_K_BLOCK_ELES / ELES_PER_NVFP4x2 * stage;
   };
   auto get_v_stage_mem = [&](int stage) {
-    return v_shared + TILE_V_BLOCK_ELES / ELES_PER_NVFP4x2 * stage;
+    return v_shared + TILE_V_BLOCK_ELES * stage;
   };
   auto get_q_sf_stage_mem = [&](int stage) {
-    return q_sf_shared + TILE_Q_SF_BLOCK_ELES * stage;
+    (void)stage;
+    return q_sf_shared;
   };
   auto get_k_sf_stage_mem = [&](int stage) {
     return k_sf_shared + TILE_K_SF_BLOCK_ELES * stage;
@@ -674,6 +682,27 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         }
       }
 
+      /// mask to inf
+      if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+#pragma unroll
+        for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
+             dot0_atomic_m += TILE_DOT0_ATOMIC_M) {
+          int i = dot0_atomic_m / TILE_DOT0_ATOMIC_M;
+#pragma unroll
+          for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
+               dot0_atomic_n += TILE_DOT0_ATOMIC_N) {
+            int j = dot0_atomic_n / TILE_DOT0_ATOMIC_N;
+#pragma unroll
+            for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+              int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
+              if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+                s_frag[i][j].data[k] = -INFINITY;
+              }
+            }
+          }
+        }
+      }
+
       /// Step 2: max = rowmax(S): 40 cycles
       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
       float max_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
@@ -733,21 +762,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
-        /// Fix exp sum
-        /// redundant p is exp(0 - max)
-        /// total redundant exp sum is exp(-max) * (align_up(N,
-        /// TILE_DOT0_BLOCK_N) - N)
-        if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
-          l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
-                       fast_exp(max_new0[i]);
-          l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
-                       fast_exp(max_new1[i]);
-        }
+        // /// Fix exp sum
+        // /// redundant p is exp(0 - max)
+        // /// total redundant exp sum is exp(-max) * (align_up(N,
+        // /// TILE_DOT0_BLOCK_N) - N)
+        // if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+        //   l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+        //                fast_exp(max_new0[i]);
+        //   l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) /
+        //                fast_exp(max_new1[i]);
+        // }
 
         // Update l
         l0[i] = fast_exp(max0[i], max_new0[i]) * l0[i] + l_new0[i];
         l1[i] = fast_exp(max1[i], max_new1[i]) * l1[i] + l_new1[i];
       } // end loop i
+
+      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
+      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+      //   printf("l_new0=%f, l_new1=%f, l0=%f, l1=%f\n",
+      //          l_new0[0], l_new1[0], l0[0], l1[0]);
+      // }
+
+      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      //     printf("max_new0=%f, max_new1=%f, max0=%f, max1=%f\n", max_new0[0],
+      //            max_new1[0], max0[0], max1[0]);
+      //     printf("l_new0=%f, l_new1=%f, l0=%f, l1=%f\n", l_new0[0],
+      //     l_new1[0],
+      //            l0[0], l1[0]);
+      //   }
+
+      //     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      //       #pragma unroll
+      //       for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      // #pragma unroll
+      //         for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j)
+      //         {
+      //           printf("p_frag[%d][%d].data[0] = %f\t", i, j,
+      //           p_frag[i][j].data[0]); printf("p_frag[%d][%d].data[1] =
+      //           %f\t", i, j, p_frag[i][j].data[1]);
+      //         } // end loop j
+      //         printf("\n");
+      //       } // end loop i
+      //     }
 
       /// Step 4: o = expf(max - max_new) * o
       ///         4 * 8 + 2 = 34
@@ -769,10 +826,24 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         max1[i] = max_new1[i];
       }
 
+      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
+      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+      //   printf("max0=%f, max1=%f, max_new0=%f, max_new1=%f\n",
+      //          max0[0], max1[0], max_new0[0], max_new1[0]);
+      // }
+
       /// Step 5: quantize P from f32 to fp8e4m3
       AFrag_FP8_16x32 p_fp8_frag[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
                                 [TILE_DOT1_WARP_K / TILE_DOT1_ATOMIC_K];
       convert_to_fp8(p_frag, p_fp8_frag);
+
+      // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
+      //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+      //       printf("tid=%d p_frag[0]=%f, p_frag[1]=%f, p_frag[2]=%f,
+      //       p_frag[3]=%f\n", threadIdx.x, p_frag[0][0].data[0],
+      //       p_frag[0][0].data[1], p_frag[0][0].data[2],
+      //       p_frag[0][0].data[3]);
+      //     }
 
       /// Step 6: o = P @ V
       ///         256 cycles
@@ -811,6 +882,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                            : "r"(v_addr));
             }
 
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
+            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            //   printf("tid=%d, v_frag[0]=%x, v_frag[1]=%x\n", threadIdx.x,
+            //   v_frag.data[0], v_frag.data[1]);
+            // }
+            // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
+            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            //   printf("tid=%d, v_frag[0]=%x, v_frag[1]=%x\n", threadIdx.x,
+            //   v_frag.data[0], v_frag.data[1]);
+            // }
+
             /// Dot1: P @ V
             if (dot1_atomic_k == 0) {
               mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
@@ -823,6 +905,23 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
                   p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
                   v_frag.data);
             }
+
+            // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
+            //     blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            //     __half *in_u16 = reinterpret_cast<__half
+            //     *>(o_f16[0][0].data);
+            //   printf("tid=%d, dot1_atomic_k=%d, dot1_atomic_m=%d,
+            //   dot1_atomic_n=%d, o_f16[0]=%f, o_f16[1]=%f, o_f16[2]=%f,
+            //   o_f16[3]=%f\n",
+            //          threadIdx.x,
+            //          dot1_atomic_k,
+            //          dot1_atomic_m,
+            //          dot1_atomic_n,
+            //          __half2float(in_u16[0]),
+            //          __half2float(in_u16[1]),
+            //          __half2float(in_u16[2]),
+            //          __half2float(in_u16[3]));
+            // }
           } // end loop dot1_atomic_n
         } // end loop dot1_atomic_m
       } // end loop dot1_atomic_k
@@ -841,6 +940,15 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         }
       }
 
+      // if (threadIdx.x == 16 && threadIdx.y == 0 && threadIdx.z == 0 &&
+      //           blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+      //   printf("o_frag[0]=%f, o_frag[1]=%f, o_frag[2]=%f, o_frag[3]=%f\n",
+      //           o_frag[0][0].data[0],
+      //           o_frag[0][0].data[1],
+      //           o_frag[0][0].data[2],
+      //           o_frag[0][0].data[3]);
+      // }
+
       /// Release
       if (lane_id == 0) {
         arrive(&empty_bar[stage], 1);
@@ -855,8 +963,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
 #pragma unroll
     for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
-      float scale0 = 1.0f / l0[i];
-      float scale1 = 1.0f / l1[i];
+      float scale0 = 1.0f / l0[i] * (1 / P_SCALE_MAX);
+      float scale1 = 1.0f / l1[i] * (1 / P_SCALE_MAX);
 
 #pragma unroll
       for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
@@ -1030,7 +1138,7 @@ void qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120(
   /// TMA descriptor
   const auto SwizzleQ = CU_TENSOR_MAP_SWIZZLE_64B;
   const auto SwizzleK = CU_TENSOR_MAP_SWIZZLE_64B;
-  const auto SwizzleV = CU_TENSOR_MAP_SWIZZLE_128B;
+  const auto SwizzleV = CU_TENSOR_MAP_SWIZZLE_NONE;
   CUtensorMap q_tensor_map = create_4d_tensor_map<
       1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K / ELES_PER_NVFP4x2,
       CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SwizzleQ>(
@@ -1076,10 +1184,9 @@ void qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120(
   auto *kernel =
       qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120_kernel<SwizzleQ, SwizzleK,
                                                     SwizzleV>;
-  size_t smem_size = TILE_Q_BLOCK_SIZE + TILE_V_SF_BLOCK_SIZE +
-                     (TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                      TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE) *
-                         STAGE;
+  size_t smem_size =
+      TILE_Q_BLOCK_SIZE + TILE_Q_SF_BLOCK_SIZE + TILE_V_SF_BLOCK_SIZE +
+      (TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE) * STAGE;
   CHECK_CUDA_ERROR(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 

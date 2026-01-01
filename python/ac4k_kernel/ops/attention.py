@@ -77,6 +77,7 @@ def _qk_nvfp4_pv_f16_attention(q, k, v, layout="BNHD", out=None):
         H, Nq = q.shape[1], q.shape[2]
 
     N_dim = 1 if layout == "BNHD" else 2
+    k = k - k.mean(dim=N_dim, keepdim=True)
     q_fp4, q_sf, q_alpha = quantize(q, N_dim, 3)
     k_fp4, k_sf, k_alpha = quantize(k, N_dim, 3)
     v_fp4, v_sf = quantize(v, 3, N_dim, swizzle=True, precision="fp8e4m3")
