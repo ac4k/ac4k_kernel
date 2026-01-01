@@ -141,8 +141,8 @@ def quantize(input: torch.Tensor,
              max_scale=None,
              precision="nvfp4",
              swizzle=False,
-             output=None,
              alpha=None,
+             output=None,
              sf=None):
     """
     Quantize input tensor from bfloat16 to fp8e4m3/nvfp4.

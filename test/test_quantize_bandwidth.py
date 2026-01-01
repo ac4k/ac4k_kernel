@@ -1,5 +1,5 @@
 import torch
-from ac4k_kernel.ops import nvfp4_quantize
+from ac4k_kernel.ops import quantize
 
 
 def test_quantize_bench(shape,
@@ -13,10 +13,10 @@ def test_quantize_bench(shape,
             cross_dim, reduce_dim, shape, swizzle))
     input = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
 
-    nvfp4_quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
+    quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
 
     for _ in range(warmup):
-        nvfp4_quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
+        quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -24,10 +24,7 @@ def test_quantize_bench(shape,
 
     start_event.record()
     for i in range(repeat):
-        output, sf, _ = nvfp4_quantize(input,
-                                       cross_dim,
-                                       reduce_dim,
-                                       swizzle=swizzle)
+        output, sf, _ = quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
     end_event.record()
     torch.cuda.synchronize()
     avg_time_ms = start_event.elapsed_time(end_event) / repeat
