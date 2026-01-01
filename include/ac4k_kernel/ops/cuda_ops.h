@@ -18,6 +18,11 @@ void qk_nvfp4_pv_fp8_acc_fp16_mha_fwd_sm120(
     torch::Tensor &k_global_scale, torch::Tensor &v, torch::Tensor &v_sf,
     int64_t Dqk);
 
+void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
+                                  torch::Tensor &q_sf, torch::Tensor &k,
+                                  torch::Tensor &k_sf, torch::Tensor &v,
+                                  torch::Tensor &v_sf, int64_t Dqk);
+
 void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                           torch::Tensor const &in,
                           torch::Tensor const &rcp_global_scale,
@@ -27,6 +32,11 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
 void fp8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                         torch::Tensor const &in, torch::Tensor const &scale_max,
                         uint32_t cross_dim, uint32_t reduce_dim, bool swizzle);
+
+void int8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
+                         torch::Tensor const &in,
+                         torch::Tensor const &scale_max, uint32_t cross_dim,
+                         uint32_t reduce_dim);
 
 void nvfp4_quant_sm120(torch::Tensor &output, torch::Tensor &output_sf,
                        torch::Tensor const &input,

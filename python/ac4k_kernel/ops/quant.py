@@ -123,6 +123,18 @@ def _load_cuda_fp8_quantize():
         ) from e
 
 
+@lru_cache(maxsize=1)
+def _load_cuda_i8_quantize():
+    try:
+        from ._cuda_ops import int8_quantize_sm120
+        return int8_quantize_sm120
+    except ImportError as e:
+        raise ImportError(
+            "CUDA operator 'int8_quantize_sm120' failed to load. "
+            "Possible reasons: CUDA not available, or module not compiled."
+        ) from e
+
+
 def quantize(input: torch.Tensor,
              cross_dim,
              reduce_dim,
@@ -130,6 +142,7 @@ def quantize(input: torch.Tensor,
              precision="nvfp4",
              swizzle=False,
              output=None,
+             alpha=None,
              sf=None):
     """
     Quantize input tensor from bfloat16 to fp8e4m3/nvfp4.
@@ -143,7 +156,7 @@ def quantize(input: torch.Tensor,
     """
 
     assert input.ndim >= 2 and input.ndim <= 4, "input tensor must be 2D, 3D or 4D"
-    assert precision in ["nvfp4", "fp8e4m3"]
+    assert precision in ["nvfp4", "fp8e4m3", "int8"]
 
     def ceil_div(x, y):
         return (x + y - 1) // y
@@ -204,6 +217,51 @@ def quantize(input: torch.Tensor,
                         swizzle)
 
         return output, sf
+    elif precision == "int8":
+        quantize_kernel = _load_cuda_i8_quantize()
+
+        CROSS_DIM_ALIGN_SIZE = 16
+        REDUCE_DIM_ALIGN_SIZE = 16
+        MAX_SCALE = 127
+
+        # shape inference for out and sf
+        input_shape = input.shape
+        # out
+        # out layout: [xx, xx, cross_dim, reduce_dim_align] x int8
+        output_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                output_shape.append(input_shape[i])
+        output_shape.append(input_shape[cross_dim])
+        output_shape.append(
+            align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE))
+        # sf
+        # sf layout: [xx, xx, cross_dim_align] x f32
+        sf_shape = []
+        for i in range(len(input_shape)):
+            if i != cross_dim and i != reduce_dim:
+                sf_shape.append(input_shape[i])
+        sf_shape.append(align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
+
+        # alloc buffer for output and sf
+        if output is None:
+            output = torch.empty(output_shape,
+                                 dtype=torch.int8,
+                                 device=input.device)
+        if sf is None:
+            sf = torch.empty(sf_shape,
+                             dtype=torch.float32,
+                             device=input.device)
+
+        if max_scale is None:
+            max_scale = MAX_SCALE
+        max_scale = torch.full([],
+                               max_scale,
+                               dtype=torch.int32,
+                               device=input.device)
+        quantize_kernel(output, sf, input, max_scale, cross_dim, reduce_dim)
+
+        return output, sf
     else:
         quantize_kernel = _load_cuda_nvfp4_quantize()
 
@@ -219,8 +277,9 @@ def quantize(input: torch.Tensor,
         # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
         if max_scale is None:
             max_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX
-        alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
-            torch.float32)
+        if alpha is None:
+            alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
+                torch.float32)
         global_scale = 1 / alpha
 
         # shape inference for out and sf
