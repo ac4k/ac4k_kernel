@@ -45,4 +45,61 @@ __device__ __forceinline__ uint32_t fp32x4_to_e4m3x4(float4 in) {
   return fp32x4_to_e4m3x4(in.x, in.y, in.z, in.w);
 }
 
+//===----------------------------------------------------------------------===//
+// Align up/down
+//===----------------------------------------------------------------------===//
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType ceil_div(intType x, intType2 y) {
+  return (x + y - 1) / y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_up(intType x, intType2 y) {
+  return ceil_div(x, y) * y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_down(intType x, intType2 y) {
+  return (x / y) * y;
+}
+
+//===----------------------------------------------------------------------===//
+// fpoint <-> fpoint converter
+//===----------------------------------------------------------------------===//
+
+template <typename T> __device__ __forceinline__ float fpoint_to_f32(T value);
+
+template <> __device__ __forceinline__ float fpoint_to_f32<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __forceinline__ float fpoint_to_f32<__half>(__half value) {
+  return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float
+fpoint_to_f32<__nv_bfloat16>(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <typename T> __device__ __forceinline__ T f32_to_fpoint(float value);
+
+template <> __device__ __forceinline__ float f32_to_fpoint<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __forceinline__ __half f32_to_fpoint<__half>(float value) {
+  return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16
+f32_to_fpoint<__nv_bfloat16>(float value) {
+  return __float2bfloat16_rn(value);
+}
+
 } // namespace ac4k

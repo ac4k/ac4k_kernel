@@ -15,11 +15,11 @@ def _load_cuda_nvfp4_dot_scale():
 
 
 def dot_scale(a,
-              scale_a,
-              global_scale_a,
+              a_scale,
+              a_global_scale,
               b,
-              scale_b,
-              global_scale_b,
+              b_scale,
+              b_global_scale,
               bias=None,
               out=None):
     kernel = _load_cuda_nvfp4_dot_scale()
@@ -27,6 +27,6 @@ def dot_scale(a,
     if out is None:
         m, n = a.shape[0], b.shape[0]
         out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-    kernel(out, a, b, scale_a, scale_b, global_scale_a * global_scale_b, bias)
+    kernel(out, a, a_scale, a_global_scale, b, b_scale, b_global_scale, bias)
 
     return out

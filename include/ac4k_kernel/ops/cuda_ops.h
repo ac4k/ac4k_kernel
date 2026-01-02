@@ -55,9 +55,10 @@ void _internal_nvfp4_matmul_sm120(torch::Tensor &D, torch::Tensor const &A,
                                   c10::optional<torch::Tensor> const &bias);
 
 void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
-                           torch::Tensor const &B, torch::Tensor const &A_sf,
-                           torch::Tensor const &B_sf,
-                           torch::Tensor const &alpha,
+                           torch::Tensor const &A_sf,
+                           torch::Tensor const &A_global_scale,
+                           torch::Tensor const &B, torch::Tensor const &B_sf,
+                           torch::Tensor const &B_global_scale,
                            c10::optional<torch::Tensor> const &bias);
 
 void rope_3d_apply(const torch::Tensor &x,          // [B, S, N, D], bfloat16

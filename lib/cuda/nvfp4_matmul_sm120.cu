@@ -494,20 +494,13 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                            : "r"(b_addr));
 
               /// Apply mma
-              fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
-                  a_frag.data[1], a_frag.data[2], a_frag.data[3],
-                  b_frag.data[0], b_frag.data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data, a_frag.data,
+                  b_frag.data, sfa0, sfb0);
             } // end loop atomic_n
-          }   // end loop atomic_m
-        }     // end loop atomic_k
-      }       // end loop warp_k
+          } // end loop atomic_m
+        } // end loop atomic_k
+      } // end loop warp_k
 
       if (lane_id == 0) {
         arrive(&empty_bar[stage], 1);
@@ -534,8 +527,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
              ++idx) {
           c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
         } // end loop idx
-      }   // end loop atomic_n_cnt
-    }     // end loop atomic_m_cnt
+      } // end loop atomic_n_cnt
+    } // end loop atomic_m_cnt
 
     //===------------------------------------------------------------------===//
     // Apply bias
@@ -561,8 +554,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                   __bfloat162float(bias[n]);
             }
           } // end loop idx
-        }   // end loop atomic_n_cnt
-      }     // end loop atomic_m_cnt
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
     }
 
     //===------------------------------------------------------------------===//
@@ -614,7 +607,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
           }
         } // end loop atomic_n_cnt
-      }   // end loop atomic_m_cnt
+      } // end loop atomic_m_cnt
     } else {
       // Meet out-of-range
 
@@ -658,8 +651,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             D[m * N + n] = __float2bfloat16_rn(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
           } // end loop idx
-        }   // end loop atomic_n_cnt
-      }     // end loop atomic_m_cnt
+        } // end loop atomic_n_cnt
+      } // end loop atomic_m_cnt
     }
   } // end if consumer
 }

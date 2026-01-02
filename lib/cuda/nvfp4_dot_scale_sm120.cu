@@ -1,5 +1,4 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda/barrier>
 #include <cuda_bf16.h>
@@ -55,7 +54,6 @@ const int TILE_WARP_K = 64;
 const int TILE_WARP_PACK_K = TILE_WARP_K / ELES_PER_NVFP4x2;
 
 /// Atomic level tile size
-/// mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
 const int TILE_ATOMIC_M = 16;
 const int TILE_ATOMIC_N = 8;
 const int TILE_ATOMIC_K = 64;
@@ -254,15 +252,20 @@ __device__ static __forceinline__ int2 get_program_id(int M, int N) {
 // C shape:MxN stride:Nx1 matrix, row major
 //===----------------------------------------------------------------------===//
 
-template <CUtensorMapSwizzle Swizzle>
+template <CUtensorMapSwizzle Swizzle, at::ScalarType D_AT_TYPE>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     void nvfp4_dot_scale_sm120_kernel(
-        __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
-        const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
-        int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
+        typename AtDataTraits<D_AT_TYPE>::Type *D, const NVFP4x2 *A,
+        const E4M3 *A_sf, const float *A_global_scale, const NVFP4x2 *B,
+        const E4M3 *B_sf, const float *B_global_scale,
+        const typename AtDataTraits<D_AT_TYPE>::Type *bias, int M, int N, int K,
+        const __grid_constant__ CUtensorMap a_tensor_map,
         const __grid_constant__ CUtensorMap b_tensor_map,
         const __grid_constant__ CUtensorMap a_sf_tensor_map,
         const __grid_constant__ CUtensorMap b_sf_tensor_map) {
+  using D_TYPE = typename AtDataTraits<D_AT_TYPE>::Type;
+  using D_TYPEx2 = typename AtDataTraits<D_AT_TYPE>::Typex2;
+
   //===--------------------------------------------------------------------===//
   // Distribute for block, warp
   //===--------------------------------------------------------------------===//
@@ -408,7 +411,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
             /// SF A
             uint32_t sfa0 = 0;
-            if (lane_id % 4 < 2) {
+            {
               int row =
                   warp_m + atomic_m + ((lane_id % 4) % 2) * 8 + (lane_id / 4);
               int col = warp_k + atomic_k;
@@ -442,7 +445,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
               /// SF B
               uint32_t sfb0 = 0;
-              if (lane_id % 4 == 0) {
+              {
                 int row = warp_n + atomic_n + (lane_id / 4);
                 int col = warp_k + atomic_k;
                 sfb0 = b_sf_shared[stage * TILE_BLOCK_B_SF_ELES +
@@ -469,16 +472,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                            : "r"(b_addr));
 
               /// Apply mma
-              fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
-                  a_frag.data[1], a_frag.data[2], a_frag.data[3],
-                  b_frag.data[0], b_frag.data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data, a_frag.data,
+                  b_frag.data, sfa0, sfb0);
             } // end loop atomic_n
           } // end loop atomic_m
         } // end loop atomic_k
@@ -497,6 +493,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     // Apply alpha
     //===------------------------------------------------------------------===//
 
+    float scale = (*A_global_scale) * (*B_global_scale);
+
 #pragma unroll
     for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
          ++atomic_m_cnt) {
@@ -507,7 +505,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         for (int idx = 0;
              idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
              ++idx) {
-          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
+          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= scale;
         } // end loop idx
       } // end loop atomic_n_cnt
     } // end loop atomic_m_cnt
@@ -533,7 +531,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             int n = block_n + warp_n + thread_n;
             if (n < N) {
               c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] +=
-                  __bfloat162float(bias[n]);
+                  fpoint_to_f32(bias[n]);
             }
           } // end loop idx
         } // end loop atomic_n_cnt
@@ -553,13 +551,13 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 #pragma unroll
         for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
              ++atomic_n_cnt) {
-          __nv_bfloat162 out;
-          __nv_bfloat16 *out_bf16 = reinterpret_cast<__nv_bfloat16 *>(&out);
+          D_TYPEx2 out;
+          auto *out_bf16 = reinterpret_cast<D_TYPE *>(&out);
           {
-            out_bf16[0] =
-                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
-            out_bf16[1] =
-                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
+            out_bf16[0] = f32_to_fpoint<D_TYPE>(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
+            out_bf16[1] = f32_to_fpoint<D_TYPE>(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
 
             int thread_m =
                 atomic_m_cnt * TILE_ATOMIC_M +
@@ -569,14 +567,14 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                 atomic_n_cnt * TILE_ATOMIC_N +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 0);
             int n = block_n + warp_n + thread_n;
-            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+            *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
           }
 
           {
-            out_bf16[0] =
-                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
-            out_bf16[1] =
-                __float2bfloat16_rn(c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
+            out_bf16[0] = f32_to_fpoint<D_TYPE>(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
+            out_bf16[1] = f32_to_fpoint<D_TYPE>(
+                c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
 
             int thread_m =
                 atomic_m_cnt * TILE_ATOMIC_M +
@@ -586,7 +584,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                 atomic_n_cnt * TILE_ATOMIC_N +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 2);
             int n = block_n + warp_n + thread_n;
-            *reinterpret_cast<__nv_bfloat162 *>(D + m * N + n) = out;
+            *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
           }
         } // end loop atomic_n_cnt
       } // end loop atomic_m_cnt
@@ -630,7 +628,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
               continue;
             }
 
-            D[m * N + n] = __float2bfloat16_rn(
+            D[m * N + n] = f32_to_fpoint<D_TYPE>(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[idx]);
           } // end loop idx
         } // end loop atomic_n_cnt
@@ -640,18 +638,19 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 }
 
 void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
-                           torch::Tensor const &B, torch::Tensor const &A_sf,
-                           torch::Tensor const &B_sf,
-                           torch::Tensor const &alpha,
+                           torch::Tensor const &A_sf,
+                           torch::Tensor const &A_global_scale,
+                           torch::Tensor const &B, torch::Tensor const &B_sf,
+                           torch::Tensor const &B_global_scale,
                            c10::optional<torch::Tensor> const &bias) {
   /// Check type
   CHECK_INPUT(A_sf, at::ScalarType::Float8_e4m3fn, "scale_a");
   CHECK_INPUT(B_sf, at::ScalarType::Float8_e4m3fn, "scale_b");
-  CHECK_INPUT(alpha, at::ScalarType::Float, "alpha");
+  CHECK_INPUT(A_global_scale, at::ScalarType::Float, "global_scale_a");
+  CHECK_INPUT(B_global_scale, at::ScalarType::Float, "global_scale_b");
 
   CHECK_INPUT(A, at::ScalarType::Byte, "a");
   CHECK_INPUT(B, at::ScalarType::Byte, "b");
-  CHECK_INPUT(D, at::ScalarType::BFloat16, "d");
 
   /// Check rank
   TORCH_CHECK(A.dim() == 2, "a must be a matrix");
@@ -692,9 +691,16 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
               "meet invalid scale_b shape[1]");
   TORCH_CHECK(B_sf.sizes()[2] == 4, "meet invalid scale_b shape[2]");
 
+  /// Check global_scale_a operand
+  TORCH_CHECK(A_global_scale.dim() == 0, "A_global_scale must be a scalar");
+
+  /// Check global_scale_b operand
+  TORCH_CHECK(B_global_scale.dim() == 0, "B_global_scale must be a scalar");
+
   /// Check bias
   if (bias.has_value()) {
-    CHECK_INPUT(bias.value(), at::ScalarType::BFloat16, "bias");
+    TORCH_CHECK(bias.value().scalar_type() == D.scalar_type(),
+                "bias must be same type as d");
     TORCH_CHECK(bias.value().dim() == 2, "bias must be a matrix");
     TORCH_CHECK(bias.value().sizes()[0] == 1, "bias shape[0] must be 1");
     TORCH_CHECK(bias.value().sizes()[1] == N, "bias shape[1] must be ", N);
@@ -702,70 +708,76 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
     TORCH_CHECK(bias.value().stride(1) == 1, "bias stride[1] must be 1");
   }
 
-  /// Check alpha
-  CHECK_INPUT(alpha, at::ScalarType::Float, "a");
-  TORCH_CHECK(alpha.dim() == 0, "alpha must be a scalar");
+  /// Check D
+  TORCH_CHECK(D.scalar_type() == at::ScalarType::BFloat16 ||
+                  D.scalar_type() == at::ScalarType::Half ||
+                  D.scalar_type() == at::ScalarType::Float,
+              "d must be bfloat16, half or float");
+  CHECK_CONTIGUOUS(D, "d");
 
-  /// Grid & Block dim3
-  dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
-  dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+  DISPATCH_AT_TENSOR_TYPES<
+      at::ScalarType::BFloat16, at::ScalarType::Half,
+      at::ScalarType::Float>(D.scalar_type(), [&]<at::ScalarType D_AT_TYPE>() {
+    using T = typename AtDataTraits<D_AT_TYPE>::Type;
 
-  /// Set dynamic shared memory size
-  const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
-  auto *kernel = nvfp4_dot_scale_sm120_kernel<SWIZZLE>;
-  size_t smem_size =
-      TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
-      (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) * STAGE;
-  CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    /// Grid & Block dim3
+    dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
+    dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
 
-  /// Get CUDA stream
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
+    /// Get CUDA stream
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  /// TMA descriptor
-  CUtensorMap a_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           NVFP4x2, SWIZZLE>(
-          reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
-  CUtensorMap b_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           NVFP4x2, SWIZZLE>(
-          reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
-  CUtensorMap a_sf_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                           uint32_t>(
-          reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(A_sf.size(0)),
-          static_cast<uint64_t>(A_sf.size(1)));
-  CUtensorMap b_sf_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                           uint32_t>(
-          reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(B_sf.size(0)),
-          static_cast<uint64_t>(B_sf.size(1)));
+    /// Set dynamic shared memory size
+    const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
+    auto *kernel = nvfp4_dot_scale_sm120_kernel<SWIZZLE, D_AT_TYPE>;
+    size_t smem_size =
+        TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
+        (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) *
+            STAGE;
+    CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-  /// Launch kernel
-  kernel<<<grid, block, smem_size, stream>>>(
-      reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-      reinterpret_cast<const E4M3 *>(A_sf.data_ptr()),
-      reinterpret_cast<const E4M3 *>(B_sf.data_ptr()),
-      reinterpret_cast<const float *>(alpha.data_ptr()),
-      bias.has_value()
-          ? reinterpret_cast<const __nv_bfloat16 *>(bias.value().data_ptr())
-          : nullptr,
-      M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map, b_sf_tensor_map);
+    /// TMA descriptor
+    CUtensorMap a_tensor_map = create_4d_tensor_map<
+        1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+        reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+        static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
+    CUtensorMap b_tensor_map = create_4d_tensor_map<
+        1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+        reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+        static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
+    CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
+        1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+        reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
+        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+        static_cast<uint64_t>(A_sf.size(0)),
+        static_cast<uint64_t>(A_sf.size(1)));
+    CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
+        1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
+        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+        reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
+        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+        static_cast<uint64_t>(B_sf.size(0)),
+        static_cast<uint64_t>(B_sf.size(1)));
+
+    /// Launch kernel
+    kernel<<<grid, block, smem_size, stream>>>(
+        reinterpret_cast<T *>(D.data_ptr()),
+        reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+        reinterpret_cast<const E4M3 *>(A_sf.data_ptr()),
+        reinterpret_cast<const float *>(A_global_scale.data_ptr()),
+        reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+        reinterpret_cast<const E4M3 *>(B_sf.data_ptr()),
+        reinterpret_cast<const float *>(B_global_scale.data_ptr()),
+        bias.has_value() ? reinterpret_cast<const T *>(bias.value().data_ptr())
+                         : nullptr,
+        M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map, b_sf_tensor_map);
+  });
 }
 
 } // namespace ac4k
