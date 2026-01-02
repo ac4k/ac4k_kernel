@@ -256,9 +256,10 @@ __device__ static __forceinline__ int2 get_program_id(int M, int N) {
 template <CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     void nvfp4_dot_scale_sm120_kernel(
-        __nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B, const E4M3 *A_sf,
-        const E4M3 *B_sf, const float *alpha, const __nv_bfloat16 *bias, int M,
-        int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
+        __nv_bfloat16 *D, const NVFP4x2 *A, const E4M3 *A_sf,
+        const float *A_global_scale, const NVFP4x2 *B, const E4M3 *B_sf,
+        const float *B_global_scale, const __nv_bfloat16 *bias, int M, int N,
+        int K, const __grid_constant__ CUtensorMap a_tensor_map,
         const __grid_constant__ CUtensorMap b_tensor_map,
         const __grid_constant__ CUtensorMap a_sf_tensor_map,
         const __grid_constant__ CUtensorMap b_sf_tensor_map) {
@@ -489,6 +490,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     // Apply alpha
     //===------------------------------------------------------------------===//
 
+    float scale = (*A_global_scale) * (*B_global_scale);
+
 #pragma unroll
     for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
          ++atomic_m_cnt) {
@@ -499,7 +502,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         for (int idx = 0;
              idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
              ++idx) {
-          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= *alpha;
+          c_frag[atomic_m_cnt][atomic_n_cnt].data[idx] *= scale;
         } // end loop idx
       } // end loop atomic_n_cnt
     } // end loop atomic_m_cnt
@@ -632,14 +635,16 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 }
 
 void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
-                           torch::Tensor const &B, torch::Tensor const &A_sf,
-                           torch::Tensor const &B_sf,
-                           torch::Tensor const &alpha,
+                           torch::Tensor const &A_sf,
+                           torch::Tensor const &A_global_scale,
+                           torch::Tensor const &B, torch::Tensor const &B_sf,
+                           torch::Tensor const &B_global_scale,
                            c10::optional<torch::Tensor> const &bias) {
   /// Check type
   CHECK_INPUT(A_sf, at::ScalarType::Float8_e4m3fn, "scale_a");
   CHECK_INPUT(B_sf, at::ScalarType::Float8_e4m3fn, "scale_b");
-  CHECK_INPUT(alpha, at::ScalarType::Float, "alpha");
+  CHECK_INPUT(A_global_scale, at::ScalarType::Float, "global_scale_a");
+  CHECK_INPUT(B_global_scale, at::ScalarType::Float, "global_scale_b");
 
   CHECK_INPUT(A, at::ScalarType::Byte, "a");
   CHECK_INPUT(B, at::ScalarType::Byte, "b");
@@ -684,6 +689,12 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
               "meet invalid scale_b shape[1]");
   TORCH_CHECK(B_sf.sizes()[2] == 4, "meet invalid scale_b shape[2]");
 
+  /// Check global_scale_a operand
+  TORCH_CHECK(A_global_scale.dim() == 0, "A_global_scale must be a scalar");
+
+  /// Check global_scale_b operand
+  TORCH_CHECK(B_global_scale.dim() == 0, "B_global_scale must be a scalar");
+
   /// Check bias
   if (bias.has_value()) {
     CHECK_INPUT(bias.value(), at::ScalarType::BFloat16, "bias");
@@ -693,10 +704,6 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
     TORCH_CHECK(bias.value().stride(0) == N, "bias stride[0] must be ", N);
     TORCH_CHECK(bias.value().stride(1) == 1, "bias stride[1] must be 1");
   }
-
-  /// Check alpha
-  CHECK_INPUT(alpha, at::ScalarType::Float, "a");
-  TORCH_CHECK(alpha.dim() == 0, "alpha must be a scalar");
 
   /// Grid & Block dim3
   dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
@@ -750,10 +757,11 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
   kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<__nv_bfloat16 *>(D.data_ptr()),
       reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-      reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
       reinterpret_cast<const E4M3 *>(A_sf.data_ptr()),
+      reinterpret_cast<const float *>(A_global_scale.data_ptr()),
+      reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
       reinterpret_cast<const E4M3 *>(B_sf.data_ptr()),
-      reinterpret_cast<const float *>(alpha.data_ptr()),
+      reinterpret_cast<const float *>(B_global_scale.data_ptr()),
       bias.has_value()
           ? reinterpret_cast<const __nv_bfloat16 *>(bias.value().data_ptr())
           : nullptr,
