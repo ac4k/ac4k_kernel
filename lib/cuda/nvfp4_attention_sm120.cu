@@ -254,18 +254,6 @@ __forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
 }
 
 //===----------------------------------------------------------------------===//
-// Heterogeneous allocation of registers for producer & consumer.
-//===----------------------------------------------------------------------===//
-
-template <uint32_t RegCount> __forceinline__ __device__ void reg_alloc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-//===----------------------------------------------------------------------===//
 // Convert 8xfloat32 to 8xNVFP4 (represented as one uint32_t)
 //===----------------------------------------------------------------------===//
 

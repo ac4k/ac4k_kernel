@@ -3,6 +3,7 @@
 #include "dispatch.cuh"
 #include "math.cuh"
 #include "mma.cuh"
+#include "register.cuh"
 #include "traits.cuh"
 
 #include <cstdint>
