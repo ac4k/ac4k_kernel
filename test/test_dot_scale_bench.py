@@ -75,8 +75,8 @@ def get_torch_results(a_fp4,
                       b_global_scale,
                       m,
                       n,
-                      dtype,
                       block_size,
+                      o_dtype=None,
                       bias=None):
     assert a_fp4.dtype == torch.uint8
     assert b_fp4.dtype == torch.uint8
@@ -101,14 +101,16 @@ def get_torch_results(a_fp4,
     if bias is not None:
         out += bias
 
-    return out.to(dtype)
+    if o_dtype is None:
+        return out.to(torch.bfloat16)
+
+    return out.to(o_dtype)
 
 
 @torch.inference_mode()
-def test_dot_scale(
-    dtype: torch.dtype,
-    shape: tuple[int, int, int],
-) -> None:
+def test_dot_scale(dtype: torch.dtype,
+                   shape: tuple[int, int, int],
+                   o_dtype=None) -> None:
     print("test dot scale: ", shape)
 
     m, n, k = shape
@@ -116,6 +118,10 @@ def test_dot_scale(
     a = torch.randn((m, k), dtype=dtype, device="cuda")
     b = torch.randn((n, k), dtype=dtype, device="cuda")
     bias = None
+
+    out = None
+    if o_dtype is not None:
+        out = torch.randn((m, n), dtype=o_dtype, device="cuda")
 
     a_fp4, a_sf, a_global_scale = quantize(a, 0, 1)
     b_fp4, b_sf, b_global_scale = quantize(b, 0, 1)
@@ -125,7 +131,8 @@ def test_dot_scale(
                     b_fp4,
                     b_sf,
                     b_global_scale,
-                    bias=bias)
+                    bias=bias,
+                    out=out)
 
     # ref
     expected_out = get_torch_results(a_fp4,
@@ -136,8 +143,8 @@ def test_dot_scale(
                                      1 / b_global_scale,
                                      m,
                                      n,
-                                     dtype,
                                      block_size,
+                                     o_dtype=o_dtype,
                                      bias=bias)
 
     torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
@@ -158,3 +165,4 @@ if __name__ == "__main__":
     test_dot_scale(torch.bfloat16, (1, 4, 256))
     test_dot_scale(torch.bfloat16, (64, 64, 128))
     test_dot_scale(torch.bfloat16, (12, 23, 55))
+    test_dot_scale(torch.bfloat16, (12, 23, 5), o_dtype=torch.float32)
