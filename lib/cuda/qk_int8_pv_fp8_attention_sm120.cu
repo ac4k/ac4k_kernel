@@ -40,7 +40,7 @@ using F8E4M3x4 = uint32_t;
 using INT8 = int8_t;
 
 constexpr int64_t HEAD_DIM_SIZE = 128;
-constexpr int64_t HEAD_DIM_ALIGN_SIZE = 128;
+constexpr int64_t MAX_HEAD_DIM_SIZE = 128;
 
 using Q_TYPE = INT8;
 using K_TYPE = INT8;
@@ -254,16 +254,6 @@ load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
 }
 
 //===----------------------------------------------------------------------===//
-// Fast reciprocal
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-//===----------------------------------------------------------------------===//
 // Heterogeneous allocation of registers for producer & consumer.
 //===----------------------------------------------------------------------===//
 
@@ -308,7 +298,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     void qk_int8_pv_fp8_mha_fwd_sm120_kernel(
         BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
         int64_t o_d_stride, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
-        int64_t Dqk, int64_t Dv, float qk_norm,
+        int64_t Dqk, int64_t Dv, float sm_scale,
         const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
@@ -469,6 +459,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         arrive(&empty_bar[i], 1);
       }
     }
+
+    /// Scale for softmax
+    sm_scale = sm_scale * LOG2E_F;
 
     //===------------------------------------------------------------------===//
     // Define fragment
@@ -653,9 +646,6 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
           }
         }
       }
-
-      /// Scale for softmax
-      float sm_scale = qk_norm * LOG2E_F;
 
       /// Step 2: max = rowmax(S)
       float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
@@ -924,18 +914,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
                                   torch::Tensor &q_sf, torch::Tensor &k,
                                   torch::Tensor &k_sf, torch::Tensor &v,
-                                  torch::Tensor &v_sf, int64_t Dqk) {
+                                  torch::Tensor &v_sf, float sm_scale) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Char, "Q must be pack to int8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
   int64_t B = q.size(0);
   int64_t H = q.size(1);
   int64_t Nq = q.size(2);
-  TORCH_CHECK(q.size(3) == align_up(Dqk, 16), "q.size(3) must be ",
-              align_up(Dqk, 16), " but see ", q.size(3));
+  int64_t Dqk = q.size(3);
+  TORCH_CHECK(Dqk % 16 == 0, "Dqk must be multiple of 16");
   /// TODO(need remove limit)
-  TORCH_CHECK(Dqk <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
-              HEAD_DIM_ALIGN_SIZE);
+  TORCH_CHECK(Dqk <= MAX_HEAD_DIM_SIZE, "Dqk must be less than ",
+              MAX_HEAD_DIM_SIZE);
   CHECK_INPUT(q_sf, at::ScalarType::Float, "Q_SF must be a float tensor");
   TORCH_CHECK(q_sf.dim() == 3, "Q_SF must be a 3D tensor");
   TORCH_CHECK(q_sf.size(0) == B, "Meet invalid Q_SF size(0) with ",
@@ -973,8 +963,8 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
   TORCH_CHECK(v.size(3) == align_up(Nkv, 16), "Meet invalid v size(3) with ",
               v.size(3), "==", align_up(Nkv, 16));
   /// TODO(need remove limit)
-  TORCH_CHECK(Dv <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
-              HEAD_DIM_ALIGN_SIZE);
+  TORCH_CHECK(Dv <= MAX_HEAD_DIM_SIZE, "Dqk must be less than ",
+              MAX_HEAD_DIM_SIZE);
   CHECK_INPUT(v_sf, at::ScalarType::Float, "V_SF must be a float tensor");
   TORCH_CHECK(v_sf.dim() == 3, "V_SF must be a 3D tensor");
   TORCH_CHECK(v_sf.size(0) == B, "Meet invalid v_sf size(0) with ",
@@ -1064,9 +1054,9 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
       /* o b stride */ o.stride(0),
       /* o h stride */ o.stride(1),
       /* o n stride */ o.stride(2),
-      /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv,
-      1.0f / std::sqrt(static_cast<float>(Dqk)), q_tensor_map, k_tensor_map,
-      v_tensor_map, q_sf_tensor_map, k_sf_tensor_map, v_sf_tensor_map);
+      /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
+      q_tensor_map, k_tensor_map, v_tensor_map, q_sf_tensor_map,
+      k_sf_tensor_map, v_sf_tensor_map);
 }
 
 } // namespace ac4k
