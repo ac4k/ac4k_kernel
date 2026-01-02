@@ -14,7 +14,7 @@ def test_performance(B, N, H, D, warmup_runs: int = 5, repeat: int = 10):
 
     print("Warming up...")
     for _ in range(warmup_runs):
-        attention(q, k, v, precision="nvfp4+fp8e4m3")
+        attention(q, k, v, precision="int8+fp8e4m3")
 
     torch.cuda.synchronize()  # Make sure the warmup is done
 
@@ -36,3 +36,4 @@ def test_performance(B, N, H, D, warmup_runs: int = 5, repeat: int = 10):
 if __name__ == "__main__":
     torch.manual_seed(9567)
     test_performance(1, 75600, 40, 128)
+    test_performance(1, 75600, 40, 64)

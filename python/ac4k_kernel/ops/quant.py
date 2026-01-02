@@ -141,7 +141,6 @@ def quantize(input: torch.Tensor,
              max_scale=None,
              precision="nvfp4",
              swizzle=False,
-             alpha=None,
              output=None,
              sf=None):
     """
@@ -277,9 +276,8 @@ def quantize(input: torch.Tensor,
         # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
         if max_scale is None:
             max_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX
-        if alpha is None:
-            alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
-                torch.float32)
+        alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
+            torch.float32)
         global_scale = 1 / alpha
 
         # shape inference for out and sf

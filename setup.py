@@ -63,7 +63,6 @@ setup(
                 'lib/cuda/nvfp4_dot_scale_sm120.cu',
                 'lib/cuda/nvfp4_quant_sm120.cu',
                 'lib/cuda/nvfp4_attention_sm120.cu',
-                'lib/cuda/qk_nvfp4_pv_fp8_acc_f16_attention_sm120.cu',
                 'lib/cuda/qk_int8_pv_fp8_attention_sm120.cu',
                 'lib/cuda/nvfp4_quantize_sm120.cu',
                 'lib/cuda/fp8_quantize_sm120.cu',

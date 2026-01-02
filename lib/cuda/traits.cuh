@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <torch/all.h>
 
 template <at::ScalarType ATDtype> struct AtDataTraits;

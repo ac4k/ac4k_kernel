@@ -1,6 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
-#include <c10/cuda/CUDAGuard.h>
 #include <cmath>
 #include <cuda.h>
 #include <cuda/barrier>
@@ -9,7 +8,6 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
-#include <mma.h>
 #include <torch/all.h>
 
 #include "ac4k_kernel/ops/cuda_ops.h"
@@ -39,81 +37,159 @@ using F8E4M3 = uint8_t;
 using F8E4M3x4 = uint32_t;
 using INT8 = int8_t;
 
-constexpr int64_t HEAD_DIM_SIZE = 128;
-constexpr int64_t HEAD_DIM_ALIGN_SIZE = 128;
+constexpr int64_t MAX_HEAD_DIM_SIZE = 128;
 
-using Q_TYPE = INT8;
-using K_TYPE = INT8;
-using V_TYPE = F8E4M3;
-using Q_SF_TYPE = float;
-using K_SF_TYPE = float;
-using V_SF_TYPE = float;
+template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
+  using Q_TYPE = INT8;
+  using K_TYPE = INT8;
+  using V_TYPE = F8E4M3;
+  using Q_SF_TYPE = float;
+  using K_SF_TYPE = float;
+  using V_SF_TYPE = float;
 
-//===----------------------------------------------------------------------===//
-// Define tile size for block level, warp level and atomic level
-//===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Define tile size for block level, warp level and atomic level
+  //===--------------------------------------------------------------------===//
 
-/// Block level tile size
-constexpr int TILE_DOT_BLOCK_M = 128;
-constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
-constexpr int TILE_DOT0_BLOCK_N = 128;
-constexpr int TILE_DOT0_BLOCK_K = 128;
-constexpr int TILE_DOT1_BLOCK_M = TILE_DOT0_BLOCK_M;
-constexpr int TILE_DOT1_BLOCK_N = 128;
-constexpr int TILE_DOT1_BLOCK_K = TILE_DOT0_BLOCK_N;
+  /// Block level tile size
+  static constexpr int TILE_DOT_BLOCK_M = 128;
+  static constexpr int TILE_DOT0_BLOCK_M = TILE_DOT_BLOCK_M;
+  static constexpr int TILE_DOT0_BLOCK_N = 128;
+  static constexpr int TILE_DOT0_BLOCK_K = HEAD_DIM_QK;
+  static constexpr int TILE_DOT1_BLOCK_M = TILE_DOT0_BLOCK_M;
+  static constexpr int TILE_DOT1_BLOCK_N = HEAD_DIM_V;
+  static constexpr int TILE_DOT1_BLOCK_K = TILE_DOT0_BLOCK_N;
 
-/// Warp level tile size
-constexpr int TILE_DOT0_WARP_M = 16;
-constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
-constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
-constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
-constexpr int TILE_DOT1_WARP_N = 128;
-constexpr int TILE_DOT1_WARP_K = TILE_DOT1_BLOCK_K;
+  /// Warp level tile size
+  static constexpr int TILE_DOT0_WARP_M = 16;
+  static constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
+  static constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
+  static constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
+  static constexpr int TILE_DOT1_WARP_N = 128;
+  static constexpr int TILE_DOT1_WARP_K = TILE_DOT1_BLOCK_K;
 
-constexpr int WARP_NUM =
-    TILE_DOT0_BLOCK_M / TILE_DOT0_WARP_M * TILE_DOT0_BLOCK_N / TILE_DOT0_WARP_N;
-constexpr int WARP_SIZE = 32;
+  static constexpr int CONSUMER_WARP_NUM = TILE_DOT0_BLOCK_M /
+                                           TILE_DOT0_WARP_M *
+                                           TILE_DOT0_BLOCK_N / TILE_DOT0_WARP_N;
+  static constexpr int PRODUCER_WARP_NUM = 4;
+  static constexpr int WARP_SIZE = 32;
 
-/// Atomic levle tile size
-/// Dot0: Q @ V i8.i8.i32
-constexpr int TILE_DOT0_ATOMIC_M = 16;
-constexpr int TILE_DOT0_ATOMIC_N = 8;
-constexpr int TILE_DOT0_ATOMIC_K = 32;
-/// Dot1: Q @ K e4m3.e4m3.f16
-constexpr int TILE_DOT1_ATOMIC_M = 16;
-constexpr int TILE_DOT1_ATOMIC_N = 8;
-constexpr int TILE_DOT1_ATOMIC_K = 32;
+  /// Atomic levle tile size
+  /// Dot0: Q @ V i8.i8.i32
+  static constexpr int TILE_DOT0_ATOMIC_M = 16;
+  static constexpr int TILE_DOT0_ATOMIC_N = 8;
+  static constexpr int TILE_DOT0_ATOMIC_K = 32;
+  /// Dot1: Q @ K e4m3.e4m3.f16
+  static constexpr int TILE_DOT1_ATOMIC_M = 16;
+  static constexpr int TILE_DOT1_ATOMIC_N = 8;
+  static constexpr int TILE_DOT1_ATOMIC_K = 32;
 
-/// Tile size
-constexpr int TILE_Q_BLOCK_ELES = TILE_DOT0_BLOCK_M * TILE_DOT0_BLOCK_K;
-constexpr int TILE_K_BLOCK_ELES = TILE_DOT0_BLOCK_K * TILE_DOT0_BLOCK_N;
-constexpr int TILE_V_BLOCK_ELES = TILE_DOT1_BLOCK_K * TILE_DOT1_BLOCK_N;
-constexpr int TILE_Q_SF_BLOCK_ELES = TILE_DOT0_BLOCK_M;
-constexpr int TILE_K_SF_BLOCK_ELES = TILE_DOT0_BLOCK_N;
-constexpr int TILE_V_SF_BLOCK_ELES = TILE_DOT1_BLOCK_N;
-constexpr int TILE_Q_BLOCK_SIZE = TILE_Q_BLOCK_ELES * sizeof(Q_TYPE);
-constexpr int TILE_K_BLOCK_SIZE = TILE_K_BLOCK_ELES * sizeof(K_TYPE);
-constexpr int TILE_V_BLOCK_SIZE = TILE_V_BLOCK_ELES * sizeof(V_TYPE);
-constexpr int TILE_Q_SF_BLOCK_SIZE = TILE_Q_SF_BLOCK_ELES * sizeof(Q_SF_TYPE);
-constexpr int TILE_K_SF_BLOCK_SIZE = TILE_K_SF_BLOCK_ELES * sizeof(K_SF_TYPE);
-constexpr int TILE_V_SF_BLOCK_SIZE = TILE_V_SF_BLOCK_ELES * sizeof(V_SF_TYPE);
+  /// Tile size
+  static constexpr int TILE_Q_BLOCK_ELES =
+      TILE_DOT0_BLOCK_M * TILE_DOT0_BLOCK_K;
+  static constexpr int TILE_K_BLOCK_ELES =
+      TILE_DOT0_BLOCK_K * TILE_DOT0_BLOCK_N;
+  static constexpr int TILE_V_BLOCK_ELES =
+      TILE_DOT1_BLOCK_K * TILE_DOT1_BLOCK_N;
+  static constexpr int TILE_Q_SF_BLOCK_ELES = TILE_DOT0_BLOCK_M;
+  static constexpr int TILE_K_SF_BLOCK_ELES = TILE_DOT0_BLOCK_N;
+  static constexpr int TILE_V_SF_BLOCK_ELES = TILE_DOT1_BLOCK_N;
+  static constexpr int TILE_Q_BLOCK_SIZE = TILE_Q_BLOCK_ELES * sizeof(Q_TYPE);
+  static constexpr int TILE_K_BLOCK_SIZE = TILE_K_BLOCK_ELES * sizeof(K_TYPE);
+  static constexpr int TILE_V_BLOCK_SIZE = TILE_V_BLOCK_ELES * sizeof(V_TYPE);
+  static constexpr int TILE_Q_SF_BLOCK_SIZE =
+      TILE_Q_SF_BLOCK_ELES * sizeof(Q_SF_TYPE);
+  static constexpr int TILE_K_SF_BLOCK_SIZE =
+      TILE_K_SF_BLOCK_ELES * sizeof(K_SF_TYPE);
+  static constexpr int TILE_V_SF_BLOCK_SIZE =
+      TILE_V_SF_BLOCK_ELES * sizeof(V_SF_TYPE);
 
-constexpr float V_SCALE_MAX = 2.25f;
-/// EXP_OFFSET < log2(FP16 / TILE_DOT0_BLOCK_N / V_SCALE_MAX)
-constexpr float EXP_OFFSET = 7.5f;
+  /// P & V scale factor
+  static constexpr float V_SCALE_MAX = 2.25f;
+  /// EXP_OFFSET < log2(FP16 / TILE_DOT0_BLOCK_N / V_SCALE_MAX)
+  static constexpr float EXP_OFFSET = 7.5f;
 
-//===----------------------------------------------------------------------===//
-// Define mutiple buffer stage
-//===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Define mutiple buffer stage
+  //===--------------------------------------------------------------------===//
 
-const int STAGE = 2;
+  static constexpr int STAGE = 2;
 
-//===----------------------------------------------------------------------===//
-// Consumer & Producer
-//===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Consumer & Producer
+  //===--------------------------------------------------------------------===//
 
-const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
-const int PRODUCER_THREAD_NUM = 128;
+  static constexpr int CONSUMER_THREAD_NUM = CONSUMER_WARP_NUM * WARP_SIZE;
+  static constexpr int PRODUCER_THREAD_NUM = PRODUCER_WARP_NUM * WARP_SIZE;
+  static constexpr int THREAD_NUM = CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM;
+
+  //===--------------------------------------------------------------------===//
+  // Swizzle
+  //===--------------------------------------------------------------------===//
+
+  template <int DIM_SIZE, int BPE>
+  static __forceinline__ constexpr CUtensorMapSwizzle get_swizzle() {
+    if constexpr (DIM_SIZE * BPE == 128) {
+      return CU_TENSOR_MAP_SWIZZLE_128B;
+    } else if constexpr (DIM_SIZE * BPE == 64) {
+      return CU_TENSOR_MAP_SWIZZLE_64B;
+    } else {
+      return CU_TENSOR_MAP_SWIZZLE_NONE;
+    }
+  }
+  static constexpr CUtensorMapSwizzle SWIZZLE_Q =
+      get_swizzle<TILE_DOT0_BLOCK_K, sizeof(Q_TYPE)>();
+  static constexpr CUtensorMapSwizzle SWIZZLE_K =
+      get_swizzle<TILE_DOT0_BLOCK_K, sizeof(K_TYPE)>();
+  static constexpr CUtensorMapSwizzle SWIZZLE_V =
+      get_swizzle<TILE_DOT1_BLOCK_K, sizeof(V_TYPE)>();
+
+  //===--------------------------------------------------------------------===//
+  // Shared memory layout
+  //===--------------------------------------------------------------------===//
+  // Q/K0/K1/V0/V1/Q_SF/K_SF0/K_SF1/V_SF
+  static constexpr int Q_SMEM_OFF = 0;
+  static constexpr int K_SMEM_OFF = Q_SMEM_OFF + TILE_Q_BLOCK_SIZE;
+  static constexpr int V_SMEM_OFF = K_SMEM_OFF + TILE_K_BLOCK_SIZE * STAGE;
+  static constexpr int Q_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE * STAGE;
+  static constexpr int K_SF_SMEM_OFF = Q_SF_SMEM_OFF + TILE_Q_SF_BLOCK_SIZE;
+  static constexpr int V_SF_SMEM_OFF =
+      K_SF_SMEM_OFF + TILE_K_SF_BLOCK_SIZE * STAGE;
+  static constexpr int SMEM_SIZE =
+      TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE * STAGE +
+      TILE_V_BLOCK_SIZE * STAGE + TILE_Q_SF_BLOCK_SIZE +
+      TILE_K_SF_BLOCK_SIZE * STAGE + TILE_V_SF_BLOCK_SIZE;
+  static __forceinline__ __device__ Q_TYPE *get_q_stage_mem(char *smem,
+                                                            int stage) {
+    (void)stage;
+    return reinterpret_cast<Q_TYPE *>(smem + Q_SMEM_OFF);
+  }
+  static __forceinline__ __device__ K_TYPE *get_k_stage_mem(char *smem,
+                                                            int stage) {
+    return reinterpret_cast<K_TYPE *>(smem + K_SMEM_OFF +
+                                      TILE_K_BLOCK_SIZE * stage);
+  }
+  static __forceinline__ __device__ V_TYPE *get_v_stage_mem(char *smem,
+                                                            int stage) {
+    return reinterpret_cast<V_TYPE *>(smem + V_SMEM_OFF +
+                                      TILE_V_BLOCK_SIZE * stage);
+  }
+  static __forceinline__ __device__ Q_SF_TYPE *get_q_sf_stage_mem(char *smem,
+                                                                  int stage) {
+    (void)stage;
+    return reinterpret_cast<Q_SF_TYPE *>(smem + Q_SF_SMEM_OFF);
+  }
+  static __forceinline__ __device__ K_SF_TYPE *get_k_sf_stage_mem(char *smem,
+                                                                  int stage) {
+    return reinterpret_cast<K_SF_TYPE *>(smem + K_SF_SMEM_OFF +
+                                         TILE_K_SF_BLOCK_SIZE * stage);
+  }
+  static __forceinline__ __device__ V_SF_TYPE *get_v_sf_stage_mem(char *smem,
+                                                                  int stage) {
+    (void)stage;
+    return reinterpret_cast<V_SF_TYPE *>(smem + V_SF_SMEM_OFF);
+  }
+};
 
 //===----------------------------------------------------------------------===//
 // Create tma tensor map
@@ -254,28 +330,6 @@ load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
 }
 
 //===----------------------------------------------------------------------===//
-// Fast reciprocal
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-//===----------------------------------------------------------------------===//
-// Heterogeneous allocation of registers for producer & consumer.
-//===----------------------------------------------------------------------===//
-
-template <uint32_t RegCount> __forceinline__ __device__ void reg_alloc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-template <uint32_t RegCount> __forceinline__ __device__ void reg_dealloc() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-//===----------------------------------------------------------------------===//
 // Convert to FP8E4M3
 //===----------------------------------------------------------------------===//
 
@@ -302,27 +356,26 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
   return;
 }
 
-template <CUtensorMapSwizzle SwizzleQ, CUtensorMapSwizzle SwizzleK,
-          CUtensorMapSwizzle SwizzleV>
-__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
+template <typename Policy>
+__launch_bounds__(Policy::THREAD_NUM, 1) __global__
     void qk_int8_pv_fp8_mha_fwd_sm120_kernel(
         BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
         int64_t o_d_stride, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
-        int64_t Dqk, int64_t Dv, float qk_norm,
+        int64_t Dqk, int64_t Dv, float sm_scale,
         const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
         const __grid_constant__ CUtensorMap q_sf_tensor_map,
         const __grid_constant__ CUtensorMap k_sf_tensor_map,
         const __grid_constant__ CUtensorMap v_sf_tensor_map) {
-  int block_b = blockIdx.z;                    // batch
-  int block_h = blockIdx.y;                    // head
-  int block_n = blockIdx.x * TILE_DOT_BLOCK_M; // seq
+  int block_b = blockIdx.z;                            // batch
+  int block_h = blockIdx.y;                            // head
+  int block_n = blockIdx.x * Policy::TILE_DOT_BLOCK_M; // seq
 
   int tid = threadIdx.x;
   int lane_id = tid % 32;
   int warp_id = tid / 32;
-  bool is_consumer = tid < CONSUMER_THREAD_NUM;
+  bool is_consumer = tid < Policy::CONSUMER_THREAD_NUM;
   bool is_producer = !is_consumer;
 
   // dot0 = q @ k
@@ -339,9 +392,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
   int block_dot0_n = block_dot_n;
   int block_dot1_m = block_dot_m;
   int block_dot1_n = block_dot_n;
-  int warp_dot0_m = warp_id * TILE_DOT0_WARP_M;
+  int warp_dot0_m = warp_id * Policy::TILE_DOT0_WARP_M;
   int warp_dot0_n = 0;
-  int warp_dot1_m = warp_id * TILE_DOT1_WARP_M;
+  int warp_dot1_m = warp_id * Policy::TILE_DOT1_WARP_M;
   int warp_dot1_n = 0;
 
   //===--------------------------------------------------------------------===//
@@ -349,48 +402,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
   //===--------------------------------------------------------------------===//
 
   extern __shared__ __align__(1024) char smem[];
-  Q_TYPE *q_shared = reinterpret_cast<Q_TYPE *>(smem);
-  K_TYPE *k_shared = reinterpret_cast<K_TYPE *>(q_shared + TILE_Q_BLOCK_ELES);
-  V_TYPE *v_shared =
-      reinterpret_cast<V_TYPE *>(k_shared + TILE_K_BLOCK_ELES * STAGE);
-  Q_SF_TYPE *q_sf_shared =
-      reinterpret_cast<Q_SF_TYPE *>(v_shared + TILE_V_BLOCK_ELES * STAGE);
-  K_SF_TYPE *k_sf_shared =
-      reinterpret_cast<K_SF_TYPE *>(q_sf_shared + TILE_Q_SF_BLOCK_ELES);
-  V_SF_TYPE *v_sf_shared =
-      reinterpret_cast<V_SF_TYPE *>(k_sf_shared + TILE_K_SF_BLOCK_ELES * STAGE);
-  auto get_q_stage_mem = [&](int stage) {
-    (void)stage;
-    return q_shared;
-  };
-  auto get_k_stage_mem = [&](int stage) {
-    return k_shared + TILE_K_BLOCK_ELES * stage;
-  };
-  auto get_v_stage_mem = [&](int stage) {
-    return v_shared + TILE_V_BLOCK_ELES * stage;
-  };
-  auto get_q_sf_stage_mem = [&](int stage) {
-    (void)stage;
-    return q_sf_shared;
-  };
-  auto get_k_sf_stage_mem = [&](int stage) {
-    return k_sf_shared + TILE_K_SF_BLOCK_ELES * stage;
-  };
-  auto get_v_sf_stage_mem = [&](int stage) {
-    (void)stage;
-    return v_sf_shared;
-  };
 
   //===--------------------------------------------------------------------===//
   // Define brrier for a and b tma
   //===--------------------------------------------------------------------===//
 
-  __shared__ __align__(8) uint64_t empty_bar[STAGE];
-  __shared__ __align__(8) uint64_t full_bar[STAGE];
+  __shared__ __align__(8) uint64_t empty_bar[Policy::STAGE];
+  __shared__ __align__(8) uint64_t full_bar[Policy::STAGE];
   if (is_producer && lane_id == 0) {
 #pragma unroll
-    for (int i = 0; i < STAGE; ++i) {
-      init_barrier(&empty_bar[i], WARP_NUM);
+    for (int i = 0; i < Policy::STAGE; ++i) {
+      init_barrier(&empty_bar[i], Policy::CONSUMER_WARP_NUM);
       init_barrier(&full_bar[i], 1);
     }
   }
@@ -403,7 +425,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
   if (is_producer) {
     reg_dealloc<24>();
-    if (tid == CONSUMER_THREAD_NUM) {
+    if (tid == Policy::CONSUMER_THREAD_NUM) {
       int stage = 0;
       int phase = 0;
 
@@ -411,30 +433,31 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
       /// Acquire
       wait(&empty_bar[stage], phase);
-      load_4d_async(get_q_stage_mem(stage), &q_tensor_map, &full_bar[stage],
-                    block_b, block_h, block_dot_m, 0);
-      load_4d_async(get_q_sf_stage_mem(stage), &q_sf_tensor_map,
+      load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
+                    &full_bar[stage], block_b, block_h, block_dot_m, 0);
+      load_4d_async(Policy::get_q_sf_stage_mem(smem, stage), &q_sf_tensor_map,
                     &full_bar[stage], 0, block_b, block_h, block_dot_m);
-      load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                    block_b, block_h, 0, 0);
-      load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
+      load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, 0);
+      load_4d_async(Policy::get_k_sf_stage_mem(smem, stage), &k_sf_tensor_map,
                     &full_bar[stage], 0, block_b, block_h, 0);
-      load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                    block_b, block_h, 0, 0);
-      load_4d_async(get_v_sf_stage_mem(stage), &v_sf_tensor_map,
+      load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, 0);
+      load_4d_async(Policy::get_v_sf_stage_mem(smem, stage), &v_sf_tensor_map,
                     &full_bar[stage], 0, block_b, block_h, 0);
       /// Commit
-      expect_bytes(&full_bar[stage],
-                   TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                       TILE_Q_SF_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE +
-                       TILE_V_SF_BLOCK_SIZE);
+      expect_bytes(
+          &full_bar[stage],
+          Policy::TILE_Q_BLOCK_SIZE + Policy::TILE_K_BLOCK_SIZE +
+              Policy::TILE_V_BLOCK_SIZE + Policy::TILE_Q_SF_BLOCK_SIZE +
+              Policy::TILE_K_SF_BLOCK_SIZE + Policy::TILE_V_SF_BLOCK_SIZE);
 
       ++stage;
 
       /// Next
-      for (int dot0_n = TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
-           dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
-        if (stage == STAGE) {
+      for (int dot0_n = Policy::TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
+           dot0_n += Policy::TILE_DOT0_BLOCK_N, ++stage) {
+        if (stage == Policy::STAGE) {
           stage = 0;
           phase ^= 1;
         }
@@ -443,16 +466,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         wait(&empty_bar[stage], phase);
 
         /// TMA K/V and K_SF/V_SF
-        load_4d_async(get_k_stage_mem(stage), &k_tensor_map, &full_bar[stage],
-                      block_b, block_h, dot0_n, 0);
-        load_4d_async(get_k_sf_stage_mem(stage), &k_sf_tensor_map,
+        load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
+                      &full_bar[stage], block_b, block_h, dot0_n, 0);
+        load_4d_async(Policy::get_k_sf_stage_mem(smem, stage), &k_sf_tensor_map,
                       &full_bar[stage], 0, block_b, block_h, dot0_n);
-        load_4d_async(get_v_stage_mem(stage), &v_tensor_map, &full_bar[stage],
-                      block_b, block_h, 0, dot0_n);
+        load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
+                      &full_bar[stage], block_b, block_h, 0, dot0_n);
 
         /// Commit
-        expect_bytes(&full_bar[stage], TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE +
-                                           TILE_K_SF_BLOCK_SIZE);
+        expect_bytes(&full_bar[stage], Policy::TILE_K_BLOCK_SIZE +
+                                           Policy::TILE_V_BLOCK_SIZE +
+                                           Policy::TILE_K_SF_BLOCK_SIZE);
       }
     }
   } // end if (is_producer)
@@ -465,38 +489,46 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     reg_alloc<240>();
     if (lane_id == 0) {
 #pragma unroll
-      for (int i = 0; i < STAGE; ++i) {
+      for (int i = 0; i < Policy::STAGE; ++i) {
         arrive(&empty_bar[i], 1);
       }
     }
+
+    /// Scale for softmax
+    sm_scale = sm_scale * LOG2E_F;
 
     //===------------------------------------------------------------------===//
     // Define fragment
     //===------------------------------------------------------------------===//
 
     /// Q
-    AFrag_I8_16x32 q_frag[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M]
-                         [TILE_DOT0_WARP_K / TILE_DOT0_ATOMIC_K];
+    AFrag_I8_16x32
+        q_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+              [Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K];
     /// max(row max of S=Q @ K)
-    float max0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-    float max1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+    float max0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    float max1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
     /// l（sum of exp)
-    float l0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-    float l1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+    float l0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    float l1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
       max0[i] = -INFINITY;
       max1[i] = -INFINITY;
       l0[i] = 0.0f;
       l1[i] = 0.0f;
     }
     /// o: P @ V
-    DFrag_F32_16x8 o_frag[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
-                         [TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N];
+    DFrag_F32_16x8
+        o_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+              [Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N];
 #pragma unroll
-    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
+    for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+         ++i) {
 #pragma unroll
-      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
+      for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+           ++j) {
 #pragma unroll
         for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
           /// Clear o fragment
@@ -506,8 +538,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     }
 
     for (int dot0_n = 0, stage = 0, phase = 0; dot0_n < DOT0_N;
-         dot0_n += TILE_DOT0_BLOCK_N, ++stage) {
-      if (stage == STAGE) {
+         dot0_n += Policy::TILE_DOT0_BLOCK_N, ++stage) {
+      if (stage == Policy::STAGE) {
         stage = 0;
         phase ^= 1;
       }
@@ -521,20 +553,24 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         /// Load shared to fragment for Q/Q_SF operand
 
 #pragma unroll
-        for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+        for (int i = 0;
+             i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M; ++i) {
 #pragma unroll
-          for (int j = 0; j < TILE_DOT0_WARP_K / TILE_DOT0_ATOMIC_K; ++j) {
+          for (int j = 0;
+               j < Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K; ++j) {
             /// Q
             int *q_regs = (int *)q_frag[i][j].data;
             int q_shared_row =
-                warp_dot0_m + i * TILE_DOT0_ATOMIC_M + (lane_id % 16);
-            int q_shared_col = (j * TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
-            int q_shared_row_swiz = SwizzleIndexMap<SwizzleQ>::get_row(
-                q_shared_row, q_shared_col, sizeof(Q_TYPE));
-            int q_shared_col_swiz = SwizzleIndexMap<SwizzleQ>::get_col(
-                q_shared_row, q_shared_col, sizeof(Q_TYPE));
+                warp_dot0_m + i * Policy::TILE_DOT0_ATOMIC_M + (lane_id % 16);
+            int q_shared_col =
+                (j * Policy::TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
+            int q_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_row(
+                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
+            int q_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_col(
+                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
             uint32_t q_addr = __cvta_generic_to_shared(
-                get_q_stage_mem(stage) + q_shared_row_swiz * TILE_DOT0_BLOCK_K +
+                Policy::get_q_stage_mem(smem, stage) +
+                q_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
                 q_shared_col_swiz);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
                          "{%0, %1, %2, %3}, [%4];"
@@ -546,36 +582,42 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end if (dot0_n == 0) leading
 
       /// S: I32
-      DFrag_I32_16x8 s_frag_i32[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M]
-                               [TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N];
+      DFrag_I32_16x8
+          s_frag_i32[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                    [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 
       /// Step 0: S = Q @ K
 
 #pragma unroll
-      for (int dot0_k = 0; dot0_k < TILE_DOT0_BLOCK_K;
-           dot0_k += TILE_DOT0_ATOMIC_K) {
-        int dot0_atomic_k_cnt = dot0_k / TILE_DOT0_ATOMIC_K;
+      for (int dot0_k = 0; dot0_k < Policy::TILE_DOT0_BLOCK_K;
+           dot0_k += Policy::TILE_DOT0_ATOMIC_K) {
+        int dot0_atomic_k_cnt = dot0_k / Policy::TILE_DOT0_ATOMIC_K;
 #pragma unroll
-        for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
-             dot0_atomic_m += TILE_DOT0_ATOMIC_M) {
-          int dot0_atomic_m_cnt = dot0_atomic_m / TILE_DOT0_ATOMIC_M;
+        for (int dot0_atomic_m = 0; dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+             dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+          int dot0_atomic_m_cnt = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
 #pragma unroll
-          for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
-               dot0_atomic_n += TILE_DOT0_ATOMIC_N) {
-            int dot0_atomic_n_cnt = dot0_atomic_n / TILE_DOT0_ATOMIC_N;
+          for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
+               dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+            int dot0_atomic_n_cnt = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
             /// Load K
             BFrag_I8_32x8 k_frag;
             {
               int *k_regs = (int *)k_frag.data;
               int k_shared_row = warp_dot0_n + dot0_atomic_n + (lane_id % 8);
               int k_shared_col = dot0_k + ((lane_id % 16) / 8) * 16;
-              int k_shared_row_swiz = SwizzleIndexMap<SwizzleK>::get_row(
-                  k_shared_row, k_shared_col, sizeof(K_TYPE));
-              int k_shared_col_swiz = SwizzleIndexMap<SwizzleK>::get_col(
-                  k_shared_row, k_shared_col, sizeof(K_TYPE));
+              int k_shared_row_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_K>::get_row(
+                      k_shared_row, k_shared_col,
+                      sizeof(typename Policy::K_TYPE));
+              int k_shared_col_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_K>::get_col(
+                      k_shared_row, k_shared_col,
+                      sizeof(typename Policy::K_TYPE));
               uint32_t k_addr = __cvta_generic_to_shared(
-                  get_k_stage_mem(stage) +
-                  k_shared_row_swiz * TILE_DOT0_BLOCK_K + k_shared_col_swiz);
+                  Policy::get_k_stage_mem(smem, stage) +
+                  k_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
+                  k_shared_col_swiz);
               asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
                            "{%0, %1}, [%2];"
                            : "=r"(k_regs[0]), "=r"(k_regs[1])
@@ -603,46 +645,49 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop dot0_k
 
       /// Convert s_frag_i32 to float
-      DFrag_F32_16x8 s_frag[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M]
-                           [TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N];
+      DFrag_F32_16x8
+          s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 #pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
-        int atomic_m = i * TILE_DOT0_ATOMIC_M;
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
+        int atomic_m = i * Policy::TILE_DOT0_ATOMIC_M;
 #pragma unroll
-        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
-          int atomic_n = j * TILE_DOT0_ATOMIC_N;
+        for (int j = 0;
+             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
+          int atomic_n = j * Policy::TILE_DOT0_ATOMIC_N;
 
           auto *in_i32 = reinterpret_cast<int32_t *>(s_frag_i32[i][j].data);
           auto *out_f32 = reinterpret_cast<float *>(s_frag[i][j].data);
 
           int lane_m0 = s_frag[i][j].get_row_with_reg(lane_id, 0);
           int lane_n0 = s_frag[i][j].get_col_with_reg(lane_id, 0);
-          float q_scale0 =
-              get_q_sf_stage_mem(stage)[warp_dot0_m + atomic_m + lane_m0];
-          float k_scale0 =
-              get_k_sf_stage_mem(stage)[warp_dot0_n + atomic_n + lane_n0];
+          float q_scale0 = Policy::get_q_sf_stage_mem(
+              smem, stage)[warp_dot0_m + atomic_m + lane_m0];
+          float k_scale0 = Policy::get_k_sf_stage_mem(
+              smem, stage)[warp_dot0_n + atomic_n + lane_n0];
           out_f32[0] = __int2float_rz(in_i32[0]) * q_scale0 * k_scale0;
-          float k_scale1 =
-              get_k_sf_stage_mem(stage)[warp_dot0_n + atomic_n + lane_n0 + 1];
+          float k_scale1 = Policy::get_k_sf_stage_mem(
+              smem, stage)[warp_dot0_n + atomic_n + lane_n0 + 1];
           out_f32[1] = __int2float_rz(in_i32[1]) * q_scale0 * k_scale1;
           int lane_m1 = s_frag[i][j].get_row_with_reg(lane_id, 2);
-          float q_scale1 =
-              get_q_sf_stage_mem(stage)[warp_dot0_m + atomic_m + lane_m1];
+          float q_scale1 = Policy::get_q_sf_stage_mem(
+              smem, stage)[warp_dot0_m + atomic_m + lane_m1];
           out_f32[2] = __int2float_rz(in_i32[2]) * q_scale1 * k_scale0;
           out_f32[3] = __int2float_rz(in_i32[3]) * q_scale1 * k_scale1;
         }
       }
 
       /// mask to inf
-      if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
+      if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
 #pragma unroll
-        for (int dot0_atomic_m = 0; dot0_atomic_m < TILE_DOT0_WARP_M;
-             dot0_atomic_m += TILE_DOT0_ATOMIC_M) {
-          int i = dot0_atomic_m / TILE_DOT0_ATOMIC_M;
+        for (int dot0_atomic_m = 0; dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+             dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+          int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
 #pragma unroll
-          for (int dot0_atomic_n = 0; dot0_atomic_n < TILE_DOT0_WARP_N;
-               dot0_atomic_n += TILE_DOT0_ATOMIC_N) {
-            int j = dot0_atomic_n / TILE_DOT0_ATOMIC_N;
+          for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
+               dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+            int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
 #pragma unroll
             for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
               int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
@@ -654,27 +699,26 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
         }
       }
 
-      /// Scale for softmax
-      float sm_scale = qk_norm * LOG2E_F;
-
       /// Step 2: max = rowmax(S)
-      float max_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-      float max_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+      float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+      float max_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
         max_new0[i] = max0[i];
         max_new1[i] = max1[i];
 #pragma unroll
-        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
           max_new0[i] =
-              fmaxf(max_new0[i], fmaf(data[0], sm_scale, -EXP_OFFSET));
+              fmaxf(max_new0[i], fmaf(data[0], sm_scale, -Policy::EXP_OFFSET));
           max_new0[i] =
-              fmaxf(max_new0[i], fmaf(data[1], sm_scale, -EXP_OFFSET));
+              fmaxf(max_new0[i], fmaf(data[1], sm_scale, -Policy::EXP_OFFSET));
           max_new1[i] =
-              fmaxf(max_new1[i], fmaf(data[2], sm_scale, -EXP_OFFSET));
+              fmaxf(max_new1[i], fmaf(data[2], sm_scale, -Policy::EXP_OFFSET));
           max_new1[i] =
-              fmaxf(max_new1[i], fmaf(data[3], sm_scale, -EXP_OFFSET));
+              fmaxf(max_new1[i], fmaf(data[3], sm_scale, -Policy::EXP_OFFSET));
         } // end loop j
         max_new0[i] =
             fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
@@ -687,12 +731,15 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop i
 
       /// Step 3: p = exp(S - max)
-      DFrag_F32_16x8 p_frag[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M]
-                           [TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N];
+      DFrag_F32_16x8
+          p_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 #pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
 #pragma unroll
-        for (int j = 0; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
           p_frag[i][j].data[0] = exp2f(fmaf(data[0], sm_scale, -max_new0[i]));
           p_frag[i][j].data[1] = exp2f(fmaf(data[1], sm_scale, -max_new0[i]));
@@ -702,14 +749,16 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       } // end loop i
 
       /// Step 4: l = sum(p)
-      float l_new0[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
-      float l_new1[TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M];
+      float l_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+      float l_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < TILE_DOT0_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
         l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
         l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
 #pragma unroll
-        for (int j = 1; j < TILE_DOT0_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
+        for (int j = 1;
+             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           l_new0[i] += p_frag[i][j].data[0];
           l_new0[i] += p_frag[i][j].data[1];
           l_new1[i] += p_frag[i][j].data[2];
@@ -739,9 +788,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       /// Step 4: o = expf(max - max_new) * o
 
 #pragma unroll
-      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
 #pragma unroll
-        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT0_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           o_frag[i][j].data[0] *= exp2f(max0[i] - max_new0[i]);
           o_frag[i][j].data[1] *= exp2f(max0[i] - max_new0[i]);
           o_frag[i][j].data[2] *= exp2f(max1[i] - max_new1[i]);
@@ -752,46 +803,54 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       /// Update max
 
 #pragma unroll
-      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT0_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
         max0[i] = max_new0[i];
         max1[i] = max_new1[i];
       }
 
       /// Step 5: quantize P from f32 to fp8e4m3
-      AFrag_FP8_16x32 p_fp8_frag[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
-                                [TILE_DOT1_WARP_K / TILE_DOT1_ATOMIC_K];
+      AFrag_FP8_16x32
+          p_fp8_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+                    [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
       convert_to_fp8(p_frag, p_fp8_frag);
 
       /// Step 6: o = P @ V
       int dot1_k = dot0_n;
-      DFrag_F16_16x8 o_f16[TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M]
-                          [TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N];
+      DFrag_F16_16x8
+          o_f16[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+               [Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N];
 
 #pragma unroll
-      for (int dot1_atomic_k = 0; dot1_atomic_k < TILE_DOT1_BLOCK_K;
-           dot1_atomic_k += TILE_DOT1_ATOMIC_K) {
-        int dot1_atomic_k_cnt = dot1_atomic_k / TILE_DOT1_ATOMIC_K;
+      for (int dot1_atomic_k = 0; dot1_atomic_k < Policy::TILE_DOT1_BLOCK_K;
+           dot1_atomic_k += Policy::TILE_DOT1_ATOMIC_K) {
+        int dot1_atomic_k_cnt = dot1_atomic_k / Policy::TILE_DOT1_ATOMIC_K;
 #pragma unroll
-        for (int dot1_atomic_m = 0; dot1_atomic_m < TILE_DOT1_WARP_M;
-             dot1_atomic_m += TILE_DOT1_ATOMIC_M) {
-          int dot1_atomic_m_cnt = dot1_atomic_m / TILE_DOT1_ATOMIC_M;
+        for (int dot1_atomic_m = 0; dot1_atomic_m < Policy::TILE_DOT1_WARP_M;
+             dot1_atomic_m += Policy::TILE_DOT1_ATOMIC_M) {
+          int dot1_atomic_m_cnt = dot1_atomic_m / Policy::TILE_DOT1_ATOMIC_M;
 #pragma unroll
-          for (int dot1_atomic_n = 0; dot1_atomic_n < TILE_DOT1_WARP_N;
-               dot1_atomic_n += TILE_DOT1_ATOMIC_N) {
-            int dot1_atomic_n_cnt = dot1_atomic_n / TILE_DOT1_ATOMIC_N;
+          for (int dot1_atomic_n = 0; dot1_atomic_n < Policy::TILE_DOT1_WARP_N;
+               dot1_atomic_n += Policy::TILE_DOT1_ATOMIC_N) {
+            int dot1_atomic_n_cnt = dot1_atomic_n / Policy::TILE_DOT1_ATOMIC_N;
             /// Load V
             BFrag_FP8_32x8 v_frag;
             {
               int *v_regs = (int *)v_frag.data;
               int v_shared_row = warp_dot1_n + dot1_atomic_n + (lane_id % 8);
               int v_shared_col = dot1_atomic_k + ((lane_id % 16) / 8) * 16;
-              int v_shared_row_swiz = SwizzleIndexMap<SwizzleV>::get_row(
-                  v_shared_row, v_shared_col, sizeof(F8E4M3));
-              int v_shared_col_swiz = SwizzleIndexMap<SwizzleV>::get_col(
-                  v_shared_row, v_shared_col, sizeof(F8E4M3));
+              int v_shared_row_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_V>::get_row(
+                      v_shared_row, v_shared_col,
+                      sizeof(typename Policy::V_TYPE));
+              int v_shared_col_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_V>::get_col(
+                      v_shared_row, v_shared_col,
+                      sizeof(typename Policy::V_TYPE));
               uint32_t v_addr = __cvta_generic_to_shared(
-                  get_v_stage_mem(stage) +
-                  v_shared_row_swiz * TILE_DOT1_BLOCK_K + v_shared_col_swiz);
+                  Policy::get_v_stage_mem(smem, stage) +
+                  v_shared_row_swiz * Policy::TILE_DOT1_BLOCK_K +
+                  v_shared_col_swiz);
               asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
                            "{%0, %1}, [%2];"
                            : "=r"(v_regs[0]), "=r"(v_regs[1])
@@ -817,9 +876,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       /// update o = o + o_f16
 
 #pragma unroll
-      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+           ++i) {
 #pragma unroll
-        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N; ++j) {
 #pragma unroll
           for (int k = 0; k < o_f16[i][j].ELES_PER_THREAD; ++k) {
             __half *in_u16 = reinterpret_cast<__half *>(o_f16[i][j].data);
@@ -841,16 +902,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
     /// step 8: o = o / l * v_scale
 
 #pragma unroll
-    for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
+    for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+         ++i) {
       float scale0 = 1.0f / l0[i];
       float scale1 = 1.0f / l1[i];
 
 #pragma unroll
-      for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
+      for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+           ++j) {
         int thread_n = (lane_id % 4) * 2;
-        int n = warp_dot1_n + j * TILE_DOT1_ATOMIC_N + thread_n;
-        float v_scale0 = v_sf_shared[n];
-        float v_scale1 = v_sf_shared[n + 1];
+        int n = warp_dot1_n + j * Policy::TILE_DOT1_ATOMIC_N + thread_n;
+        float v_scale0 = Policy::get_v_sf_stage_mem(smem, 0)[n];
+        float v_scale1 = Policy::get_v_sf_stage_mem(smem, 0)[n + 1];
         o_frag[i][j].data[0] *= scale0 * v_scale0;
         o_frag[i][j].data[1] *= scale0 * v_scale1;
         o_frag[i][j].data[2] *= scale1 * v_scale0;
@@ -860,19 +923,21 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
     /// Step 9: Write back to O
 
-    if (block_dot_m + warp_dot0_m + TILE_DOT0_WARP_M <= Nq &&
-        block_dot_n + warp_dot0_n + TILE_DOT1_WARP_N <= Dv) {
+    if (block_dot_m + warp_dot0_m + Policy::TILE_DOT0_WARP_M <= Nq &&
+        block_dot_n + warp_dot0_n + Policy::TILE_DOT1_WARP_N <= Dv) {
 #pragma unroll
-      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+           ++i) {
 #pragma unroll
-        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N; ++j) {
 #pragma unroll
           for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-            int thread_m = i * TILE_DOT1_ATOMIC_M +
+            int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
                            o_frag[i][j].get_row_with_reg(lane_id, idx);
             // map m to O's N(seq)
             int m = block_dot_m + warp_dot1_m + thread_m;
-            int thread_n = j * TILE_DOT1_ATOMIC_N +
+            int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
                            o_frag[i][j].get_col_with_reg(lane_id, idx);
             // map n to O's D(emb)
             int n = block_dot_n + warp_dot1_n + thread_n;
@@ -884,16 +949,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
       }
     } else {
 #pragma unroll
-      for (int i = 0; i < TILE_DOT1_WARP_M / TILE_DOT1_ATOMIC_M; ++i) {
+      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+           ++i) {
 #pragma unroll
-        for (int j = 0; j < TILE_DOT1_WARP_N / TILE_DOT1_ATOMIC_N; ++j) {
+        for (int j = 0;
+             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N; ++j) {
 #pragma unroll
           for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-            int thread_m = i * TILE_DOT1_ATOMIC_M +
+            int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
                            o_frag[i][j].get_row_with_reg(lane_id, idx);
             // map m to O's N(seq)
             int m = block_dot_m + warp_dot1_m + thread_m;
-            int thread_n = j * TILE_DOT1_ATOMIC_N +
+            int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
                            o_frag[i][j].get_col_with_reg(lane_id, idx);
             // map n to O's D(emb)
             int n = block_dot_n + warp_dot1_n + thread_n;
@@ -924,18 +991,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
                                   torch::Tensor &q_sf, torch::Tensor &k,
                                   torch::Tensor &k_sf, torch::Tensor &v,
-                                  torch::Tensor &v_sf, int64_t Dqk) {
+                                  torch::Tensor &v_sf, float sm_scale) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Char, "Q must be pack to int8 tensor");
   TORCH_CHECK(q.dim() == 4, "Q must be a 4D tensor");
   int64_t B = q.size(0);
   int64_t H = q.size(1);
   int64_t Nq = q.size(2);
-  TORCH_CHECK(q.size(3) == align_up(Dqk, 16), "q.size(3) must be ",
-              align_up(Dqk, 16), " but see ", q.size(3));
+  int64_t Dqk = q.size(3);
+  TORCH_CHECK(Dqk % 16 == 0, "Dqk must be multiple of 16");
   /// TODO(need remove limit)
-  TORCH_CHECK(Dqk <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
-              HEAD_DIM_ALIGN_SIZE);
+  TORCH_CHECK(Dqk <= MAX_HEAD_DIM_SIZE, "Dqk must be less than ",
+              MAX_HEAD_DIM_SIZE);
   CHECK_INPUT(q_sf, at::ScalarType::Float, "Q_SF must be a float tensor");
   TORCH_CHECK(q_sf.dim() == 3, "Q_SF must be a 3D tensor");
   TORCH_CHECK(q_sf.size(0) == B, "Meet invalid Q_SF size(0) with ",
@@ -973,8 +1040,8 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
   TORCH_CHECK(v.size(3) == align_up(Nkv, 16), "Meet invalid v size(3) with ",
               v.size(3), "==", align_up(Nkv, 16));
   /// TODO(need remove limit)
-  TORCH_CHECK(Dv <= HEAD_DIM_ALIGN_SIZE, "Dqk must be less than ",
-              HEAD_DIM_ALIGN_SIZE);
+  TORCH_CHECK(Dv <= MAX_HEAD_DIM_SIZE, "Dqk must be less than ",
+              MAX_HEAD_DIM_SIZE);
   CHECK_INPUT(v_sf, at::ScalarType::Float, "V_SF must be a float tensor");
   TORCH_CHECK(v_sf.dim() == 3, "V_SF must be a 3D tensor");
   TORCH_CHECK(v_sf.size(0) == B, "Meet invalid v_sf size(0) with ",
@@ -993,34 +1060,37 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
   TORCH_CHECK(o.size(2) == Nq, "O must have the same sequence length as Q");
   TORCH_CHECK(o.size(3) == Dv, "O must have the same dim as V");
 
+  /// Policy
+  using policy = Policy<128, 128>;
+
   /// TMA descriptor
-  const auto SwizzleQ = CU_TENSOR_MAP_SWIZZLE_128B;
-  const auto SwizzleK = CU_TENSOR_MAP_SWIZZLE_128B;
-  const auto SwizzleV = CU_TENSOR_MAP_SWIZZLE_128B;
   CUtensorMap q_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_DOT0_BLOCK_M, TILE_DOT0_BLOCK_K,
+      create_4d_tensor_map<1, 1, policy::TILE_DOT0_BLOCK_M,
+                           policy::TILE_DOT0_BLOCK_K,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           uint8_t, SwizzleQ>(
+                           uint8_t, policy::SWIZZLE_Q>(
           reinterpret_cast<const uint8_t *>(q.data_ptr()),
           static_cast<uint64_t>(q.size(0)), static_cast<uint64_t>(q.size(1)),
           static_cast<uint64_t>(q.size(2)), static_cast<uint64_t>(q.size(3)));
   CUtensorMap k_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_DOT0_BLOCK_N, TILE_DOT0_BLOCK_K,
+      create_4d_tensor_map<1, 1, policy::TILE_DOT0_BLOCK_N,
+                           policy::TILE_DOT0_BLOCK_K,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           uint8_t, SwizzleK>(
+                           uint8_t, policy::SWIZZLE_K>(
           reinterpret_cast<const uint8_t *>(k.data_ptr()),
           static_cast<uint64_t>(k.size(0)), static_cast<uint64_t>(k.size(1)),
           static_cast<uint64_t>(k.size(2)), static_cast<uint64_t>(k.size(3)));
   CUtensorMap v_tensor_map =
-      create_4d_tensor_map<1, 1, TILE_DOT1_BLOCK_N, TILE_DOT1_BLOCK_K,
+      create_4d_tensor_map<1, 1, policy::TILE_DOT1_BLOCK_N,
+                           policy::TILE_DOT1_BLOCK_K,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           F8E4M3, SwizzleV>(
+                           F8E4M3, policy::SWIZZLE_V>(
           reinterpret_cast<const F8E4M3 *>(v.data_ptr()),
           static_cast<uint64_t>(v.size(0)), static_cast<uint64_t>(v.size(1)),
           static_cast<uint64_t>(v.size(2)), static_cast<uint64_t>(v.size(3)));
 
   CUtensorMap q_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, TILE_DOT0_BLOCK_M,
+      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT0_BLOCK_M,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
                            uint32_t>(
           reinterpret_cast<const uint32_t *>(q_sf.data_ptr()), 1UL,
@@ -1028,7 +1098,7 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
           static_cast<uint64_t>(q_sf.size(1)),
           static_cast<uint64_t>(q_sf.size(2)));
   CUtensorMap k_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, TILE_DOT0_BLOCK_N,
+      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT0_BLOCK_N,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
                            uint32_t>(
           reinterpret_cast<const uint32_t *>(k_sf.data_ptr()), 1UL,
@@ -1036,7 +1106,7 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
           static_cast<uint64_t>(k_sf.size(1)),
           static_cast<uint64_t>(k_sf.size(2)));
   CUtensorMap v_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, TILE_DOT1_BLOCK_N,
+      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT1_BLOCK_N,
                            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
                            uint32_t>(
           reinterpret_cast<const uint32_t *>(v_sf.data_ptr()), 1UL,
@@ -1045,28 +1115,24 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
           static_cast<uint64_t>(v_sf.size(2)));
 
   /// Set dynamic shared memory size
-  auto *kernel =
-      qk_int8_pv_fp8_mha_fwd_sm120_kernel<SwizzleQ, SwizzleK, SwizzleV>;
-  size_t smem_size =
-      TILE_Q_BLOCK_SIZE + TILE_Q_SF_BLOCK_SIZE + TILE_V_SF_BLOCK_SIZE +
-      (TILE_K_BLOCK_SIZE + TILE_V_BLOCK_SIZE + TILE_K_SF_BLOCK_SIZE) * STAGE;
+  auto *kernel = qk_int8_pv_fp8_mha_fwd_sm120_kernel<policy>;
   CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, policy::SMEM_SIZE));
 
   /// Get CUDA stream
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   /// Launch kernel
-  dim3 grid(ceil_div(Nq, static_cast<int64_t>(TILE_DOT_BLOCK_M)), H, B);
-  dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
-  kernel<<<grid, block, smem_size, stream>>>(
+  dim3 grid(ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H, B);
+  dim3 block(policy::THREAD_NUM);
+  kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
       reinterpret_cast<BF16 *>(o.data_ptr()),
       /* o b stride */ o.stride(0),
       /* o h stride */ o.stride(1),
       /* o n stride */ o.stride(2),
-      /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv,
-      1.0f / std::sqrt(static_cast<float>(Dqk)), q_tensor_map, k_tensor_map,
-      v_tensor_map, q_sf_tensor_map, k_sf_tensor_map, v_sf_tensor_map);
+      /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
+      q_tensor_map, k_tensor_map, v_tensor_map, q_sf_tensor_map,
+      k_sf_tensor_map, v_sf_tensor_map);
 }
 
 } // namespace ac4k
