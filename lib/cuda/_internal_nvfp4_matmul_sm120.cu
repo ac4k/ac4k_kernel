@@ -124,10 +124,8 @@ nvfp4_matmul_sm120_kernel(__nv_bfloat16 *D, const NVFP4x2 *A, const NVFP4x2 *B,
     }
 
     /// Apply mma
-    fma(c_tile.data[0], c_tile.data[1], c_tile.data[2], c_tile.data[3],
-        a_tile.data[0], a_tile.data[1], a_tile.data[2], a_tile.data[3],
-        b_tile.data[0], b_tile.data[1], c_tile.data[0], c_tile.data[1],
-        c_tile.data[2], c_tile.data[3], sfa0, sfb0);
+    mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(c_tile.data, a_tile.data,
+                                            b_tile.data, sfa0, sfb0);
   } // end loop k
 
   //===----------------------------------------------------------------------===//

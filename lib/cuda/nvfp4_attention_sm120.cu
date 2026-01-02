@@ -675,31 +675,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
 
             /// Dot0
             if (dot0_k == 0) {
-              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
-                  k_frag.data[0], k_frag.data[1], 0, 0, 0, 0,
-                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32<MMAAccumulateMode::kInit>(
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data,
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
+                  k_frag.data, q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt],
+                  k_sf_frag);
             } else {
-              fma(s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[0],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[1],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[2],
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data[3],
-                  k_frag.data[0], k_frag.data[1],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[0],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[1],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[2],
-                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data[3],
-                  q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt], k_sf_frag);
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+                  s_frag[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data,
+                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
+                  k_frag.data, q_sf_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt],
+                  k_sf_frag);
             }
           } // end loop dot0_atomic_n
         } // end loop dot0_atomic_m
@@ -867,19 +853,10 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM, 1) __global__
             }
 
             /// Dot1
-            fma(o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
-                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[0],
-                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[1],
-                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[2],
-                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data[3],
-                v_frag.data[0], v_frag.data[1],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[0],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[1],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[2],
-                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[3],
+            mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+                o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data,
+                p_fp4_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
+                v_frag.data,
                 p_fp4_sf_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt], v_sf_frag);
           } // end loop dot1_atomic_n
         } // end loop dot1_atomic_m

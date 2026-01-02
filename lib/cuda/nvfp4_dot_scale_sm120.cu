@@ -55,7 +55,6 @@ const int TILE_WARP_K = 64;
 const int TILE_WARP_PACK_K = TILE_WARP_K / ELES_PER_NVFP4x2;
 
 /// Atomic level tile size
-/// mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
 const int TILE_ATOMIC_M = 16;
 const int TILE_ATOMIC_N = 8;
 const int TILE_ATOMIC_K = 64;
@@ -408,7 +407,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
             /// SF A
             uint32_t sfa0 = 0;
-            if (lane_id % 4 < 2) {
+            {
               int row =
                   warp_m + atomic_m + ((lane_id % 4) % 2) * 8 + (lane_id / 4);
               int col = warp_k + atomic_k;
@@ -442,7 +441,7 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
               /// SF B
               uint32_t sfb0 = 0;
-              if (lane_id % 4 == 0) {
+              {
                 int row = warp_n + atomic_n + (lane_id / 4);
                 int col = warp_k + atomic_k;
                 sfb0 = b_sf_shared[stage * TILE_BLOCK_B_SF_ELES +
@@ -469,16 +468,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                            : "r"(b_addr));
 
               /// Apply mma
-              fma(c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], a_frag.data[0],
-                  a_frag.data[1], a_frag.data[2], a_frag.data[3],
-                  b_frag.data[0], b_frag.data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[0],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[1],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[2],
-                  c_frag[atomic_m_cnt][atomic_n_cnt].data[3], sfa0, sfb0);
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+                  c_frag[atomic_m_cnt][atomic_n_cnt].data, a_frag.data,
+                  b_frag.data, sfa0, sfb0);
             } // end loop atomic_n
           } // end loop atomic_m
         } // end loop atomic_k

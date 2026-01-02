@@ -45,4 +45,23 @@ __device__ __forceinline__ uint32_t fp32x4_to_e4m3x4(float4 in) {
   return fp32x4_to_e4m3x4(in.x, in.y, in.z, in.w);
 }
 
+//===----------------------------------------------------------------------===//
+// Align up/down
+//===----------------------------------------------------------------------===//
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType ceil_div(intType x, intType2 y) {
+  return (x + y - 1) / y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_up(intType x, intType2 y) {
+  return ceil_div(x, y) * y;
+}
+
+template <typename intType, typename intType2 = intType>
+__forceinline__ __host__ __device__ intType align_down(intType x, intType2 y) {
+  return (x / y) * y;
+}
+
 } // namespace ac4k

@@ -150,7 +150,8 @@ def test_dot_scale_performance(
                   b_fp4,
                   b_sf,
                   b_global_scale,
-                  bias=bias)
+                  bias=bias,
+                  out=out)
     torch.cuda.synchronize()  # Make sure the warmup is done
 
     # Test performance: measure the time taken for multiple runs
