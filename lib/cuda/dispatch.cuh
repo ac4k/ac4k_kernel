@@ -15,3 +15,25 @@ __forceinline__ void DISPATCH_AT_TENSOR_TYPES(at::ScalarType type,
                            : false) ||
    ...);
 }
+
+template <int First, int... Rest>
+__forceinline__ bool _TRY_DISPATCH_HEAD_DIM_SIZES(int hdim, auto &&func) {
+  if (hdim <= First) {
+    func.template operator()<First>();
+    return true;
+  }
+
+  if constexpr (sizeof...(Rest) > 0) {
+    return _TRY_DISPATCH_HEAD_DIM_SIZES<Rest...>(
+        hdim, std::forward<decltype(func)>(func));
+  }
+
+  return false;
+}
+
+template <int... SupportedHeadDimSize>
+__forceinline__ void DISPATCH_HEAD_DIM_SIZES(int hdim, auto &&func) {
+  if (!_TRY_DISPATCH_HEAD_DIM_SIZES<SupportedHeadDimSize...>(hdim, func)) {
+    throw std::invalid_argument("Unsupported hdim: " + std::to_string(hdim));
+  }
+}

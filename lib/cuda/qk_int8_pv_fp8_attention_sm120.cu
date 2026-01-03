@@ -65,7 +65,7 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
   static constexpr int TILE_DOT0_WARP_N = TILE_DOT0_BLOCK_N;
   static constexpr int TILE_DOT0_WARP_K = TILE_DOT0_BLOCK_K;
   static constexpr int TILE_DOT1_WARP_M = TILE_DOT0_WARP_M;
-  static constexpr int TILE_DOT1_WARP_N = 128;
+  static constexpr int TILE_DOT1_WARP_N = TILE_DOT1_BLOCK_N;
   static constexpr int TILE_DOT1_WARP_K = TILE_DOT1_BLOCK_K;
 
   static constexpr int CONSUMER_WARP_NUM = TILE_DOT0_BLOCK_M /
@@ -359,9 +359,9 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
 template <typename Policy>
 __launch_bounds__(Policy::THREAD_NUM, 1) __global__
     void qk_int8_pv_fp8_mha_fwd_sm120_kernel(
-        BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
-        int64_t o_d_stride, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
-        int64_t Dqk, int64_t Dv, float sm_scale,
+        BF16 *__restrict__ O, int64_t o_b_stride, int64_t o_h_stride,
+        int64_t o_n_stride, int64_t o_d_stride, int64_t B, int64_t H,
+        int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv, float sm_scale,
         const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
@@ -1060,79 +1060,81 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
   TORCH_CHECK(o.size(2) == Nq, "O must have the same sequence length as Q");
   TORCH_CHECK(o.size(3) == Dv, "O must have the same dim as V");
 
-  /// Policy
-  using policy = Policy<128, 128>;
+  DISPATCH_HEAD_DIM_SIZES<64,
+                          128>(static_cast<int>(Dqk), [&]<int HEAD_DIM_QK>() {
+    DISPATCH_HEAD_DIM_SIZES<64,
+                            128>(static_cast<int>(Dv), [&]<int HEAD_DIM_V>() {
+      /// Policy
+      using policy = Policy<HEAD_DIM_QK, HEAD_DIM_V>;
 
-  /// TMA descriptor
-  CUtensorMap q_tensor_map =
-      create_4d_tensor_map<1, 1, policy::TILE_DOT0_BLOCK_M,
-                           policy::TILE_DOT0_BLOCK_K,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           uint8_t, policy::SWIZZLE_Q>(
+      /// TMA descriptor
+      CUtensorMap q_tensor_map = create_4d_tensor_map<
+          1, 1, policy::TILE_DOT0_BLOCK_M, policy::TILE_DOT0_BLOCK_K,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
+          policy::SWIZZLE_Q>(
           reinterpret_cast<const uint8_t *>(q.data_ptr()),
           static_cast<uint64_t>(q.size(0)), static_cast<uint64_t>(q.size(1)),
           static_cast<uint64_t>(q.size(2)), static_cast<uint64_t>(q.size(3)));
-  CUtensorMap k_tensor_map =
-      create_4d_tensor_map<1, 1, policy::TILE_DOT0_BLOCK_N,
-                           policy::TILE_DOT0_BLOCK_K,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           uint8_t, policy::SWIZZLE_K>(
+      CUtensorMap k_tensor_map = create_4d_tensor_map<
+          1, 1, policy::TILE_DOT0_BLOCK_N, policy::TILE_DOT0_BLOCK_K,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
+          policy::SWIZZLE_K>(
           reinterpret_cast<const uint8_t *>(k.data_ptr()),
           static_cast<uint64_t>(k.size(0)), static_cast<uint64_t>(k.size(1)),
           static_cast<uint64_t>(k.size(2)), static_cast<uint64_t>(k.size(3)));
-  CUtensorMap v_tensor_map =
-      create_4d_tensor_map<1, 1, policy::TILE_DOT1_BLOCK_N,
-                           policy::TILE_DOT1_BLOCK_K,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                           F8E4M3, policy::SWIZZLE_V>(
+      CUtensorMap v_tensor_map = create_4d_tensor_map<
+          1, 1, policy::TILE_DOT1_BLOCK_N, policy::TILE_DOT1_BLOCK_K,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, F8E4M3,
+          policy::SWIZZLE_V>(
           reinterpret_cast<const F8E4M3 *>(v.data_ptr()),
           static_cast<uint64_t>(v.size(0)), static_cast<uint64_t>(v.size(1)),
           static_cast<uint64_t>(v.size(2)), static_cast<uint64_t>(v.size(3)));
 
-  CUtensorMap q_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT0_BLOCK_M,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                           uint32_t>(
+      CUtensorMap q_sf_tensor_map = create_4d_tensor_map<
+          1, 1, 1, policy::TILE_DOT0_BLOCK_M,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
           reinterpret_cast<const uint32_t *>(q_sf.data_ptr()), 1UL,
           static_cast<uint64_t>(q_sf.size(0)),
           static_cast<uint64_t>(q_sf.size(1)),
           static_cast<uint64_t>(q_sf.size(2)));
-  CUtensorMap k_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT0_BLOCK_N,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                           uint32_t>(
+      CUtensorMap k_sf_tensor_map = create_4d_tensor_map<
+          1, 1, 1, policy::TILE_DOT0_BLOCK_N,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
           reinterpret_cast<const uint32_t *>(k_sf.data_ptr()), 1UL,
           static_cast<uint64_t>(k_sf.size(0)),
           static_cast<uint64_t>(k_sf.size(1)),
           static_cast<uint64_t>(k_sf.size(2)));
-  CUtensorMap v_sf_tensor_map =
-      create_4d_tensor_map<1, 1, 1, policy::TILE_DOT1_BLOCK_N,
-                           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
-                           uint32_t>(
+      CUtensorMap v_sf_tensor_map = create_4d_tensor_map<
+          1, 1, 1, policy::TILE_DOT1_BLOCK_N,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
           reinterpret_cast<const uint32_t *>(v_sf.data_ptr()), 1UL,
           static_cast<uint64_t>(v_sf.size(0)),
           static_cast<uint64_t>(v_sf.size(1)),
           static_cast<uint64_t>(v_sf.size(2)));
 
-  /// Set dynamic shared memory size
-  auto *kernel = qk_int8_pv_fp8_mha_fwd_sm120_kernel<policy>;
-  CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, policy::SMEM_SIZE));
+      /// Set dynamic shared memory size
+      auto *kernel = qk_int8_pv_fp8_mha_fwd_sm120_kernel<policy>;
+      CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          policy::SMEM_SIZE));
 
-  /// Get CUDA stream
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
+      /// Get CUDA stream
+      auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  /// Launch kernel
-  dim3 grid(ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H, B);
-  dim3 block(policy::THREAD_NUM);
-  kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
-      reinterpret_cast<BF16 *>(o.data_ptr()),
-      /* o b stride */ o.stride(0),
-      /* o h stride */ o.stride(1),
-      /* o n stride */ o.stride(2),
-      /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
-      q_tensor_map, k_tensor_map, v_tensor_map, q_sf_tensor_map,
-      k_sf_tensor_map, v_sf_tensor_map);
+      /// Launch kernel
+      dim3 grid(ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H,
+                B);
+      dim3 block(policy::THREAD_NUM);
+      kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
+          reinterpret_cast<BF16 *>(o.data_ptr()),
+          /* o b stride */ o.stride(0),
+          /* o h stride */ o.stride(1),
+          /* o n stride */ o.stride(2),
+          /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
+          q_tensor_map, k_tensor_map, v_tensor_map, q_sf_tensor_map,
+          k_sf_tensor_map, v_sf_tensor_map);
+    });
+  });
 }
 
 } // namespace ac4k

@@ -361,7 +361,7 @@ def quantize(input,
             xx mean the other dimension in the input tensor.
         sf: The scaling factors.
             If quantize to nvfp4:
-                sf shape is: [xx, xx, ceil_div(reduce_dim, 64), align_up(cross_dim, 16)] x fp8e4m3
+                sf shape is: [xx, xx, ceil_div(reduce_dim, 64), align_up(cross_dim, 16), 4] x fp8e4m3
             If quantize to fp8e4m3:
                 sf shape is: [xx, xx, align_up(cross_dim, 16)] x fp32
             If quantize to int8:

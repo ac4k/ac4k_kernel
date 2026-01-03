@@ -51,10 +51,10 @@ def dot_scale(a,
     nvfp4 dot scale
 
     Arguments:
-        a: dot lhs operand, must be nvfp4 dtype and pack to uint8 dtype.
+        a: dot lhs operand, must be nvfp4 dtype and pack to uint8 dtype. Must be row major.
         a_scale: dot lhs scale factor, must be fp8e4m3 dtype.
         a_global_scale: dot lhs global scale factor, must be fp32 dtype.
-        b: dot rhs operand, must be nvfp4 dtype and pack to uint8 dtype.
+        b: dot rhs operand, must be nvfp4 dtype and pack to uint8 dtype. Must be col major.
         b_scale: dot rhs scale factor, must be fp8e4m3 dtype.
         b_global_scale: dot rhs global scale factor, must be fp32 dtype.
         bias: dot bias, must be same type with output.

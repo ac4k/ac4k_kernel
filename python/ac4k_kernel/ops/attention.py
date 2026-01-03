@@ -132,6 +132,8 @@ def attention(q, k, v, layout="BNHD", precision="int8+fp8e4m3", out=None):
         precision: nvfp4 or int8+fp8e4m3, default int8+fp8e4m3. If set to nvfp4, q, k, v will be quantized to nvfp4 format, otherwise, q & k will be quantized to int8, v will be quantized to fp8e4m3 format.
         out: output tensor, if None, will create a new tensor. Only support bf16 dtype now.
 
+        q, k, v headdim must be LE 128.
+
     Return:
         out: output tensor, only support bf16 dtype now.
     """
