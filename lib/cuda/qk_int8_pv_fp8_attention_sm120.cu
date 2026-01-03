@@ -359,9 +359,9 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
 template <typename Policy>
 __launch_bounds__(Policy::THREAD_NUM, 1) __global__
     void qk_int8_pv_fp8_mha_fwd_sm120_kernel(
-        BF16 *O, int64_t o_b_stride, int64_t o_h_stride, int64_t o_n_stride,
-        int64_t o_d_stride, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
-        int64_t Dqk, int64_t Dv, float sm_scale,
+        BF16 *__restrict__ O, int64_t o_b_stride, int64_t o_h_stride,
+        int64_t o_n_stride, int64_t o_d_stride, int64_t B, int64_t H,
+        int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv, float sm_scale,
         const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
