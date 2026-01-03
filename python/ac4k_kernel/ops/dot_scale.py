@@ -14,6 +14,31 @@ def _load_cuda_nvfp4_dot_scale():
         ) from e
 
 
+class Ac4kDotScaleOp(torch.nn.Module):
+
+    def __init__(self):
+        super(Ac4kDotScaleOp, self).__init__()
+
+    def forward(self,
+                a,
+                a_scale,
+                a_global_scale,
+                b,
+                b_scale,
+                b_global_scale,
+                bias,
+                out=None):
+        kernel = _load_cuda_nvfp4_dot_scale()
+
+        if out is None:
+            m, n = a.shape[0], b.shape[0]
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+        kernel(out, a, a_scale, a_global_scale, b, b_scale, b_global_scale,
+               bias)
+
+        return out
+
+
 def dot_scale(a,
               a_scale,
               a_global_scale,
@@ -22,11 +47,28 @@ def dot_scale(a,
               b_global_scale,
               bias=None,
               out=None):
-    kernel = _load_cuda_nvfp4_dot_scale()
+    """
+    nvfp4 dot scale
 
-    if out is None:
-        m, n = a.shape[0], b.shape[0]
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-    kernel(out, a, a_scale, a_global_scale, b, b_scale, b_global_scale, bias)
+    Arguments:
+        a: dot lhs operand, must be nvfp4 dtype and pack to uint8 dtype.
+        a_scale: dot lhs scale factor, must be fp8e4m3 dtype.
+        a_global_scale: dot lhs global scale factor, must be fp32 dtype.
+        b: dot rhs operand, must be nvfp4 dtype and pack to uint8 dtype.
+        b_scale: dot rhs scale factor, must be fp8e4m3 dtype.
+        b_global_scale: dot rhs global scale factor, must be fp32 dtype.
+        bias: dot bias, must be same type with output.
+        out: dot output. If None, a new tensor is created, which is bf16 dtype.
 
-    return out
+    Return:
+        out: dot output. If out is None, a new tensor is created, which is bf16 dtype.
+    """
+    op = Ac4kDotScaleOp()
+    return op(a,
+              a_scale,
+              a_global_scale,
+              b,
+              b_scale,
+              b_global_scale,
+              bias,
+              out=out)
