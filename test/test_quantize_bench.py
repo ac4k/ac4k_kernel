@@ -169,6 +169,7 @@ def qunatize_fp8(shape, cross_dim, reduce_dim, swizzle=False):
     output, sf = quantize(input,
                           cross_dim,
                           reduce_dim,
+                          max_scale=2.25,
                           swizzle=swizzle,
                           precision="fp8e4m3")
 
@@ -222,7 +223,7 @@ def qunatize_fp8(shape, cross_dim, reduce_dim, swizzle=False):
 if __name__ == "__main__":
     torch.manual_seed(9567)
     random.seed(9527)
-    test_fp8_quantize_bench((1024, 1024), -2, -1)
+    qunatize_fp8((1024, 1024), 0, 1)
     qunatize_fp8((1, 75600, 40, 128), 3, 1, swizzle=True)
     qunatize_fp8((1024, 10), 0, 1)
     qunatize_fp8((16, 16), 0, 1, swizzle=True)

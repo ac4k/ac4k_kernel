@@ -17,7 +17,7 @@ def _load_cuda_nvfp4_mha():
         ) from e
 
 
-def _nvfp4_attention(q, k, v, layout="BNHD", out=None):
+def _nvfp4_attention(q, k, v, layout, out=None):
     assert layout in ["BNHD", "BHND"], "Unsupported layout: {}".format(layout)
 
     _nvfp4_mha_sm120 = _load_cuda_nvfp4_mha()
@@ -66,7 +66,7 @@ def _load_cuda_qk_int8_pv_fp8_mha():
         ) from e
 
 
-def _qk_int8_pv_fp8_attention(q, k, v, layout="BNHD", out=None):
+def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
     assert layout in ["BNHD", "BHND"], "Unsupported layout: {}".format(layout)
 
     kernel = _load_cuda_qk_int8_pv_fp8_mha()
@@ -82,7 +82,12 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout="BNHD", out=None):
     k = k - k.mean(dim=N_dim, keepdim=True)
     q_int8, q_sf = quantize(q, N_dim, 3, precision="int8")
     k_int8, k_sf = quantize(k, N_dim, 3, precision="int8")
-    v_fp8, v_sf = quantize(v, 3, N_dim, swizzle=True, precision="fp8e4m3")
+    v_fp8, v_sf = quantize(v,
+                           3,
+                           N_dim,
+                           swizzle=True,
+                           max_scale=2.25,
+                           precision="fp8e4m3")
 
     # Alloc output tensor
     if out is None:
@@ -103,12 +108,42 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout="BNHD", out=None):
     return out
 
 
+class Ac4kAttentionOp(torch.nn.Module):
+
+    def __init__(self):
+        super(Ac4kAttentionOp, self).__init__()
+
+    def forward(self, q, k, v, layout, precision, out=None):
+        if precision == "nvfp4":
+            return _nvfp4_attention(q, k, v, layout, out=out)
+        else:
+            return _qk_int8_pv_fp8_attention(q, k, v, layout, out=out)
+
+
 def attention(q, k, v, layout="BNHD", precision="int8+fp8e4m3", out=None):
+    """
+    attention's Docstring
+
+    Arguments:
+        q: q tensor, only support bf16 dtype now.
+        k: k tensor, only support bf16 dtype now.
+        v: v tensor, only support bf16 dtype now.
+        layout: BNHD or BHND, default BNHD. BNHD means (batch, seqlen, nheads, headdim), BHND means (batch, nheads, seqlen, headdim).
+        precision: nvfp4 or int8+fp8e4m3, default int8+fp8e4m3. If set to nvfp4, q, k, v will be quantized to nvfp4 format, otherwise, q & k will be quantized to int8, v will be quantized to fp8e4m3 format.
+        out: output tensor, if None, will create a new tensor. Only support bf16 dtype now.
+
+    Return:
+        out: output tensor, only support bf16 dtype now.
+    """
+
+    assert q.dtype == torch.bfloat16, "q dtype must be bf16"
+    assert k.dtype == torch.bfloat16, "k dtype must be bf16"
+    assert v.dtype == torch.bfloat16, "v dtype must be bf16"
     assert layout in ["BNHD", "BHND"], "Unsupported layout: {}".format(layout)
     assert precision in ["nvfp4", "int8+fp8e4m3"
                          ], "Unsupported precision: {}".format(precision)
+    if out:
+        assert out.dtype == torch.bfloat16, "out dtype must be bf16"
 
-    if precision == "nvfp4":
-        return _nvfp4_attention(q, k, v, layout, out)
-    else:
-        return _qk_int8_pv_fp8_attention(q, k, v, layout, out)
+    op = Ac4kAttentionOp()
+    return op(q, k, v, layout, precision, out=out)
