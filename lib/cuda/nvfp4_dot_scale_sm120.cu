@@ -252,14 +252,15 @@ __device__ static __forceinline__ int2 get_program_id(int M, int N) {
 // C shape:MxN stride:Nx1 matrix, row major
 //===----------------------------------------------------------------------===//
 
-template <CUtensorMapSwizzle Swizzle, at::ScalarType D_AT_TYPE>
+template <at::ScalarType D_AT_TYPE, at::ScalarType BIAS_AT_TYPE,
+          CUtensorMapSwizzle Swizzle>
 __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     void nvfp4_dot_scale_sm120_kernel(
-        typename AtDataTraits<D_AT_TYPE>::Type *D, const NVFP4x2 *A,
-        const E4M3 *A_sf, const float *A_global_scale, const NVFP4x2 *B,
-        const E4M3 *B_sf, const float *B_global_scale,
-        const typename AtDataTraits<D_AT_TYPE>::Type *bias, int M, int N, int K,
-        const __grid_constant__ CUtensorMap a_tensor_map,
+        typename AtDataTraits<D_AT_TYPE>::Type *__restrict__ D,
+        const float *__restrict__ A_global_scale,
+        const float *__restrict__ B_global_scale,
+        const typename AtDataTraits<BIAS_AT_TYPE>::Type *__restrict__ bias,
+        int M, int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
         const __grid_constant__ CUtensorMap b_tensor_map,
         const __grid_constant__ CUtensorMap a_sf_tensor_map,
         const __grid_constant__ CUtensorMap b_sf_tensor_map) {
@@ -643,140 +644,124 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
                            torch::Tensor const &B, torch::Tensor const &B_sf,
                            torch::Tensor const &B_global_scale,
                            c10::optional<torch::Tensor> const &bias) {
-  /// Check type
-  CHECK_INPUT(A_sf, at::ScalarType::Float8_e4m3fn, "scale_a");
-  CHECK_INPUT(B_sf, at::ScalarType::Float8_e4m3fn, "scale_b");
-  CHECK_INPUT(A_global_scale, at::ScalarType::Float, "global_scale_a");
-  CHECK_INPUT(B_global_scale, at::ScalarType::Float, "global_scale_b");
-
-  CHECK_INPUT(A, at::ScalarType::Byte, "a");
-  CHECK_INPUT(B, at::ScalarType::Byte, "b");
-
-  /// Check rank
-  TORCH_CHECK(A.dim() == 2, "a must be a matrix");
-  TORCH_CHECK(B.dim() == 2, "b must be a matrix");
-  TORCH_CHECK(D.dim() == 2, "d must be a matrix");
-
-  /// Get shape
+  /// Check D
+  TORCH_CHECK(D.dim() == 2, "d must be a 2d matrix");
   auto const M = D.sizes()[0];
   auto const N = D.sizes()[1];
-  auto const K = A.sizes()[1] * 2;
-
-  /// Check shape, stride
-  /// Check A operand: shape:MxK stride:Kx1
-  TORCH_CHECK(A.sizes()[0] == M, "A shape[0] must be ", M);
-  TORCH_CHECK(A.sizes()[1] == K / 2, "A shape[1] must be ", K / 2);
-  TORCH_CHECK(A.stride(0) == K / 2, "A stride[0] must be ", K / 2);
-  TORCH_CHECK(A.stride(1) == 1, "A stride[1] must be 1");
-
-  /// Check B operand: shape:NxK stride:Kx1
-  TORCH_CHECK(B.sizes()[0] == N, "B shape[0] must be ", N);
-  TORCH_CHECK(B.sizes()[1] == K / 2, "B shape[1] must be ", K / 2);
-  TORCH_CHECK(B.stride(0) == K / 2, "B stride[0] must be ", K / 2);
-  TORCH_CHECK(B.stride(1) == 1, "B stride[1] must be ", 1);
-
-  /// Check scale_a operand
-  TORCH_CHECK(A_sf.dim() == 3, "scale_a must be a matrix");
-  TORCH_CHECK(A_sf.sizes()[0] == ceil_div(K, 64),
-              "meet invalid scale_a shape[0]");
-  TORCH_CHECK(A_sf.sizes()[1] == align_up(M, 16),
-              "meet invalid scale_a shape[1]");
-  TORCH_CHECK(A_sf.sizes()[2] == 4, "meet invalid scale_a shape[2]");
-
-  /// Check scale_b operand
-  TORCH_CHECK(B_sf.dim() == 3, "scale_a must be b matrix");
-  TORCH_CHECK(B_sf.sizes()[0] == ceil_div(K, 64),
-              "meet invalid scale_b shape[0]");
-  TORCH_CHECK(B_sf.sizes()[1] == align_up(N, 16),
-              "meet invalid scale_b shape[1]");
-  TORCH_CHECK(B_sf.sizes()[2] == 4, "meet invalid scale_b shape[2]");
-
-  /// Check global_scale_a operand
-  TORCH_CHECK(A_global_scale.dim() == 0, "A_global_scale must be a scalar");
-
-  /// Check global_scale_b operand
-  TORCH_CHECK(B_global_scale.dim() == 0, "B_global_scale must be a scalar");
-
-  /// Check bias
-  if (bias.has_value()) {
-    TORCH_CHECK(bias.value().scalar_type() == D.scalar_type(),
-                "bias must be same type as d");
-    TORCH_CHECK(bias.value().dim() == 2, "bias must be a matrix");
-    TORCH_CHECK(bias.value().sizes()[0] == 1, "bias shape[0] must be 1");
-    TORCH_CHECK(bias.value().sizes()[1] == N, "bias shape[1] must be ", N);
-    TORCH_CHECK(bias.value().stride(0) == N, "bias stride[0] must be ", N);
-    TORCH_CHECK(bias.value().stride(1) == 1, "bias stride[1] must be 1");
-  }
-
-  /// Check D
   TORCH_CHECK(D.scalar_type() == at::ScalarType::BFloat16 ||
                   D.scalar_type() == at::ScalarType::Half ||
                   D.scalar_type() == at::ScalarType::Float,
               "d must be bfloat16, half or float");
-  CHECK_CONTIGUOUS(D, "d");
+  CHECK_CONTIGUOUS(D, "d must be contiguous");
 
+  /// Check A
+  TORCH_CHECK(A.dim() == 2, "a must be a 2d matrix");
+  CHECK_INPUT(A, at::ScalarType::Byte, "a");
+  TORCH_CHECK(A.size(0) == M, "A size(0) must be ", M, " but see ", A.size(0));
+  auto const K = A.size(1) * ELES_PER_NVFP4x2;
+  TORCH_CHECK(K % 16 == 0, "A size(1)*2 must be multiple of 16 but see ", K);
+  TORCH_CHECK(A_sf.dim() == 3, "scale_a must be a 3d matrix");
+  CHECK_INPUT(A_sf, at::ScalarType::Float8_e4m3fn, "scale_a");
+  TORCH_CHECK(A_sf.size(0) == ceil_div(K, 64));
+  TORCH_CHECK(A_sf.size(1) == align_up(M, 16));
+  TORCH_CHECK(A_sf.size(2) == 4);
+  CHECK_INPUT(A_global_scale, at::ScalarType::Float, "global_scale_a");
+  TORCH_CHECK(A_global_scale.dim() == 0, "A_global_scale must be a scalar");
+
+  /// Check B
+  TORCH_CHECK(B.dim() == 2, "b must be a 2d matrix");
+  CHECK_INPUT(B, at::ScalarType::Byte, "b");
+  TORCH_CHECK(B.size(1) == A.size(1), "B size(1) must equal A size(1)");
+  TORCH_CHECK(B_sf.dim() == 3, "scale_b must be a 3d matrix");
+  CHECK_INPUT(B_sf, at::ScalarType::Float8_e4m3fn, "scale_b");
+  TORCH_CHECK(B_sf.size(0) == ceil_div(K, 64));
+  TORCH_CHECK(B_sf.size(1) == align_up(N, 16));
+  TORCH_CHECK(B_sf.size(2) == 4);
+  CHECK_INPUT(B_global_scale, at::ScalarType::Float, "global_scale_b");
+  TORCH_CHECK(B_global_scale.dim() == 0, "B_global_scale must be a scalar");
+
+  /// Check bias
+  if (bias.has_value()) {
+    TORCH_CHECK(bias.value().scalar_type() == at::ScalarType::BFloat16 ||
+                    bias.value().scalar_type() == at::ScalarType::Half ||
+                    bias.value().scalar_type() == at::ScalarType::Float,
+                "bias must be bfloat16, half or float");
+    CHECK_CONTIGUOUS(bias.value(), "bias must be contiguous");
+    TORCH_CHECK(bias.value().dim() == 2, "bias must be a 2d matrix");
+    TORCH_CHECK(bias.value().size(0) == 1, "bias shape[0] must be 1");
+    TORCH_CHECK(bias.value().size(1) == N, "bias shape[1] must be ", N);
+  }
+
+  /// Dispatch output
   DISPATCH_AT_TENSOR_TYPES<
       at::ScalarType::BFloat16, at::ScalarType::Half,
       at::ScalarType::Float>(D.scalar_type(), [&]<at::ScalarType D_AT_TYPE>() {
-    using T = typename AtDataTraits<D_AT_TYPE>::Type;
+    /// Dispatch bias
+    auto bias_type = bias.has_value() ? bias.value().scalar_type() : D_AT_TYPE;
+    DISPATCH_AT_TENSOR_TYPES<
+        at::ScalarType::BFloat16, at::ScalarType::Half,
+        at::ScalarType::Float>(bias_type, [&]<at::ScalarType BIAS_AT_TYPE>() {
+      using D_T = typename AtDataTraits<D_AT_TYPE>::Type;
+      using BIAS_T = typename AtDataTraits<BIAS_AT_TYPE>::Type;
 
-    /// Grid & Block dim3
-    dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
-    dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+      /// Grid & Block dim3
+      dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
+      dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
 
-    /// Get CUDA stream
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+      /// Get CUDA stream
+      auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    /// Set dynamic shared memory size
-    const auto SWIZZLE = CU_TENSOR_MAP_SWIZZLE_64B;
-    auto *kernel = nvfp4_dot_scale_sm120_kernel<SWIZZLE, D_AT_TYPE>;
-    size_t smem_size =
-        TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
-        (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) *
-            STAGE;
-    CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      /// Set dynamic shared memory size
+      const auto SWIZZLE =
+          get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+      auto *kernel =
+          nvfp4_dot_scale_sm120_kernel<D_AT_TYPE, BIAS_AT_TYPE, SWIZZLE>;
+      size_t smem_size =
+          TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
+          (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) *
+              STAGE;
+      CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    /// TMA descriptor
-    CUtensorMap a_tensor_map = create_4d_tensor_map<
-        1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
-        reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-        static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
-    CUtensorMap b_tensor_map = create_4d_tensor_map<
-        1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
-        reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-        static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
-    CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
-        1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-        reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
-        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-        static_cast<uint64_t>(A_sf.size(0)),
-        static_cast<uint64_t>(A_sf.size(1)));
-    CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
-        1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-        reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
-        static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-        static_cast<uint64_t>(B_sf.size(0)),
-        static_cast<uint64_t>(B_sf.size(1)));
+      /// TMA descriptor
+      CUtensorMap a_tensor_map = create_4d_tensor_map<
+          1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+          reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
+      CUtensorMap b_tensor_map = create_4d_tensor_map<
+          1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
+          reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
+      CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
+          1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+          reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(A_sf.size(0)),
+          static_cast<uint64_t>(A_sf.size(1)));
+      CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
+          1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+          reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
+          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+          static_cast<uint64_t>(B_sf.size(0)),
+          static_cast<uint64_t>(B_sf.size(1)));
 
-    /// Launch kernel
-    kernel<<<grid, block, smem_size, stream>>>(
-        reinterpret_cast<T *>(D.data_ptr()),
-        reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-        reinterpret_cast<const E4M3 *>(A_sf.data_ptr()),
-        reinterpret_cast<const float *>(A_global_scale.data_ptr()),
-        reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-        reinterpret_cast<const E4M3 *>(B_sf.data_ptr()),
-        reinterpret_cast<const float *>(B_global_scale.data_ptr()),
-        bias.has_value() ? reinterpret_cast<const T *>(bias.value().data_ptr())
-                         : nullptr,
-        M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map, b_sf_tensor_map);
+      /// Launch kernel
+      kernel<<<grid, block, smem_size, stream>>>(
+          reinterpret_cast<D_T *>(D.data_ptr()),
+          reinterpret_cast<const float *>(A_global_scale.data_ptr()),
+          reinterpret_cast<const float *>(B_global_scale.data_ptr()),
+          bias.has_value()
+              ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
+              : nullptr,
+          M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map,
+          b_sf_tensor_map);
+    });
   });
 }
 

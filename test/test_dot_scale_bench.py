@@ -108,16 +108,18 @@ def get_torch_results(a_fp4,
 
 
 @torch.inference_mode()
-def test_dot_scale(dtype: torch.dtype,
-                   shape: tuple[int, int, int],
-                   o_dtype=None) -> None:
-    print("test dot scale: ", shape)
+def test_dot_scale(dtype, shape, bias_type=None, o_dtype=None) -> None:
+    print("test dot scale shape:{} dtype:{} bias_type:{} o_dtype:{}".format(
+        shape, dtype, bias_type, o_dtype))
 
     m, n, k = shape
     block_size = 16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
     b = torch.randn((n, k), dtype=dtype, device="cuda")
-    bias = None
+    if bias_type is None:
+        bias = None
+    else:
+        bias = torch.randn((1, n), dtype=bias_type, device="cuda")
 
     out = None
     if o_dtype is not None:
@@ -166,3 +168,30 @@ if __name__ == "__main__":
     test_dot_scale(torch.bfloat16, (64, 64, 128))
     test_dot_scale(torch.bfloat16, (12, 23, 55))
     test_dot_scale(torch.bfloat16, (12, 23, 5), o_dtype=torch.float32)
+    test_dot_scale(torch.bfloat16, (1, 2, 50),
+                   o_dtype=torch.float16,
+                   bias_type=torch.bfloat16)
+    test_dot_scale(torch.bfloat16, (1, 2, 50),
+                   o_dtype=torch.float16,
+                   bias_type=torch.float16)
+    test_dot_scale(torch.bfloat16, (2, 3, 51),
+                   o_dtype=torch.float16,
+                   bias_type=torch.float32)
+    test_dot_scale(torch.bfloat16, (3, 2, 50),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.bfloat16)
+    test_dot_scale(torch.bfloat16, (4, 2, 50),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.float16)
+    test_dot_scale(torch.bfloat16, (5, 3, 51),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.float32)
+    test_dot_scale(torch.bfloat16, (1, 21, 50),
+                   o_dtype=torch.float32,
+                   bias_type=torch.bfloat16)
+    test_dot_scale(torch.bfloat16, (1, 22, 50),
+                   o_dtype=torch.float32,
+                   bias_type=torch.float16)
+    test_dot_scale(torch.bfloat16, (2, 33, 51),
+                   o_dtype=torch.float32,
+                   bias_type=torch.float32)

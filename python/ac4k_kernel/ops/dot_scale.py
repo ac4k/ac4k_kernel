@@ -57,7 +57,7 @@ def dot_scale(a,
         b: dot rhs operand, must be nvfp4 dtype and pack to uint8 dtype. Must be col major.
         b_scale: dot rhs scale factor, must be fp8e4m3 dtype.
         b_global_scale: dot rhs global scale factor, must be fp32 dtype.
-        bias: dot bias, must be same type with output.
+        bias: dot bias, must be bf16, fp16 or fp32. And it's shape must be [1, N].
         out: dot output. If None, a new tensor is created, which is bf16 dtype.
 
     Return:
