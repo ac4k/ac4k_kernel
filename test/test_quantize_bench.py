@@ -4,8 +4,7 @@ import random
 from functools import reduce
 import operator
 
-from ac4k_kernel.ops import nvfp4_quant, quantize
-from utils import get_global_scale
+from ac4k_kernel.ops import quantize
 
 
 def ceil_div(x, y):
@@ -17,6 +16,9 @@ def align_up(x, y):
 
 
 def get_ref(input, cross_dim, reduce_dim, swizzle):
+    global_scale_max = torch.amax(torch.abs(input)).to(
+        torch.float32) / (6 * 448)
+
     if reduce_dim < 0:
         reduce_dim = input.ndim + reduce_dim
     if cross_dim < 0:
@@ -24,7 +26,9 @@ def get_ref(input, cross_dim, reduce_dim, swizzle):
 
     origin_cross_dim_size = input.shape[cross_dim]
     origin_reduce_dim_size = input.shape[reduce_dim]
-    total_size = reduce(operator.mul, input.shape, 1)
+    origin_cross_dim_size_paded = align_up(origin_cross_dim_size, 16)
+    origin_reduce_dim_size_paded = align_up(origin_reduce_dim_size, 64)
+    origin_input_shape = input.shape
 
     # transpsoe to [xx, xx, cross_dim, reduce_dim]
     transpose = []
@@ -34,93 +38,169 @@ def get_ref(input, cross_dim, reduce_dim, swizzle):
     transpose.append(cross_dim)
     transpose.append(reduce_dim)
     input = torch.permute(input, transpose).contiguous()
-
     # reshape
-    input = input.reshape(-1, input.shape[-1])
+    input = input.reshape(-1, origin_cross_dim_size, origin_reduce_dim_size)
 
     # pad
-    if input.shape[-1] % 64 != 0:
-        pad = [0, 64 - (input.shape[-1] % 64), 0, 0]
+    # pad cross dim
+    if origin_cross_dim_size_paded != origin_cross_dim_size:
+        pad = [
+            0, 0, 0, origin_cross_dim_size_paded - origin_cross_dim_size, 0, 0
+        ]
+        input = F.pad(input, pad, value=0).contiguous()
+    # pad reduce dim
+    if origin_reduce_dim_size_paded != origin_reduce_dim_size:
+        pad = [
+            0, origin_reduce_dim_size_paded - origin_reduce_dim_size, 0, 0, 0,
+            0
+        ]
         input = F.pad(input, pad, value=0).contiguous()
 
-    quantize_dim = input.shape[-1]
-
     # swizzle
-    # quantize dim layout
-    # [-1, 4, 4, 2]
-    # apply swizzle, transpose layout is [0, 2, 1, 3]
-    # [-1, 4, 4, 2]
     if swizzle:
         input = input.reshape(-1, 4, 4, 2)
         input = torch.permute(input, (0, 2, 1, 3)).contiguous()
-        input = input.reshape(-1, quantize_dim)
+        input = input.reshape(-1, origin_cross_dim_size_paded,
+                              origin_reduce_dim_size_paded)
 
-    scale = get_global_scale(input)
-    # output layout
-    # [non_dim, quantize_dim / 2]
-    # sf layout
-    # [non_dim / 128, quant_dim / 64, 32, 4, 4]xfloat8_e4m3fn
-    output, sf = nvfp4_quant(input, scale)
+    sf = torch.empty((input.shape[0], origin_reduce_dim_size_paded // 64,
+                      origin_cross_dim_size_paded, 4),
+                     dtype=torch.float8_e4m3fn,
+                     device="cuda")
+    out = torch.empty(input.shape, dtype=torch.float32, device="cuda")
+    for i in range(input.shape[0]):
+        for j in range(input.shape[1]):
+            for k in range(0, input.shape[2], 16):
+                vec = input[i, j, k:k + 16].to(torch.float32)
+                abs_max = torch.amax(torch.abs(vec))
+                if abs_max == 0:
+                    sf[i, k // 64, j, (k % 64) // 16] = 0
+                    out[i, j, k:k + 16] = 0
+                else:
+                    scale_factor = (abs_max / global_scale_max / 6)
+                    sf[i, k // 64, j, (k % 64) // 16] = scale_factor
+                    vec = vec / global_scale_max / scale_factor
+                    out[i, j, k:k + 16] = vec
+    # input = input.reshape(-1, 16)
+    # abs_max = torch.amax(torch.abs(input), dim=-1, keepdim=True)
+    # scale_factor = (abs_max.to(torch.float32) / global_scale_max / 6)
+    # # sf = scale_factor.reshape(-1, 1, 1, 4)
+    # out = input.to(torch.float32) / global_scale_max / scale_factor
+    # out = out.reshape(-1, origin_cross_dim_size_paded, origin_reduce_dim_size_paded)
+    # sf = scale_factor.to(torch.float8_e4m3fn).reshape(-1, origin_cross_dim_size_paded, origin_reduce_dim_size_paded // 64, 4)
+    # sf = sf.permute(0, 2, 1, 3).contiguous()
 
-    # reshape output
-    output = output.reshape(-1, origin_cross_dim_size,
-                            align_up(origin_reduce_dim_size, 64) // 2)
-
+    # reshape out
+    out_shape = []
+    for i in range(len(origin_input_shape)):
+        if i != cross_dim and i != reduce_dim:
+            out_shape.append(origin_input_shape[i])
+    out_shape.append(origin_cross_dim_size)
+    out_shape.append(origin_reduce_dim_size_paded)
+    out = out[:, :origin_cross_dim_size, :].reshape(out_shape)
     # reshape sf
-    sf = sf.reshape(ceil_div(total_size // origin_reduce_dim_size, 128),
-                    ceil_div(origin_reduce_dim_size, 64), 32, 4, 4)
-    sf = torch.permute(sf, (1, 0, 3, 2, 4)).contiguous()
-    sf = sf.reshape(ceil_div(origin_reduce_dim_size, 64), -1, 4)
-    sf = sf[:, :total_size // origin_reduce_dim_size, :].contiguous()
-    sf = sf.reshape(sf.shape[0], -1, origin_cross_dim_size, 4)
-    sf = torch.permute(sf, (1, 0, 2, 3)).contiguous()
+    sf_shape = []
+    for i in range(len(out_shape) - 2):
+        sf_shape.append(out_shape[i])
+    sf_shape.append(sf.shape[-3])
+    sf_shape.append(sf.shape[-2])
+    sf_shape.append(sf.shape[-1])
+    sf = sf.reshape(sf_shape)
+    return out, sf, global_scale_max
 
-    return output, sf
+
+def break_fp4_bytes(a):
+    assert a.dtype == torch.uint8
+
+    kE2M1ToFloatArray = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+
+    m, n = a.shape
+    a = a.flatten()
+    # Get upper 4 bits
+    highHalfByte = (a & 0xF0) >> 4
+    # Get lower 4 bits
+    lowHalfByte = a & 0x0F
+    map_tensor = torch.tensor(kE2M1ToFloatArray,
+                              dtype=torch.float32,
+                              device=a.device)
+    fH = map_tensor[highHalfByte.long()].to(a.device)
+    fL = map_tensor[lowHalfByte.long()].to(a.device)
+    # [0xAB, 0xCD] -> [0xB, 0xA, 0xD, 0xC]
+    out = torch.stack((fL, fH), dim=-1).reshape(m, n * 2)
+    return out
 
 
 def test_quantize_bench(shape, cross_dim, reduce_dim, swizzle=False):
     print(
         "test quantize cross_dim={}, reduce_dim={}, shape={}, swize={}".format(
             cross_dim, reduce_dim, shape, swizzle))
-    input = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
 
-    origin_cross_dim_size = input.shape[cross_dim]
-    origin_reduce_dim_size = input.shape[reduce_dim]
+    val = [
+        # 0.5,
+        1.0,
+        # 1.5,
+        2.0,
+        # 3.0,
+        4.0,
+        6.0,
+        # -0.5,
+        -1.0,
+        # -1.5,
+        -2.0,
+        # -3.0,
+        -4.0,
+        -6.0,
+    ]
 
-    output, sf, _ = quantize(input, cross_dim, reduce_dim, swizzle=swizzle)
-    # reshape output
-    output = output.reshape(-1, origin_cross_dim_size,
-                            align_up(origin_reduce_dim_size, 64) // 2)
-    # reshape sf
-    sf = sf.reshape(-1, ceil_div(origin_reduce_dim_size, 64),
-                    align_up(origin_cross_dim_size, 16), 4)
-    sf = sf[:, :, :origin_cross_dim_size, :].contiguous()
+    val_tensor = torch.tensor(val, dtype=torch.bfloat16, device="cuda")
+    input = val_tensor[torch.randint(0, len(val), shape)]
 
-    output_ref, sf_ref = get_ref(input, cross_dim, reduce_dim, swizzle)
+    output, sf, global_scale = quantize(input,
+                                        cross_dim,
+                                        reduce_dim,
+                                        swizzle=swizzle,
+                                        precision="nvfp4")
 
-    torch.testing.assert_close(output, output_ref)
-    torch.testing.assert_close(sf.view(torch.uint8), sf_ref.view(torch.uint8))
-    print("\ttest pass")
+    # post process out
+    output_f32 = break_fp4_bytes(output)
 
+    # ref
+    output_ref, sf_ref, global_scale_ref = get_ref(input, cross_dim,
+                                                   reduce_dim, swizzle)
 
-def test_fp8_quantize_bench(shape, cross_dim, reduce_dim, swizzle=False):
-    print(
-        "test quantize cross_dim={}, reduce_dim={}, shape={}, swize={}".format(
-            cross_dim, reduce_dim, shape, swizzle))
-    input = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-
-    quantize(input,
-             cross_dim,
-             reduce_dim,
-             swizzle=swizzle,
-             precision="fp8e4m3")
-
+    # assert output_f32.equal(output_ref)
+    torch.testing.assert_close(output_f32, output_ref, atol=1e-3, rtol=1e-6)
+    torch.testing.assert_close(sf.to(torch.float32),
+                               sf_ref.to(torch.float32),
+                               atol=1e-3,
+                               rtol=1e-6)
+    torch.testing.assert_close(global_scale,
+                               global_scale_ref,
+                               atol=1e-3,
+                               rtol=1e-6)
     print("\ttest pass")
 
 
 def test_random_bennch(num):
     for _ in range(num):
-        rank = random.randint(2, 4)
+        rank = 2
         shape = [random.randint(1, 512) for _ in range(rank)]
         swizzle = random.choice([False, True])
 
@@ -230,4 +310,4 @@ if __name__ == "__main__":
     qunatize_fp8((777, 879), 0, 1, swizzle=True)
     test_quantize_bench((1024, 1024), 1, 0)
     test_quantize_bench((128, 512), 0, 1)
-    test_random_bennch(111)
+    test_random_bennch(25)

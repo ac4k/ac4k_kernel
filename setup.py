@@ -58,15 +58,16 @@ setup(
             sources=[
                 'lib/pybind_bindings.cc',
                 # CUDA source files
-                'lib/cuda/nvfp4_matmul_sm120.cu',
-                'lib/cuda/_internal_nvfp4_matmul_sm120.cu',
+                # Dot
                 'lib/cuda/nvfp4_dot_scale_sm120.cu',
-                'lib/cuda/nvfp4_quant_sm120.cu',
+                # Attention
                 'lib/cuda/nvfp4_attention_sm120.cu',
                 'lib/cuda/qk_int8_pv_fp8_attention_sm120.cu',
+                # Quantize
                 'lib/cuda/nvfp4_quantize_sm120.cu',
                 'lib/cuda/fp8_quantize_sm120.cu',
                 'lib/cuda/int8_quantize_sm120.cu',
+                # RoPE
                 'lib/cuda/rope_3d_apply.cu'
             ],
             include_dirs=[
