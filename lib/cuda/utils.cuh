@@ -4,6 +4,7 @@
 #include "math.cuh"
 #include "mma.cuh"
 #include "register.cuh"
+#include "tma.cuh"
 #include "traits.cuh"
 
 #include <cstdint>

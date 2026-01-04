@@ -127,16 +127,6 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
   // Swizzle
   //===--------------------------------------------------------------------===//
 
-  template <int DIM_SIZE, int BPE>
-  static __forceinline__ constexpr CUtensorMapSwizzle get_swizzle() {
-    if constexpr (DIM_SIZE * BPE == 128) {
-      return CU_TENSOR_MAP_SWIZZLE_128B;
-    } else if constexpr (DIM_SIZE * BPE == 64) {
-      return CU_TENSOR_MAP_SWIZZLE_64B;
-    } else {
-      return CU_TENSOR_MAP_SWIZZLE_NONE;
-    }
-  }
   static constexpr CUtensorMapSwizzle SWIZZLE_Q =
       get_swizzle<TILE_DOT0_BLOCK_K, sizeof(Q_TYPE)>();
   static constexpr CUtensorMapSwizzle SWIZZLE_K =
