@@ -46,35 +46,9 @@ constexpr int THREAD_NUM_PER_GROUP = GROUP_SIZE / TILE_THREAD_QUANTIZE_DIM;
 constexpr int CROSS_DIM_ALIGN_SIZE = 16;
 constexpr int REDUCE_DIM_ALIGN_SIZE = BLOCK_SIZE * PACK_SF;
 
-__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-  uint32_t val;
-  asm volatile("{\n"
-               ".reg .b8 byte0;\n"
-               ".reg .b8 byte1;\n"
-               ".reg .b8 byte2;\n"
-               ".reg .b8 byte3;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-               "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-               "}"
-               : "=r"(val)
-               : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x),
-                 "f"(array[1].y), "f"(array[2].x), "f"(array[2].y),
-                 "f"(array[3].x), "f"(array[3].y));
-  return val;
-}
-
 template <bool Swizzle>
 __global__ void nvfp4_quantize_sm120_kernel(
-    NVFP4x2 *out, uint32_t *sf, const BF16 *in, const float *rcp_global_scale,
+    NVFP4x2 *out, uint32_t *sf, const BF16 *in, const float *global_scale,
     int64_t in_dim0, int64_t in_dim1, int64_t /* cross-dim-size */ in_dim2,
     int64_t /* reduce-dim-size */ in_dim3, int64_t in_stride0,
     int64_t in_stride1, int64_t in_stride2, int64_t in_stride3) {
@@ -96,7 +70,7 @@ __global__ void nvfp4_quantize_sm120_kernel(
   int64_t out_stride1 = out_stride2 * out_dim2;
   int64_t out_stride0 = out_stride1 * out_dim1;
 
-  float alpha = *rcp_global_scale;
+  float alpha = reciprocal_approximate_ftz(*global_scale);
 
   for (int dim0 = 0; dim0 < out_dim0; ++dim0) {
     int dim1 = blockIdx.z;
@@ -167,7 +141,7 @@ __global__ void nvfp4_quantize_sm120_kernel(
         f32x2[i].y *= out_scale;
       }
 
-      NVFP4x8 e2m1x8 = fp32_vec_to_e2m1(f32x2);
+      NVFP4x8 e2m1x8 = fp32x8_vec_to_e2m1x8(f32x2);
       *reinterpret_cast<NVFP4x8 *>(out + dim0 * out_stride0 +
                                    dim1 * out_stride1 + dim2 * out_stride2 +
                                    dim3 / 2 * out_stride3) = e2m1x8;
@@ -189,9 +163,8 @@ __global__ void nvfp4_quantize_sm120_kernel(
 /// [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x E4M3
 void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                           torch::Tensor const &in,
-                          torch::Tensor const &rcp_global_scale,
-                          uint32_t cross_dim, uint32_t reduce_dim,
-                          bool swizzle) {
+                          torch::Tensor const &global_scale, uint32_t cross_dim,
+                          uint32_t reduce_dim, bool swizzle) {
   static_assert(TILE_BLOCK_NON_QUANTIZE_DIM <= CROSS_DIM_ALIGN_SIZE);
   static_assert(TILE_BLOCK_QUANTIZE_DIM == REDUCE_DIM_ALIGN_SIZE);
   /// Check in
@@ -203,10 +176,10 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
     in_shape.push_back(in.size(i));
     in_stride.push_back(in.stride(i));
   }
-  /// Check rcp_global_scale
-  CHECK_INPUT(rcp_global_scale, at::ScalarType::Float,
-              "rcp_global_scale must be float");
-  TORCH_CHECK(rcp_global_scale.dim() == 0, "rcp_global_scale must be a scalar");
+  /// Check global_scale
+  CHECK_INPUT(global_scale, at::ScalarType::Float,
+              "global_scale must be float");
+  TORCH_CHECK(global_scale.dim() == 0, "global_scale must be a scalar");
 
   /// Check dim
   TORCH_CHECK(cross_dim < static_cast<uint32_t>(in.dim()),
@@ -281,8 +254,8 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
         reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),
-        reinterpret_cast<const float *>(rcp_global_scale.data_ptr()),
-        out_shape[0], out_shape[1], cross_dim_size, reduce_dim_size,
+        reinterpret_cast<const float *>(global_scale.data_ptr()), out_shape[0],
+        out_shape[1], cross_dim_size, reduce_dim_size,
         in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
         in_stride[cross_dim], in_stride[reduce_dim]);
   } else {
@@ -290,8 +263,8 @@ void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
         reinterpret_cast<NVFP4x2 *>(out.data_ptr()),
         reinterpret_cast<uint32_t *>(sf.data_ptr()),
         reinterpret_cast<const BF16 *>(in.data_ptr()),
-        reinterpret_cast<const float *>(rcp_global_scale.data_ptr()),
-        out_shape[0], out_shape[1], cross_dim_size, reduce_dim_size,
+        reinterpret_cast<const float *>(global_scale.data_ptr()), out_shape[0],
+        out_shape[1], cross_dim_size, reduce_dim_size,
         in_stride_wo_cross_reduce[0], in_stride_wo_cross_reduce[1],
         in_stride[cross_dim], in_stride[reduce_dim]);
   }

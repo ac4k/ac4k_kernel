@@ -27,9 +27,8 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
 
 void nvfp4_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                           torch::Tensor const &in,
-                          torch::Tensor const &rcp_global_scale,
-                          uint32_t cross_dim, uint32_t reduce_dim,
-                          bool swizzle);
+                          torch::Tensor const &global_scale, uint32_t cross_dim,
+                          uint32_t reduce_dim, bool swizzle);
 
 void fp8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
                         torch::Tensor const &in, torch::Tensor const &scale_max,

@@ -23,6 +23,16 @@ __forceinline__ __device__ float fast_exp(float x) {
 }
 
 //===----------------------------------------------------------------------===//
+// y = 1 / x
+//===----------------------------------------------------------------------===//
+
+__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
+}
+
+//===----------------------------------------------------------------------===//
 // Convert 4xFP32 to 4xFP8 (represented as one uint32_t)
 //===----------------------------------------------------------------------===//
 
@@ -43,6 +53,35 @@ __device__ __forceinline__ uint32_t fp32x4_to_e4m3x4(float in0, float in1,
 
 __device__ __forceinline__ uint32_t fp32x4_to_e4m3x4(float4 in) {
   return fp32x4_to_e4m3x4(in.x, in.y, in.z, in.w);
+}
+
+//===----------------------------------------------------------------------===//
+// Convert 8xFP32 to 8xE2M1 (represented as one uint32_t)
+//===----------------------------------------------------------------------===//
+
+__forceinline__ __device__ uint32_t fp32x8_vec_to_e2m1x8(float2 (&array)[4]) {
+  uint32_t val;
+  asm volatile("{\n"
+               ".reg .b8 byte0;\n"
+               ".reg .b8 byte1;\n"
+               ".reg .b8 byte2;\n"
+               ".reg .b8 byte3;\n"
+               "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+               "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+               "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+               "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+               "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+               "}"
+               : "=r"(val)
+               : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x),
+                 "f"(array[1].y), "f"(array[2].x), "f"(array[2].y),
+                 "f"(array[3].x), "f"(array[3].y));
+  return val;
+}
+
+__forceinline__ __device__ uint32_t fp32x8_vec_to_e2m1x8(float (&array)[8]) {
+  float2(&float2_array)[4] = reinterpret_cast<float2(&)[4]>(array);
+  return fp32x8_vec_to_e2m1x8(float2_array);
 }
 
 //===----------------------------------------------------------------------===//
