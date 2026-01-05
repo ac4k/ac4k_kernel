@@ -543,8 +543,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     // Write back to D
     //===------------------------------------------------------------------===//
 
-    if (block_m + TILE_BLOCK_M <= M && block_n + TILE_BLOCK_N <= N) {
-      // Not out-of-range
+    if (/* out-of-bound check */ block_m + TILE_BLOCK_M <= M &&
+        /* out-of-bound check */ block_n + TILE_BLOCK_N <= N &&
+        /* align 2 check */ (N % 2) == 0) {
 
 #pragma unroll
       for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
@@ -553,11 +554,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
         for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
              ++atomic_n_cnt) {
           D_TYPEx2 out;
-          auto *out_bf16 = reinterpret_cast<D_TYPE *>(&out);
+          auto *outx2 = reinterpret_cast<D_TYPE *>(&out);
           {
-            out_bf16[0] = f32_to_fpoint<D_TYPE>(
+            outx2[0] = f32_to_fpoint<D_TYPE>(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
-            out_bf16[1] = f32_to_fpoint<D_TYPE>(
+            outx2[1] = f32_to_fpoint<D_TYPE>(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
 
             int thread_m =
@@ -572,9 +573,9 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
           }
 
           {
-            out_bf16[0] = f32_to_fpoint<D_TYPE>(
+            outx2[0] = f32_to_fpoint<D_TYPE>(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
-            out_bf16[1] = f32_to_fpoint<D_TYPE>(
+            outx2[1] = f32_to_fpoint<D_TYPE>(
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
 
             int thread_m =

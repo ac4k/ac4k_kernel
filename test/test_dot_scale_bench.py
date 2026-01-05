@@ -153,6 +153,14 @@ def test_dot_scale(dtype, shape, bias_type=None, o_dtype=None) -> None:
     print("test passed\n")
 
 
+def test_random(times):
+    for _ in range(times):
+        M, N, K = random.randint(2, 555), random.randint(2,
+                                                         555), random.randint(
+                                                             2, 555)
+        test_dot_scale(torch.bfloat16, (M, N, K))
+
+
 if __name__ == "__main__":
     torch.manual_seed(9567)
     random.seed(9567)
@@ -195,3 +203,4 @@ if __name__ == "__main__":
     test_dot_scale(torch.bfloat16, (2, 33, 51),
                    o_dtype=torch.float32,
                    bias_type=torch.float32)
+    test_random(20)
