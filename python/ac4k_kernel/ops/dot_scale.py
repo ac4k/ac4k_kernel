@@ -30,6 +30,9 @@ class Ac4kDotScaleOp(torch.nn.Module):
                 out=None):
         kernel = _load_cuda_nvfp4_dot_scale()
 
+        if (bias is not None) and (bias.ndim == 1):
+            bias = bias.reshape(1, -1)
+
         if out is None:
             m, n = a.shape[0], b.shape[0]
             out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
@@ -57,7 +60,7 @@ def dot_scale(a,
         b: dot rhs operand, must be nvfp4 dtype and pack to uint8 dtype. Must be col major.
         b_scale: dot rhs scale factor, must be fp8e4m3 dtype.
         b_global_scale: dot rhs global scale factor, must be fp32 dtype.
-        bias: dot bias, must be bf16, fp16 or fp32. And it's shape must be [1, N].
+        bias: dot bias, must be bf16, fp16 or fp32. And it's shape must be [1, N] or [N].
         out: dot output. If None, a new tensor is created, which is bf16 dtype.
 
     Return:
