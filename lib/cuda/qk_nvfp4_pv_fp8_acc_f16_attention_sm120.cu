@@ -256,37 +256,6 @@ load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
                : "memory");
 }
 
-//===----------------------------------------------------------------------===//
-// Fast reciprocal
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-//===----------------------------------------------------------------------===//
-// Convert 4xfloat32 to 4xFP8 (represented as one uint32_t)
-//===----------------------------------------------------------------------===//
-
-static __device__ __forceinline__ F8E4M3x4 floatx4_to_e4m3x4(float in0,
-                                                             float in1,
-                                                             float in2,
-                                                             float in3) {
-  F8E4M3x4 val;
-  asm volatile("{\n"
-               ".reg .b16 lo;\n"
-               ".reg .b16 hi;\n"
-               "cvt.rn.satfinite.e4m3x2.f32   lo, %2, %1;\n"
-               "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
-               "mov.b32 %0, {lo, hi};\n"
-               "}"
-               : "=r"(val)
-               : "f"(in0), "f"(in1), "f"(in2), "f"(in3));
-  return val;
-}
-
 template <int N0, int N1>
 static __device__ __forceinline__ void
 convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
@@ -298,11 +267,11 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
       uint32_t sfu32[2];
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
-        F8E4M3x4 out_f8x4 = floatx4_to_e4m3x4(
-            p_f32_in[n0][i].data[j * 2] * P_SCALE_MAX,
-            p_f32_in[n0][i].data[j * 2 + 1] * P_SCALE_MAX,
-            p_f32_in[n0][i + 1].data[j * 2] * P_SCALE_MAX,
-            p_f32_in[n0][i + 1].data[j * 2 + 1] * P_SCALE_MAX);
+        F8E4M3x4 out_f8x4 =
+            fp32x4_to_e4m3x4(p_f32_in[n0][i].data[j * 2] * P_SCALE_MAX,
+                             p_f32_in[n0][i].data[j * 2 + 1] * P_SCALE_MAX,
+                             p_f32_in[n0][i + 1].data[j * 2] * P_SCALE_MAX,
+                             p_f32_in[n0][i + 1].data[j * 2 + 1] * P_SCALE_MAX);
         p_fp8_out[n0][i * 8 / 32].data[j + 2 * ((i / 2) % 2)] = out_f8x4;
       } // end loop j
     } // end loop i

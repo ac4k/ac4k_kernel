@@ -243,39 +243,6 @@ load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
                : "memory");
 }
 
-//===----------------------------------------------------------------------===//
-// Fast reciprocal
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-//===----------------------------------------------------------------------===//
-// Convert 8xfloat32 to 8xNVFP4 (represented as one uint32_t)
-//===----------------------------------------------------------------------===//
-
-__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-  uint32_t val;
-  asm volatile("{\n"
-               ".reg .b8 byte0;\n"
-               ".reg .b8 byte1;\n"
-               ".reg .b8 byte2;\n"
-               ".reg .b8 byte3;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-               "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-               "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-               "}"
-               : "=r"(val)
-               : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-                 "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
-  return val;
-}
-
 template <int N0, int N1>
 __forceinline__ __device__ void
 convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
@@ -336,7 +303,7 @@ convert_to_nvfp4(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
           }
 
           /// Convert 8xfloat32 to 8xe2m1(uint32)
-          uint32_t e2m1x8 = fp32_vec_to_e2m1(in);
+          uint32_t e2m1x8 = fp32x8_vec_to_e2m1x8(in);
           p_fp4_out[n0][8 * i / 64].data[j + k / 4 * 2] = e2m1x8;
         } // end loop k
       } // end loop j
