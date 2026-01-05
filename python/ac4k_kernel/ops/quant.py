@@ -3,43 +3,6 @@ from functools import lru_cache
 import triton
 import triton.language as tl
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-#         triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
-#         triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
-#         triton.Config({'BLOCK_SIZE': 512}, num_warps=8),
-#         triton.Config({'BLOCK_SIZE': 4096}, num_warps=4),
-#         triton.Config({'BLOCK_SIZE': 2048}, num_warps=4),
-#         triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
-#         triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
-#     ],
-#     key=['N'],
-# )
-# @triton.jit
-# def _triton_abs_max_kernel(x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
-#     pid = tl.program_id(0)
-#     block_start = pid * BLOCK_SIZE
-#     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-#     mask = offsets < N
-#     x = tl.load(x_ptr + offsets, mask=mask, other=0)
-#     abs_x = tl.abs(x)
-#     block_max = tl.max(abs_x, 0).to(tl.float32)
-#     out_ptrs = out_ptr + tl.zeros((BLOCK_SIZE, ), dtype=tl.int32)
-#     tl.atomic_max(out_ptrs, block_max, mask=(tl.arange(0, BLOCK_SIZE) == 0))
-
-# def _abs_max(x: torch.Tensor) -> torch.Tensor:
-#     x_flat = x.flatten()
-#     n_elements = x_flat.numel()
-
-#     def grid(META):
-#         return (triton.cdiv(n_elements, META['BLOCK_SIZE']), )
-
-#     global_max_abs = torch.zeros((), dtype=torch.float32, device="cuda")
-#     _triton_abs_max_kernel[grid](x_flat, global_max_abs, n_elements)
-
-#     return global_max_abs
-
 
 @triton.autotune(
     configs=[
@@ -260,13 +223,8 @@ class Ac4kQuantizeOp(torch.nn.Module):
             FLOAT4_E2M1_MAX = 6.0
             FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
-            # Opt: use f32 abs max
-            # alpha = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.max(torch.abs(input.view(-1)))).to(torch.float32)
             if max_scale is None:
                 max_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX
-            # alpha = (max_scale / (_abs_max(input).to(torch.bfloat16))).to(
-            #     torch.float32)
-            # global_scale = 1 / alpha
             global_scale = _global_scale(input, float(max_scale))
 
             # shape inference for out and sf
