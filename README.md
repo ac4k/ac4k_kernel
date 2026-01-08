@@ -1,5 +1,15 @@
 # ac4k_kernel
 
+ac4k_kernel is a high-performance kernel library for AI applications, designed to leverage the power of NVIDIA Blackwell GPUs. It provides optimized kernels for various AI tasks, ensuring efficient execution and minimal latency.
+
+## New Features
+
+01/10/2026: ac4k_kernel 0.1.0 is now available! This release includes the following features:
+
+- Optimized `NVFP4` dot scale kernel for RTX5090 (Blackwell) GPUs.
+- Optimized 8-bit quantized MHA kernel for RTX5090 (Blackwell) GPUs.
+- `BF16` to `NVFP4`, `BF16` to `FP8E4M3` and `BF16` to `INT8` quantize kernels for RTX5090 (Blackwell) GPUs.
+- Only support for CUDA 12.8.
 
 ## Installation
 
