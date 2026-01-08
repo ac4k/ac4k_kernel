@@ -22,59 +22,109 @@
 
 namespace ac4k {
 
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cde = cuda::device::experimental;
-
 using NVFP4x2 = uint8_t;
 using E4M3 = uint8_t;
+using E4M3x4 = uint32_t;
 constexpr int ELES_PER_NVFP4x2 = 2;
 constexpr int BLOCK_SIZE = 16;
 
-//===----------------------------------------------------------------------===//
-// Define tile size for block level, warp level and atomic level
-//===----------------------------------------------------------------------===//
+template <int TILE_BLOCK_M_, int TILE_BLOCK_N_, int TILE_BLOCK_K_,
+          int TILE_WARP_M_, int TILE_WARP_N_, int TILE_WARP_K_,
+          int GROUP_SIZE_M_ = 16>
+struct Policy {
+  //===--------------------------------------------------------------------===//
+  // Global memory
+  //===--------------------------------------------------------------------===//
 
-const int GROUP_SIZE_M = 16;
+  static const int GROUP_SIZE_M = GROUP_SIZE_M_;
 
-/// Block level tile size
-const int TILE_BLOCK_M = 128;
-const int TILE_BLOCK_N = 128;
-const int TILE_BLOCK_K = 128;
-const int TILE_BLOCK_PACK_K = TILE_BLOCK_K / ELES_PER_NVFP4x2;
-const int TILE_BLOCK_A_ELES = TILE_BLOCK_M * TILE_BLOCK_K;
-const int TILE_BLOCK_B_ELES = TILE_BLOCK_N * TILE_BLOCK_K;
-const int TILE_IN_ELES = TILE_BLOCK_A_ELES + TILE_BLOCK_B_ELES;
-const int TILE_BLOCK_A_SF_ELES = TILE_BLOCK_M * TILE_BLOCK_K / 64;
-const int TILE_BLOCK_B_SF_ELES = TILE_BLOCK_N * TILE_BLOCK_K / 64;
+  //===--------------------------------------------------------------------===//
+  // Define tile size for block level, warp level and atomic level
+  //===--------------------------------------------------------------------===//
 
-/// Warp level tile size
-const int TILE_WARP_M = 64;
-const int TILE_WARP_N = 64;
-const int TILE_WARP_K = 64;
-const int TILE_WARP_PACK_K = TILE_WARP_K / ELES_PER_NVFP4x2;
+  static const int TILE_BLOCK_M = TILE_BLOCK_M_;
+  static const int TILE_BLOCK_N = TILE_BLOCK_N_;
+  static const int TILE_BLOCK_K = TILE_BLOCK_K_;
+  static const int TILE_BLOCK_A_ELES = TILE_BLOCK_M * TILE_BLOCK_K;
+  static const int TILE_BLOCK_B_ELES = TILE_BLOCK_N * TILE_BLOCK_K;
+  static const int TILE_BLOCK_A_SF_ELES = TILE_BLOCK_M * TILE_BLOCK_K / 64;
+  static const int TILE_BLOCK_B_SF_ELES = TILE_BLOCK_N * TILE_BLOCK_K / 64;
+  static const int TILE_BLOCK_A_SIZE =
+      TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+  static const int TILE_BLOCK_B_SIZE =
+      TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2);
+  static const int TILE_BLOCK_A_SF_SIZE = TILE_BLOCK_A_SF_ELES * sizeof(E4M3x4);
+  static const int TILE_BLOCK_B_SF_SIZE = TILE_BLOCK_B_SF_ELES * sizeof(E4M3x4);
 
-/// Atomic level tile size
-const int TILE_ATOMIC_M = 16;
-const int TILE_ATOMIC_N = 8;
-const int TILE_ATOMIC_K = 64;
-const int TILE_ATOMIC_PACK_K = TILE_ATOMIC_K / ELES_PER_NVFP4x2;
+  /// Warp level tile size
+  static const int TILE_WARP_M = TILE_WARP_M_;
+  static const int TILE_WARP_N = TILE_WARP_N_;
+  static const int TILE_WARP_K = TILE_WARP_K_;
 
-const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
-const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
-const int WARP_NUM = WARP_M_NUM * WARP_N_NUM;
+  /// Atomic level tile size
+  static const int TILE_ATOMIC_M = 16;
+  static const int TILE_ATOMIC_N = 8;
+  static const int TILE_ATOMIC_K = 64;
 
-//===----------------------------------------------------------------------===//
-// Define mutiple buffer stage
-//===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Define mutiple buffer stage
+  //===--------------------------------------------------------------------===//
 
-const int STAGE = 2;
+  static const int STAGE = 2;
 
-//===----------------------------------------------------------------------===//
-// Consumer & Producer
-//===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
+  // Shared memory
+  //===--------------------------------------------------------------------===//
 
-const int CONSUMER_THREAD_NUM = WARP_NUM * 32;
-const int PRODUCER_THREAD_NUM = 32;
+  static const int SMEM_SIZE = (TILE_BLOCK_A_SIZE + TILE_BLOCK_B_SIZE +
+                                TILE_BLOCK_A_SF_SIZE + TILE_BLOCK_B_SF_SIZE) *
+                               STAGE;
+  static const int A_SMEM_OFF = 0;
+  static const int B_SMEM_OFF = A_SMEM_OFF + TILE_BLOCK_A_SIZE * STAGE;
+  static const int A_SF_SMEM_OFF = B_SMEM_OFF + TILE_BLOCK_B_SIZE * STAGE;
+  static const int B_SF_SMEM_OFF = A_SF_SMEM_OFF + TILE_BLOCK_A_SF_SIZE * STAGE;
+  static __forceinline__ __device__ NVFP4x2 *get_a_stage_mem(char *smem,
+                                                             int stage) {
+    return reinterpret_cast<NVFP4x2 *>(smem + A_SMEM_OFF +
+                                       TILE_BLOCK_A_SIZE * stage);
+  }
+  static __forceinline__ __device__ NVFP4x2 *get_b_stage_mem(char *smem,
+                                                             int stage) {
+    return reinterpret_cast<NVFP4x2 *>(smem + B_SMEM_OFF +
+                                       TILE_BLOCK_B_SIZE * stage);
+  }
+  static __forceinline__ __device__ E4M3x4 *get_a_sf_stage_mem(char *smem,
+                                                               int stage) {
+    return reinterpret_cast<E4M3x4 *>(smem + A_SF_SMEM_OFF +
+                                      TILE_BLOCK_A_SF_SIZE * stage);
+  }
+  static __forceinline__ __device__ E4M3x4 *get_b_sf_stage_mem(char *smem,
+                                                               int stage) {
+    return reinterpret_cast<E4M3x4 *>(smem + B_SF_SMEM_OFF +
+                                      TILE_BLOCK_B_SF_SIZE * stage);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Consumer & Producer
+  //===--------------------------------------------------------------------===//
+
+  static const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
+  static const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
+  static const int CONSUMER_WARP_NUM = WARP_M_NUM * WARP_N_NUM;
+  static const int PRODUCER_WARP_NUM = 1;
+  static const int CONSUMER_THREAD_NUM = CONSUMER_WARP_NUM * 32;
+  static const int PRODUCER_THREAD_NUM = PRODUCER_WARP_NUM * 32;
+  static const int TOTAL_THREAD_NUM = CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM;
+
+  //===--------------------------------------------------------------------===//
+  // Swizzle
+  //===--------------------------------------------------------------------===//
+
+  static constexpr CUtensorMapSwizzle SWIZZLE_A =
+      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+  static constexpr CUtensorMapSwizzle SWIZZLE_B =
+      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+};
 
 //===----------------------------------------------------------------------===//
 // TMA
@@ -223,19 +273,20 @@ __device__ static __forceinline__ void arrive(uint64_t *bar,
 // Program ID
 //===----------------------------------------------------------------------===//
 
+template <typename Policy>
 __device__ static __forceinline__ int2 get_program_id(int M, int N) {
   /// Program ID
   int pid = blockIdx.x;
   /// Number of program ids along the M axis
-  int num_pid_m = ceil_div(M, TILE_BLOCK_M);
+  int num_pid_m = ceil_div(M, Policy::TILE_BLOCK_M);
   /// Number of programs ids along the N axis
-  int num_pid_n = ceil_div(N, TILE_BLOCK_N);
-  int num_pid_in_group = GROUP_SIZE_M * num_pid_n;
+  int num_pid_n = ceil_div(N, Policy::TILE_BLOCK_N);
+  int num_pid_in_group = Policy::GROUP_SIZE_M * num_pid_n;
   int group_id = pid / num_pid_in_group;
-  int first_pid_m = group_id * GROUP_SIZE_M;
-  int group_size_m = (num_pid_m - first_pid_m) < GROUP_SIZE_M
+  int first_pid_m = group_id * Policy::GROUP_SIZE_M;
+  int group_size_m = (num_pid_m - first_pid_m) < Policy::GROUP_SIZE_M
                          ? num_pid_m - first_pid_m
-                         : GROUP_SIZE_M;
+                         : Policy::GROUP_SIZE_M;
   int pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m);
   int pid_n = (pid % num_pid_in_group) / group_size_m;
 
@@ -253,8 +304,8 @@ __device__ static __forceinline__ int2 get_program_id(int M, int N) {
 //===----------------------------------------------------------------------===//
 
 template <at::ScalarType D_AT_TYPE, at::ScalarType BIAS_AT_TYPE,
-          CUtensorMapSwizzle Swizzle>
-__launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
+          typename Policy>
+__launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
     void nvfp4_dot_scale_sm120_kernel(
         typename AtDataTraits<D_AT_TYPE>::Type *__restrict__ D,
         const float *__restrict__ A_global_scale,
@@ -272,63 +323,36 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   //===--------------------------------------------------------------------===//
 
   int tid = threadIdx.x;
-  bool is_consumer = tid < CONSUMER_THREAD_NUM;
-  bool is_producer = tid >= CONSUMER_THREAD_NUM;
+  bool is_consumer = tid < Policy::CONSUMER_THREAD_NUM;
+  bool is_producer = tid >= Policy::CONSUMER_THREAD_NUM;
 
-  int2 pid = get_program_id(M, N);
-  int block_m = pid.x * TILE_BLOCK_M;
-  int block_n = pid.y * TILE_BLOCK_N;
+  int2 pid = get_program_id<Policy>(M, N);
+  int block_m = pid.x * Policy::TILE_BLOCK_M;
+  int block_n = pid.y * Policy::TILE_BLOCK_N;
 
   int warp_id = tid / 32;
-  int warp_id_m = warp_id / WARP_N_NUM;
-  int warp_id_n = warp_id % WARP_N_NUM;
-  int warp_m = warp_id_m * TILE_WARP_M;
-  int warp_n = warp_id_n * TILE_WARP_N;
+  int warp_id_m = warp_id / Policy::WARP_N_NUM;
+  int warp_id_n = warp_id % Policy::WARP_N_NUM;
+  int warp_m = warp_id_m * Policy::TILE_WARP_M;
+  int warp_n = warp_id_n * Policy::TILE_WARP_N;
   int lane_id = tid % 32;
-
-  //===--------------------------------------------------------------------===//
-  // Define fragment for a, b and c operand
-  //===--------------------------------------------------------------------===//
-
-  /// Each thread has a copy of this tile
-  AFrag_NVFP4_16x64 a_frag;
-  BFrag_NVFP4_64x8 b_frag;
-  DFrag_F32_16x8 c_frag[TILE_WARP_M / TILE_ATOMIC_M]
-                       [TILE_WARP_N / TILE_ATOMIC_N];
-
-#pragma unroll
-  for (int row = 0; row < TILE_WARP_M / TILE_ATOMIC_M; ++row) {
-#pragma unroll
-    for (int col = 0; col < TILE_WARP_N / TILE_ATOMIC_N; ++col) {
-#pragma unroll
-      for (int i = 0; i < c_frag[row][col].REGISTERS_PER_THREAD; ++i) {
-        /// Init c fragment with 0.0
-        c_frag[row][col].data[i] = 0.0f;
-      }
-    }
-  }
 
   //===--------------------------------------------------------------------===//
   // Define shared memory for a and b operand
   //===--------------------------------------------------------------------===//
 
-  extern __shared__ __align__(1024) NVFP4x2 smem[];
-  NVFP4x2 *a_shared = smem;
-  NVFP4x2 *b_shared = a_shared + STAGE * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2;
-  uint32_t *a_sf_shared = reinterpret_cast<uint32_t *>(
-      b_shared + STAGE * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2);
-  uint32_t *b_sf_shared = a_sf_shared + STAGE * TILE_BLOCK_A_SF_ELES;
+  extern __shared__ __align__(1024) char smem[];
 
   //===--------------------------------------------------------------------===//
   // Define brrier for a and b tma
   //===--------------------------------------------------------------------===//
 
-  __shared__ __align__(8) uint64_t empty_bar[STAGE];
-  __shared__ __align__(8) uint64_t full_bar[STAGE];
-  if (is_producer) {
+  __shared__ __align__(8) uint64_t empty_bar[Policy::STAGE];
+  __shared__ __align__(8) uint64_t full_bar[Policy::STAGE];
+  if (is_producer && lane_id == 0) {
 #pragma unroll
-    for (int i = 0; i < STAGE; ++i) {
-      init_barrier(&empty_bar[i], WARP_NUM);
+    for (int i = 0; i < Policy::STAGE; ++i) {
+      init_barrier(&empty_bar[i], Policy::CONSUMER_WARP_NUM);
       init_barrier(&full_bar[i], 1);
     }
   }
@@ -339,51 +363,75 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
   // Producer
   //===--------------------------------------------------------------------===//
 
-  if (is_producer && tid == CONSUMER_THREAD_NUM) {
-    for (int block_k = 0, stage = 0, phase = 0; block_k < K;
-         block_k += TILE_BLOCK_K, ++stage) {
-      int block_k_pack = block_k / ELES_PER_NVFP4x2;
+  if (is_producer) {
+    // reg_dealloc<24>();
+    if (tid == Policy::CONSUMER_THREAD_NUM) {
+      for (int block_k = 0, stage = 0, phase = 0; block_k < K;
+           block_k += Policy::TILE_BLOCK_K, ++stage) {
+        int block_k_pack = block_k / ELES_PER_NVFP4x2;
 
-      if (stage == STAGE) {
-        stage = 0;
-        phase ^= 1;
-      }
+        if (stage == Policy::STAGE) {
+          stage = 0;
+          phase ^= 1;
+        }
 
-      wait(&empty_bar[stage], phase);
+        wait(&empty_bar[stage], phase);
 
-      /// TMA A
-      load_4d_async(a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2,
-                    &a_tensor_map, &full_bar[stage], 0, 0, block_m,
-                    block_k_pack);
-      /// TMA B
-      load_4d_async(b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2,
-                    &b_tensor_map, &full_bar[stage], 0, 0, block_n,
-                    block_k_pack);
-      /// TMA A_SF
-      load_4d_async(a_sf_shared + stage * TILE_BLOCK_A_SF_ELES,
-                    &a_sf_tensor_map, &full_bar[stage], 0, 0, block_k / 64,
-                    block_m);
-      /// TMA B_SF
-      load_4d_async(b_sf_shared + stage * TILE_BLOCK_B_SF_ELES,
-                    &b_sf_tensor_map, &full_bar[stage], 0, 0, block_k / 64,
-                    block_n);
+        /// TMA A
+        load_4d_async(Policy::get_a_stage_mem(smem, stage), &a_tensor_map,
+                      &full_bar[stage], 0, 0, block_m, block_k_pack);
+        /// TMA B
+        load_4d_async(Policy::get_b_stage_mem(smem, stage), &b_tensor_map,
+                      &full_bar[stage], 0, 0, block_n, block_k_pack);
+        /// TMA A_SF
+        load_4d_async(Policy::get_a_sf_stage_mem(smem, stage), &a_sf_tensor_map,
+                      &full_bar[stage], 0, 0, block_k / 64, block_m);
+        /// TMA B_SF
+        load_4d_async(Policy::get_b_sf_stage_mem(smem, stage), &b_sf_tensor_map,
+                      &full_bar[stage], 0, 0, block_k / 64, block_n);
 
-      expect_bytes(&full_bar[stage],
-                   TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) +
-                       (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) *
-                           sizeof(uint32_t));
-    } // end loop block_k
+        expect_bytes(&full_bar[stage], Policy::TILE_BLOCK_A_SIZE +
+                                           Policy::TILE_BLOCK_B_SIZE +
+                                           Policy::TILE_BLOCK_A_SF_SIZE +
+                                           Policy::TILE_BLOCK_B_SF_SIZE);
+      } // end loop block_k
+    }
   }
 
   //===--------------------------------------------------------------------===//
   // Consumer
   //===--------------------------------------------------------------------===//
 
-  if (is_consumer) {
+  else {
+    // reg_alloc<144>();
     if (lane_id == 0) {
 #pragma unroll
-      for (int i = 0; i < STAGE; ++i) {
+      for (int i = 0; i < Policy::STAGE; ++i) {
         arrive(&empty_bar[i], 1);
+      }
+    }
+
+    //===------------------------------------------------------------------===//
+    // Define fragment for a, b and c operand
+    //===------------------------------------------------------------------===//
+
+    /// Each thread has a copy of this tile
+    AFrag_NVFP4_16x64 a_frag;
+    BFrag_NVFP4_64x8 b_frag;
+    DFrag_F32_16x8 c_frag[Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M]
+                         [Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N];
+
+#pragma unroll
+    for (int row = 0; row < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
+         ++row) {
+#pragma unroll
+      for (int col = 0; col < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
+           ++col) {
+#pragma unroll
+        for (int i = 0; i < c_frag[row][col].REGISTERS_PER_THREAD; ++i) {
+          /// Init c fragment with 0.0
+          c_frag[row][col].data[i] = 0.0f;
+        }
       }
     }
 
@@ -392,8 +440,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     //===------------------------------------------------------------------===//
 
     for (int block_k = 0, stage = 0, phase = 0; block_k < K;
-         block_k += TILE_BLOCK_K, ++stage) {
-      if (stage == STAGE) {
+         block_k += Policy::TILE_BLOCK_K, ++stage) {
+      if (stage == Policy::STAGE) {
         stage = 0;
         phase ^= 1;
       }
@@ -401,14 +449,16 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       wait(&full_bar[stage], phase);
 
 #pragma unroll
-      for (int warp_k = 0; warp_k < TILE_BLOCK_K; warp_k += TILE_WARP_K) {
+      for (int warp_k = 0; warp_k < Policy::TILE_BLOCK_K;
+           warp_k += Policy::TILE_WARP_K) {
 #pragma unroll
-        for (int atomic_k = 0; atomic_k < TILE_WARP_K;
-             atomic_k += TILE_ATOMIC_K) {
+        for (int atomic_k = 0; atomic_k < Policy::TILE_WARP_K;
+             atomic_k += Policy::TILE_ATOMIC_K) {
 #pragma unroll
-          for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+          for (int atomic_m_cnt = 0;
+               atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
                ++atomic_m_cnt) {
-            int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
+            int atomic_m = atomic_m_cnt * Policy::TILE_ATOMIC_M;
 
             /// SF A
             uint32_t sfa0 = 0;
@@ -416,8 +466,8 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
               int row =
                   warp_m + atomic_m + ((lane_id % 4) % 2) * 8 + (lane_id / 4);
               int col = warp_k + atomic_k;
-              sfa0 = a_sf_shared[stage * TILE_BLOCK_A_SF_ELES +
-                                 col / 64 * TILE_BLOCK_M + row];
+              sfa0 = Policy::get_a_sf_stage_mem(
+                  smem, stage)[col / 64 * Policy::TILE_BLOCK_M + row];
             }
 
             /// Load shared to fragment for A operand
@@ -425,13 +475,13 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
             int a_shared_row = warp_m + atomic_m + (lane_id % 16);
             int a_shared_col =
                 (warp_k + atomic_k + (lane_id / 16) * 32) / ELES_PER_NVFP4x2;
-            int a_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
+            int a_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_A>::get_row(
                 a_shared_row, a_shared_col, sizeof(NVFP4x2));
-            int a_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
+            int a_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_A>::get_col(
                 a_shared_row, a_shared_col, sizeof(NVFP4x2));
             uint32_t a_addr = __cvta_generic_to_shared(
-                a_shared + stage * TILE_BLOCK_A_ELES / ELES_PER_NVFP4x2 +
-                a_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                Policy::get_a_stage_mem(smem, stage) +
+                a_shared_row_swiz * Policy::TILE_BLOCK_K / ELES_PER_NVFP4x2 +
                 a_shared_col_swiz);
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
                          "{%0, %1, %2, %3}, [%4];"
@@ -441,16 +491,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
 #pragma unroll
             for (int atomic_n_cnt = 0;
-                 atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N; ++atomic_n_cnt) {
-              int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+                 atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
+                 ++atomic_n_cnt) {
+              int atomic_n = atomic_n_cnt * Policy::TILE_ATOMIC_N;
 
               /// SF B
               uint32_t sfb0 = 0;
               {
                 int row = warp_n + atomic_n + (lane_id / 4);
                 int col = warp_k + atomic_k;
-                sfb0 = b_sf_shared[stage * TILE_BLOCK_B_SF_ELES +
-                                   col / 64 * TILE_BLOCK_N + row];
+                sfb0 = Policy::get_b_sf_stage_mem(
+                    smem, stage)[col / 64 * Policy::TILE_BLOCK_N + row];
               }
 
               /// Load shared to fragment for B operand
@@ -459,13 +510,15 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
               int b_shared_col =
                   (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
                   ELES_PER_NVFP4x2;
-              int b_shared_row_swiz = SwizzleIndexMap<Swizzle>::get_row(
-                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
-              int b_shared_col_swiz = SwizzleIndexMap<Swizzle>::get_col(
-                  b_shared_row, b_shared_col, sizeof(NVFP4x2));
+              int b_shared_row_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_B>::get_row(
+                      b_shared_row, b_shared_col, sizeof(NVFP4x2));
+              int b_shared_col_swiz =
+                  SwizzleIndexMap<Policy::SWIZZLE_B>::get_col(
+                      b_shared_row, b_shared_col, sizeof(NVFP4x2));
               uint32_t b_addr = __cvta_generic_to_shared(
-                  b_shared + stage * TILE_BLOCK_B_ELES / ELES_PER_NVFP4x2 +
-                  b_shared_row_swiz * TILE_BLOCK_K / ELES_PER_NVFP4x2 +
+                  Policy::get_b_stage_mem(smem, stage) +
+                  b_shared_row_swiz * Policy::TILE_BLOCK_K / ELES_PER_NVFP4x2 +
                   b_shared_col_swiz);
               asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
                            "{%0, %1}, [%2];"
@@ -497,10 +550,12 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     float scale = (*A_global_scale) * (*B_global_scale);
 
 #pragma unroll
-    for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+    for (int atomic_m_cnt = 0;
+         atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
          ++atomic_m_cnt) {
 #pragma unroll
-      for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+      for (int atomic_n_cnt = 0;
+           atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
            ++atomic_n_cnt) {
 #pragma unroll
         for (int idx = 0;
@@ -517,16 +572,18 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
 
     if (bias) {
 #pragma unroll
-      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+      for (int atomic_m_cnt = 0;
+           atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
            ++atomic_m_cnt) {
 #pragma unroll
-        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+        for (int atomic_n_cnt = 0;
+             atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
              ++atomic_n_cnt) {
 #pragma unroll
           for (int idx = 0;
                idx < c_frag[atomic_m_cnt][atomic_n_cnt].REGISTERS_PER_THREAD;
                ++idx) {
-            int thread_n = atomic_n_cnt * TILE_ATOMIC_N +
+            int thread_n = atomic_n_cnt * Policy::TILE_ATOMIC_N +
                            c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(
                                lane_id, idx);
             int n = block_n + warp_n + thread_n;
@@ -543,15 +600,17 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
     // Write back to D
     //===------------------------------------------------------------------===//
 
-    if (/* out-of-bound check */ block_m + TILE_BLOCK_M <= M &&
-        /* out-of-bound check */ block_n + TILE_BLOCK_N <= N &&
+    if (/* out-of-bound check */ block_m + Policy::TILE_BLOCK_M <= M &&
+        /* out-of-bound check */ block_n + Policy::TILE_BLOCK_N <= N &&
         /* align 2 check */ (N % 2) == 0) {
 
 #pragma unroll
-      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+      for (int atomic_m_cnt = 0;
+           atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
            ++atomic_m_cnt) {
 #pragma unroll
-        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+        for (int atomic_n_cnt = 0;
+             atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
              ++atomic_n_cnt) {
           D_TYPEx2 out;
           auto *outx2 = reinterpret_cast<D_TYPE *>(&out);
@@ -562,11 +621,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
 
             int thread_m =
-                atomic_m_cnt * TILE_ATOMIC_M +
+                atomic_m_cnt * Policy::TILE_ATOMIC_M +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 0);
             int m = block_m + warp_m + thread_m;
             int thread_n =
-                atomic_n_cnt * TILE_ATOMIC_N +
+                atomic_n_cnt * Policy::TILE_ATOMIC_N +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 0);
             int n = block_n + warp_n + thread_n;
             *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
@@ -579,11 +638,11 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
                 c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
 
             int thread_m =
-                atomic_m_cnt * TILE_ATOMIC_M +
+                atomic_m_cnt * Policy::TILE_ATOMIC_M +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 2);
             int m = block_m + warp_m + thread_m;
             int thread_n =
-                atomic_n_cnt * TILE_ATOMIC_N +
+                atomic_n_cnt * Policy::TILE_ATOMIC_N +
                 c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 2);
             int n = block_n + warp_n + thread_n;
             *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
@@ -599,17 +658,19 @@ __launch_bounds__(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM) __global__
       }
 
 #pragma unroll
-      for (int atomic_m_cnt = 0; atomic_m_cnt < TILE_WARP_M / TILE_ATOMIC_M;
+      for (int atomic_m_cnt = 0;
+           atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
            ++atomic_m_cnt) {
-        int atomic_m = atomic_m_cnt * TILE_ATOMIC_M;
+        int atomic_m = atomic_m_cnt * Policy::TILE_ATOMIC_M;
         if (block_m + warp_m + atomic_m >= M) {
           break;
         }
 
 #pragma unroll
-        for (int atomic_n_cnt = 0; atomic_n_cnt < TILE_WARP_N / TILE_ATOMIC_N;
+        for (int atomic_n_cnt = 0;
+             atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
              ++atomic_n_cnt) {
-          int atomic_n = atomic_n_cnt * TILE_ATOMIC_N;
+          int atomic_n = atomic_n_cnt * Policy::TILE_ATOMIC_N;
           if (block_n + warp_n + atomic_n >= N) {
             break;
           }
@@ -704,48 +765,47 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
         at::ScalarType::Float>(bias_type, [&]<at::ScalarType BIAS_AT_TYPE>() {
       using D_T = typename AtDataTraits<D_AT_TYPE>::Type;
       using BIAS_T = typename AtDataTraits<BIAS_AT_TYPE>::Type;
+      using policy = Policy<128, 128, 128 * 2, 32, 64, 64, 8>;
 
       /// Grid & Block dim3
-      dim3 grid(ceil_div(N, TILE_BLOCK_N) * ceil_div(M, TILE_BLOCK_M));
-      dim3 block(CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM);
+      dim3 grid(ceil_div(N, policy::TILE_BLOCK_N) *
+                ceil_div(M, policy::TILE_BLOCK_M));
+      dim3 block(policy::TOTAL_THREAD_NUM);
 
       /// Get CUDA stream
       auto stream = at::cuda::getCurrentCUDAStream().stream();
 
       /// Set dynamic shared memory size
-      const auto SWIZZLE =
-          get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
       auto *kernel =
-          nvfp4_dot_scale_sm120_kernel<D_AT_TYPE, BIAS_AT_TYPE, SWIZZLE>;
-      size_t smem_size =
-          TILE_IN_ELES / ELES_PER_NVFP4x2 * sizeof(NVFP4x2) * STAGE +
-          (TILE_BLOCK_A_SF_ELES + TILE_BLOCK_B_SF_ELES) * sizeof(uint32_t) *
-              STAGE;
+          nvfp4_dot_scale_sm120_kernel<D_AT_TYPE, BIAS_AT_TYPE, policy>;
       CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          policy::SMEM_SIZE));
 
       /// TMA descriptor
       CUtensorMap a_tensor_map = create_4d_tensor_map<
-          1, 1, TILE_BLOCK_M, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
-          reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(A.size(0)), static_cast<uint64_t>(A.size(1)));
+          1, 1, policy::TILE_BLOCK_M, policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
+          policy::SWIZZLE_A>(reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+                             static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                             static_cast<uint64_t>(A.size(0)),
+                             static_cast<uint64_t>(A.size(1)));
       CUtensorMap b_tensor_map = create_4d_tensor_map<
-          1, 1, TILE_BLOCK_N, TILE_BLOCK_K / ELES_PER_NVFP4x2,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2, SWIZZLE>(
-          reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(B.size(0)), static_cast<uint64_t>(B.size(1)));
+          1, 1, policy::TILE_BLOCK_N, policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
+          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
+          policy::SWIZZLE_B>(reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+                             static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                             static_cast<uint64_t>(B.size(0)),
+                             static_cast<uint64_t>(B.size(1)));
       CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
-          1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_M,
+          1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4), policy::TILE_BLOCK_M,
           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
           reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
           static_cast<uint64_t>(1), static_cast<uint64_t>(1),
           static_cast<uint64_t>(A_sf.size(0)),
           static_cast<uint64_t>(A_sf.size(1)));
       CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
-          1, 1, TILE_BLOCK_K / (BLOCK_SIZE * 4), TILE_BLOCK_N,
+          1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4), policy::TILE_BLOCK_N,
           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
           reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
           static_cast<uint64_t>(1), static_cast<uint64_t>(1),
@@ -753,7 +813,7 @@ void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
           static_cast<uint64_t>(B_sf.size(1)));
 
       /// Launch kernel
-      kernel<<<grid, block, smem_size, stream>>>(
+      kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
           reinterpret_cast<D_T *>(D.data_ptr()),
           reinterpret_cast<const float *>(A_global_scale.data_ptr()),
           reinterpret_cast<const float *>(B_global_scale.data_ptr()),
