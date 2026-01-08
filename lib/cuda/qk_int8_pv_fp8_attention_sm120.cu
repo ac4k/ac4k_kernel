@@ -668,20 +668,45 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         }
       }
 
+      //       /// mask to inf
+      //       if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
+      // #pragma unroll
+      //         for (int dot0_atomic_m = 0; dot0_atomic_m <
+      //         Policy::TILE_DOT0_WARP_M;
+      //              dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+      //           int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
+      // #pragma unroll
+      //           for (int dot0_atomic_n = 0; dot0_atomic_n <
+      //           Policy::TILE_DOT0_WARP_N;
+      //                dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+      //             int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+      // #pragma unroll
+      //             for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k)
+      //             {
+      //               int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
+      //               if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+      //                 s_frag[i][j].data[k] = -INFINITY;
+      //               }
+      //             }
+      //           }
+      //         }
+      //       }
+
       /// mask to inf
       if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
 #pragma unroll
-        for (int dot0_atomic_m = 0; dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
-             dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
-          int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
+        for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
+             dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+          int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
 #pragma unroll
-          for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
-               dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
-            int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+          for (int k = 0; k < s_frag[0][j].REGISTERS_PER_THREAD; ++k) {
+            int thread_n = s_frag[0][j].get_col_with_reg(lane_id, k);
+            if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
 #pragma unroll
-            for (int k = 0; k < s_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-              int thread_n = s_frag[i][j].get_col_with_reg(lane_id, k);
-              if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+              for (int dot0_atomic_m = 0;
+                   dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+                   dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+                int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
                 s_frag[i][j].data[k] = -INFINITY;
               }
             }
@@ -763,16 +788,18 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         // /// redundant p is exp(0 - max)
         // /// total redundant exp sum is exp(-max) * (align_up(N,
         // /// TILE_DOT0_BLOCK_N) - N)
-        // if (dot0_n + TILE_DOT0_BLOCK_N > DOT0_N) {
-        //   l_new0[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) *
+        // if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
+        //   l_new0[i] -= (align_up(DOT0_N, Policy::TILE_DOT0_BLOCK_N) - DOT0_N)
+        //   *
         //                exp2f(-max_new0[i]);
-        //   l_new1[i] -= (align_up(DOT0_N, TILE_DOT0_BLOCK_N) - DOT0_N) *
+        //   l_new1[i] -= (align_up(DOT0_N, Policy::TILE_DOT0_BLOCK_N) - DOT0_N)
+        //   *
         //                exp2f(-max_new1[i]);
         // }
 
         // Update l
-        l0[i] = exp2f(max0[i] - max_new0[i]) * l0[i] + l_new0[i];
-        l1[i] = exp2f(max1[i] - max_new1[i]) * l1[i] + l_new1[i];
+        l0[i] = fma(exp2f(max0[i] - max_new0[i]), l0[i], l_new0[i]);
+        l1[i] = fma(exp2f(max1[i] - max_new1[i]), l1[i], l_new1[i]);
       } // end loop i
 
       /// Step 4: o = expf(max - max_new) * o
@@ -800,10 +827,10 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       }
 
       /// Step 5: quantize P from f32 to fp8e4m3
-      AFrag_FP8_16x32
-          p_fp8_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
-                    [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
-      convert_to_fp8(p_frag, p_fp8_frag);
+      // AFrag_FP8_16x32
+      //     p_fp8_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+      //               [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
+      // convert_to_fp8(p_frag, p_fp8_frag);
 
       /// Step 6: o = P @ V
       int dot1_k = dot0_n;
@@ -819,6 +846,24 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         for (int dot1_atomic_m = 0; dot1_atomic_m < Policy::TILE_DOT1_WARP_M;
              dot1_atomic_m += Policy::TILE_DOT1_ATOMIC_M) {
           int dot1_atomic_m_cnt = dot1_atomic_m / Policy::TILE_DOT1_ATOMIC_M;
+
+          AFrag_FP8_16x32 p_fp8_frag;
+          AFrag_FP8_16x32(&p_fp8_frag_v1)[1][1] =
+              reinterpret_cast<AFrag_FP8_16x32(&)[1][1]>(p_fp8_frag);
+          constexpr int SIZE0 =
+              Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M *
+              Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N / 4;
+          constexpr int SIZE1 = 4;
+          DFrag_F32_16x8(&p_frag_v4)[SIZE0][SIZE1] =
+              reinterpret_cast<DFrag_F32_16x8(&)[SIZE0][SIZE1]>(p_frag);
+          DFrag_F32_16x8(&p_frag_v4_this)[1][4] =
+              reinterpret_cast<DFrag_F32_16x8(&)[1][4]>(
+                  p_frag_v4[(dot1_atomic_m / Policy::TILE_DOT0_ATOMIC_M *
+                                 Policy::TILE_DOT0_WARP_N /
+                                 Policy::TILE_DOT0_ATOMIC_N +
+                             dot1_atomic_k / Policy::TILE_DOT0_ATOMIC_N) /
+                            4]);
+          convert_to_fp8(p_frag_v4_this, p_fp8_frag_v1);
 #pragma unroll
           for (int dot1_atomic_n = 0; dot1_atomic_n < Policy::TILE_DOT1_WARP_N;
                dot1_atomic_n += Policy::TILE_DOT1_ATOMIC_N) {
@@ -851,13 +896,11 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
             if (dot1_atomic_k == 0) {
               mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
                   o_f16[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data,
-                  p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
-                  v_frag.data);
+                  p_fp8_frag.data, v_frag.data);
             } else {
               mma_sync_m16n8k32_row_col_fp8fp8f16(
                   o_f16[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data,
-                  p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
-                  v_frag.data);
+                  p_fp8_frag.data, v_frag.data);
             }
           } // end loop dot1_atomic_n
         } // end loop dot1_atomic_m
