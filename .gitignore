@@ -1,6 +1,36 @@
-*.i
-*.ii
-*.gpu
-*.ptx
-*.cubin
-*.fatbin
+# AC4K builds
+build/
+build-*/
+
+# AC4K Python module builds
+python/build/
+python/dist/
+python/ac4k_kernel*.egg-info/
+
+python/ac4k_kernel/ops/_cuda_ops.*.so
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# clangd index. (".clangd" is a config file now, thus trailing slash)
+.clangd/
+.cache
+/compile_commands.json
+.vscode
+.vs
+.cursor
+
+# Vim
+*.swp
+
+# macOS
+.DS_Store
+
+# Ignore files with the following extensions, typically related to CUDA programming
+*.i          # Preprocessed C/C++ source files
+*.ii         # Preprocessed C++ source files
+*.gpu        # GPU device code files
+*.ptx        # Parallel Thread Execution intermediate code files
+*.cubin      # Compiled GPU binary files
+*.fatbin     # NVIDIA FatBin binary files containing binary code for multiple GPU architectures
