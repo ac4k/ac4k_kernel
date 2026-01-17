@@ -37,3 +37,20 @@ __forceinline__ void DISPATCH_HEAD_DIM_SIZES(int hdim, auto &&func) {
     throw std::invalid_argument("Unsupported hdim: " + std::to_string(hdim));
   }
 }
+
+template <bool... SupportedBools>
+__forceinline__ void DISPATCH_BOOLEAN_VALUES(bool value, auto &&func) {
+  constexpr bool support_true = ((SupportedBools == true) || ...);
+  constexpr bool support_false = ((SupportedBools == false) || ...);
+
+  if ((value == true && !support_true) || (value == false && !support_false)) {
+    std::string value_str = value ? "true" : "false";
+    throw std::invalid_argument("Unsupported bool value: " + value_str);
+  }
+
+  if (value == true) {
+    func.template operator()<true>();
+  } else {
+    func.template operator()<false>();
+  }
+}
