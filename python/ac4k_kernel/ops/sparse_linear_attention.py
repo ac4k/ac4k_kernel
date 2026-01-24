@@ -79,74 +79,6 @@ def get_sparse_map(q, k, topk_ratio, BLOCK_Q, BLOCK_K):
 
 
 @triton.jit
-def _attn_fwd(
-    Q,
-    K,
-    V,
-    qk_scale: tl.constexpr,
-    topk: tl.constexpr,
-    LUT,
-    LSE,
-    OS,
-    L: tl.constexpr,
-    M_BLOCKS: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    idx_m = tl.program_id(0).to(tl.int64)
-    idx_bh = tl.program_id(1).to(tl.int64)
-
-    qkv_offset = idx_bh * L * D
-    lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
-    lse_offset = idx_bh * L
-    offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D)
-
-    Q_ptrs = Q + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
-    K_ptrs = K + qkv_offset + offs_n[None, :] * D + offs_d[:, None]
-    V_ptrs = V + qkv_offset + offs_n[:, None] * D + offs_d[None, :]
-    OS_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
-    LUT_ptr = LUT + lut_offset
-    LSE_ptrs = LSE + lse_offset + offs_m
-
-    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
-
-    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L)
-    for block_idx in tl.range(topk):
-        idx_n = tl.load(LUT_ptr + block_idx)
-        n_mask = offs_n < L - idx_n * BLOCK_N
-
-        k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
-        qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)
-        if L - idx_n * BLOCK_N < BLOCK_N:
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
-
-        v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
-        local_m = tl.max(qk, 1)
-        new_m = tl.maximum(m_i, local_m)
-        qk = qk - new_m[:, None]
-
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
-        alpha = tl.math.exp2(m_i - new_m)
-        o_s = o_s * alpha[:, None]
-        o_s += tl.dot(p.to(v.dtype), v)
-
-        l_i = l_i * alpha + l_ij
-        m_i = new_m
-
-    o_s = o_s / l_i[:, None]
-    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
-
-    m_i += tl.math.log2(l_i)
-    tl.store(LSE_ptrs, m_i, mask=offs_m < L)
-
-
-@triton.jit
 def _triton_attn_fwd(
     q_ptr,  # Q tensor
     q_stride_b,
@@ -474,8 +406,8 @@ class _attention(torch.autograd.Function):
                 BLOCK_Q,
                 BLOCK_KV,
                 sm_scale=None):
-        assert BLOCK_Q == 64 or BLOCK_Q == 128
-        assert BLOCK_KV == 64
+        assert BLOCK_Q in [64, 128]
+        assert BLOCK_KV in [64, 128]
 
         B, H, Lqo, Dqk = q.shape
         _, _, Lkv, Dvo = v.shape
@@ -620,25 +552,43 @@ class SparseLinearAttention(torch.nn.Module):
                  kernel_type='softmax',
                  BLOCK_Q=64,
                  BLOCK_KV=64,
-                 use_bf16=True):
+                 precision='bfloat16'):
         '''
-        Sparse Linear Attention.
-        o = sparse_attn + Proj(linear_atten)
-        Pc = softmax(pool(Q) @ pool(K))
-        Mc = 1 if Pc is in topk else 0
-        for j in range(0, L, BLOCK_KV):
-            if Mc = 1:
-                full attention
-            else:
-                linear attention
+        Sparse Linear Attention implementation that combines sparse attention with linear attention.
+        1. Compute sparse attention pattern using pooling:
+           prediction = softmax(pool(Q) @ pool(K))
+        2. Select top-k keys for each query block based on prediction
+        3. Apply full attention on selected blocks and linear attention on others
+        4. Combine both attention outputs: o = sparse_attn + Proj(linear_attention)
 
         Args:
-            head_dim: dimension of each head.
-            topk_ratio: ratio of keys selected for sparse attention, shared across all queries. Must be in (0, 1].
-            kernel_type: kernel type for linear attention, one of ['elu', 'relu', 'softmax'].
-            BLOCK_Q: block size for query.
-            BLOCK_KV: block size for key and value.
-            use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
+            head_dim (int): Dimension of each attention head. Must be positive.
+            topk_ratio (float): Ratio of keys selected for sparse attention, shared across all queries.
+                            Must be in (0, 1]. Larger values lead to denser attention patterns.
+            kernel_type (str): Kernel function for linear attention. Options:
+                            - 'elu': Exponential Linear Unit
+                            - 'relu': Rectified Linear Unit
+                            - 'softmax': Softmax activation
+            BLOCK_Q (int): Block size for query sequences. Must be 64 or 128 for optimal performance.
+            BLOCK_KV (int): Block size for key/value sequences. Must be 64 or 128 for optimal performance.
+            precision (str): Numerical precision for computation. Options:
+                            - 'bfloat16': Use bfloat16 precision (default)
+                            - 'float16': Use float16 precision
+                            The conversion to the target precision is handled internally.
+
+        Example:
+            >>> attn = SparseLinearAttention(
+            ...     head_dim=64,
+            ...     topk_ratio=0.3,
+            ...     kernel_type='softmax',
+            ...     BLOCK_Q=64,
+            ...     BLOCK_KV=64,
+            ...     use_bf16='bfloat16'
+            ... )
+            >>> q = torch.randn(2, 8, 128, 64)  # [batch, heads, seq_len, dim]
+            >>> k = torch.randn(2, 8, 128, 64)
+            >>> v = torch.randn(2, 8, 128, 64)
+            >>> output = attn(q, k, v)
         '''
 
         assert topk_ratio > 0 and topk_ratio <= 1, f'Invalid topk_ratio {topk_ratio}.'
@@ -646,7 +596,7 @@ class SparseLinearAttention(torch.nn.Module):
                                ], f'Not supported feature map {kernel_type}.'
 
         super().__init__()
-        self.dtype = torch.bfloat16 if use_bf16 else torch.float16
+        self.dtype = torch.bfloat16 if precision == 'bfloat16' else torch.float16
         self.topk_ratio = topk_ratio
         self.BLOCK_Q = BLOCK_Q
         self.BLOCK_KV = BLOCK_KV
