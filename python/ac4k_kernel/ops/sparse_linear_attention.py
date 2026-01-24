@@ -179,10 +179,14 @@ def _triton_attn_fwd(
     lse_stride_l,
     Lqo,
     Lkv,
+    Dqk,
+    Dvo,
     sm_scale,  # Softmax scale
     TOP_K: tl.constexpr,
     BLOCK_D_QK: tl.constexpr,
     BLOCK_D_VO: tl.constexpr,
+    PAD_D_QK: tl.constexpr,
+    PAD_D_VO: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
 ):
@@ -217,7 +221,11 @@ def _triton_attn_fwd(
 
     # TODO(mask D)
     # Pre-load Q
-    q = tl.load(q_ptrs, mask=offs_qo_l[:, None] < Lqo)
+    if PAD_D_QK:
+        q = tl.load(q_ptrs,
+                    mask=offs_qo_l[:, None] < Lqo and offs_qk_d[None, :] < Dqk)
+    else:
+        q = tl.load(q_ptrs, mask=offs_qo_l[:, None] < Lqo)
 
     # main loop
     for block_idx in tl.range(TOP_K):
@@ -228,8 +236,12 @@ def _triton_attn_fwd(
         kv_mask = offs_kv_l < Lkv - kv_index * BLOCK_KV
 
         # Load K
-        k = tl.load(k_ptrs + kv_index * BLOCK_KV * k_stride_l,
-                    mask=kv_mask[None, :])
+        if PAD_D_QK:
+            k = tl.load(k_ptrs + kv_index * BLOCK_KV * k_stride_l,
+                        mask=kv_mask[None, :] and offs_qk_d[:, None] < Dqk)
+        else:
+            k = tl.load(k_ptrs + kv_index * BLOCK_KV * k_stride_l,
+                        mask=kv_mask[None, :])
 
         # s = q @ k
         s = tl.dot(q, k) * (sm_scale * 1.4426950408889634)
@@ -239,8 +251,12 @@ def _triton_attn_fwd(
             s = tl.where(kv_mask[None, :], s, float("-inf"))
 
         # Load V
-        v = tl.load(v_ptrs + kv_index * BLOCK_KV * v_stride_l,
-                    mask=kv_mask[:, None])
+        if PAD_D_VO:
+            v = tl.load(v_ptrs + kv_index * BLOCK_KV * v_stride_l,
+                        mask=kv_mask[:, None] and offs_vo_d[None, :] < Dvo)
+        else:
+            v = tl.load(v_ptrs + kv_index * BLOCK_KV * v_stride_l,
+                        mask=kv_mask[:, None])
 
         # block max
         m_block = tl.max(s, 1)
@@ -260,9 +276,14 @@ def _triton_attn_fwd(
 
     # epilogue
     o = o * (1.0 / se[:, None])
-    tl.store(o_ptrs,
-             o.to(o_ptr.type.element_ty),
-             mask=offs_qo_l[:, None] < Lqo)
+    if PAD_D_VO:
+        tl.store(o_ptrs,
+                 o.to(o_ptr.type.element_ty),
+                 mask=offs_qo_l[:, None] < Lqo and offs_vo_d[None, :] < Dvo)
+    else:
+        tl.store(o_ptrs,
+                 o.to(o_ptr.type.element_ty),
+                 mask=offs_qo_l[:, None] < Lqo)
 
     # lse = m + log(se)
     tl.store(lse_ptrs, m + tl.math.log2(se), mask=offs_qo_l < Lqo)
@@ -502,13 +523,17 @@ class _attention(torch.autograd.Function):
                                lse.stride(2),
                                Lqo,
                                Lkv,
+                               Dqk,
+                               Dvo,
                                sm_scale,
                                TOP_K=lut.shape[-1],
                                BLOCK_D_QK=BLOCK_D_QK,
                                BLOCK_D_VO=BLOCK_D_VO,
+                               PAD_D_QK=BLOCK_D_QK > Dqk,
+                               PAD_D_VO=BLOCK_D_VO > Dvo,
                                BLOCK_Q=BLOCK_Q,
                                BLOCK_KV=BLOCK_KV,
-                               num_warps=4 if BLOCK_D_QK == 64 else 8,
+                               num_warps=_align_up(_ceil_div(BLOCK_Q, 16), 4),
                                num_stages=3)
 
         ctx.save_for_backward(q, k, v, sparse_mask, lut, lse, o)
