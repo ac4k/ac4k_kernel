@@ -3,57 +3,79 @@ import triton
 import triton.language as tl
 
 
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _align_up(a, b):
+    return _ceil_div(a, b) * b
+
+
 @triton.jit
-def compress_kernel(
-    X,
-    XM,
-    L: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_L: tl.constexpr,
-):
-    idx_l = tl.program_id(0)
-    idx_bh = tl.program_id(1)
+def _triton_mean_pool(X, Y, B, H, L, D, x_stride_b, x_stride_h, x_stride_l,
+                      x_stride_d, y_stride_b, y_stride_h, y_stride_l,
+                      y_stride_d, BLOCK_L: tl.constexpr,
+                      BLOCK_D: tl.constexpr):
+    pid_l = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
-    offs_l = idx_l * BLOCK_L + tl.arange(0, BLOCK_L)
-    offs_d = tl.arange(0, D)
+    offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_d = tl.arange(0, BLOCK_D) % D
 
-    x_offset = idx_bh * L * D
-    xm_offset = idx_bh * ((L + BLOCK_L - 1) // BLOCK_L) * D
-    x = tl.load(X + x_offset + offs_l[:, None] * D + offs_d[None, :],
-                mask=offs_l[:, None] < L)
+    x_offs = pid_b * x_stride_b + pid_h * x_stride_h + offs_l[:,
+                                                              None] * x_stride_l + offs_d[
+                                                                  None, :] * x_stride_d
+    x = tl.load(X + x_offs, mask=offs_l[:, None] < L)
 
-    nx = min(BLOCK_L, L - idx_l * BLOCK_L)
-    x_mean = tl.sum(x, axis=0, dtype=tl.float32) / nx
-    tl.store(XM + xm_offset + idx_l * D + offs_d,
-             x_mean.to(XM.dtype.element_ty))
+    num = min(BLOCK_L, L - pid_l * BLOCK_L)
+    x_mean = tl.sum(x, axis=0, dtype=tl.float32) / num
+
+    y_offs = pid_b * y_stride_b + pid_h * y_stride_h + pid_l * y_stride_l + offs_d * y_stride_d
+    tl.store(Y + y_offs, x_mean.to(Y.dtype.element_ty))
 
 
-def mean_pool(x, BLK):
-    assert x.is_contiguous()
+def mean_pool(x, WINDOW_SIZE):
+    assert WINDOW_SIZE == triton.next_power_of_2(WINDOW_SIZE)
 
     B, H, L, D = x.shape
-    L_BLOCKS = (L + BLK - 1) // BLK
-    x_mean = torch.empty((B, H, L_BLOCKS, D), device=x.device, dtype=x.dtype)
+    L_BLOCKS = _ceil_div(L, WINDOW_SIZE)
+    y = torch.empty((B, H, L_BLOCKS, D), device=x.device, dtype=x.dtype)
 
-    grid = (L_BLOCKS, B * H)
-    compress_kernel[grid](x, x_mean, L, D, BLK)
-    return x_mean
+    grid = (L_BLOCKS, H, B)
+    BLOCK_D = triton.next_power_of_2(D)
+    _triton_mean_pool[grid](x,
+                            y,
+                            B,
+                            H,
+                            L,
+                            D,
+                            x.stride(0),
+                            x.stride(1),
+                            x.stride(2),
+                            x.stride(3),
+                            y.stride(0),
+                            y.stride(1),
+                            y.stride(2),
+                            y.stride(3),
+                            BLOCK_L=WINDOW_SIZE,
+                            BLOCK_D=BLOCK_D)
+    return y
 
 
-def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
-    arg_k = k - torch.mean(k, dim=-2,
-                           keepdim=True)  # smooth-k technique in SageAttention
-    pooled_qblocks = mean_pool(q, BLKQ)
-    pooled_kblocks = mean_pool(arg_k, BLKK)
-    pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
+def get_sparse_map(q, k, topk_ratio, BLOCK_Q, BLOCK_K):
+    # Smooth
+    smooth_k = k - torch.mean(k, dim=-2, keepdim=True)
+    prediction = mean_pool(q, BLOCK_Q) @ mean_pool(smooth_k,
+                                                   BLOCK_K).transpose(-1, -2)
 
-    K = pooled_score.shape[-1]
-    topk = min(K, int(topk_ratio * K))
-    lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
+    topk = int(topk_ratio * prediction.shape[-1])
+    # Sparse attention loopup table
+    sa_lut = torch.topk(prediction, topk, dim=-1, sorted=False).indices
 
-    sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
-    sparse_map.scatter_(-1, lut, 1)
-    return sparse_map, lut, topk
+    sparse_mask = torch.zeros_like(prediction, dtype=torch.int8)
+    sparse_mask.scatter_(-1, sa_lut, 1)
+    return sparse_mask, sa_lut
 
 
 @triton.jit
@@ -122,6 +144,131 @@ def _attn_fwd(
 
     m_i += tl.math.log2(l_i)
     tl.store(LSE_ptrs, m_i, mask=offs_m < L)
+
+
+@triton.jit
+def _triton_attn_fwd(
+    q_ptr,  # Q tensor
+    q_stride_b,
+    q_stride_h,
+    q_stride_l,
+    q_stride_d,
+    k_ptr,  # K tensor
+    k_stride_b,
+    k_stride_h,
+    k_stride_l,
+    k_stride_d,
+    v_ptr,  # V tensor
+    v_stride_b,
+    v_stride_h,
+    v_stride_l,
+    v_stride_d,
+    sa_lut_ptr,  # Sparse attention loopup table tensor
+    sa_lut_stride_b,
+    sa_lut_stride_h,
+    sa_lut_stride_num_q,
+    sa_lut_stride_topk,
+    o_ptr,  # Output tensor
+    o_stride_b,
+    o_stride_h,
+    o_stride_l,
+    o_stride_d,
+    lse_ptr,  # LogSumExp tensor
+    lse_stride_b,
+    lse_stride_h,
+    lse_stride_l,
+    Lqo,
+    Lkv,
+    sm_scale,  # Softmax scale
+    TOP_K: tl.constexpr,
+    BLOCK_D_QK: tl.constexpr,
+    BLOCK_D_VO: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    pid_l = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    pid_b = tl.program_id(2).to(tl.int64)
+
+    # TODO(bug): triton has bug with the flowing code
+    # offs_qo_l = (pid_l * BLOCK_Q + tl.arange(0, BLOCK_Q)) % Lqo
+    offs_qo_l = pid_l * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    offs_kv_l = tl.arange(0, BLOCK_KV)
+    offs_qk_d = tl.arange(0, BLOCK_D_QK)
+    offs_vo_d = tl.arange(0, BLOCK_D_VO)
+
+    q_ptrs = q_ptr + pid_b * q_stride_b + pid_h * q_stride_h + offs_qo_l[:, None] * q_stride_l + offs_qk_d[
+        None, :] * q_stride_d
+    k_ptrs = k_ptr + pid_b * k_stride_b + pid_h * k_stride_h + offs_kv_l[
+        None, :] * k_stride_l + offs_qk_d[:, None] * k_stride_d
+    v_ptrs = v_ptr + pid_b * v_stride_b + pid_h * v_stride_h + offs_kv_l[:, None] * v_stride_l + offs_vo_d[
+        None, :] * v_stride_d
+    o_ptrs = o_ptr + pid_b * o_stride_b + pid_h * o_stride_h + offs_qo_l[:, None] * o_stride_l + offs_vo_d[
+        None, :] * o_stride_d
+    lse_ptrs = lse_ptr + pid_b * lse_stride_b + pid_h * lse_stride_h + offs_qo_l * lse_stride_l
+
+    # Init m/l/o
+    # Max
+    m = tl.full([BLOCK_Q], -float('inf'), dtype=tl.float32)
+    # SumExp
+    se = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    # Attention out
+    o = tl.zeros([BLOCK_Q, BLOCK_D_VO], dtype=tl.float32)
+
+    # TODO(mask D)
+    # Pre-load Q
+    q = tl.load(q_ptrs, mask=offs_qo_l[:, None] < Lqo)
+
+    # main loop
+    for block_idx in tl.range(TOP_K):
+        kv_index = tl.load(sa_lut_ptr + pid_b * sa_lut_stride_b +
+                           pid_h * sa_lut_stride_h +
+                           pid_l * sa_lut_stride_num_q +
+                           block_idx * sa_lut_stride_topk)
+        kv_mask = offs_kv_l < Lkv - kv_index * BLOCK_KV
+
+        # Load K
+        k = tl.load(k_ptrs + kv_index * BLOCK_KV * k_stride_l,
+                    mask=kv_mask[None, :])
+
+        # s = q @ k
+        s = tl.dot(q, k) * (sm_scale * 1.4426950408889634)
+
+        # Mask to -inf, so that softmax will zero out these positions
+        if Lkv - kv_index * BLOCK_KV < BLOCK_KV:
+            s = tl.where(kv_mask[None, :], s, float("-inf"))
+
+        # Load V
+        v = tl.load(v_ptrs + kv_index * BLOCK_KV * v_stride_l,
+                    mask=kv_mask[:, None])
+
+        # block max
+        m_block = tl.max(s, 1)
+        m_new = tl.maximum(m, m_block)
+
+        # softmax
+        p = tl.math.exp2(s - m_new[:, None])
+
+        # block sumexp
+        se_block = tl.sum(p, 1)
+
+        # block o = p @ v
+        o_block = tl.dot(p.to(v.dtype), v)
+
+        # update m/l/o
+        scale = tl.math.exp2(m - m_new)
+        o = o * scale[:, None] + o_block
+        se = se * scale + se_block
+        m = m_new
+
+    # epilogue
+    o = o * (1.0 / se[:, None])
+    tl.store(o_ptrs,
+             o.to(o_ptr.type.element_ty),
+             mask=offs_qo_l[:, None] < Lqo)
+
+    # lse = m + log(se)
+    tl.store(lse_ptrs, m + tl.math.log2(se), mask=offs_qo_l < Lqo)
 
 
 @triton.jit
@@ -271,8 +418,7 @@ def _attn_bwd_dkdv(
             m_mask = offs_m < L - idx_m
             q = tl.load(Q_ptrs, mask=m_mask[:, None])
             lse = tl.load(LSE_ptrs, mask=m_mask, other=float("inf"))
-            qkT = tl.dot(k, q.T) * (qk_scale * 1.4426950408889634
-                                    )  # = 1 / ln(2)
+            qkT = tl.dot(k, q.T) * (qk_scale * 1.4426950408889634)
             pT = tl.math.exp2(qkT - lse[None, :])
             pT = tl.where(offs_n[:, None] < L, pT, 0.0)
 
@@ -301,59 +447,86 @@ def _attn_bwd_dkdv(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx,
-                q,
-                k,
-                v,
-                k_block_id,
-                lut,
-                topk,
-                BLOCK_M,
-                BLOCK_N,
-                qk_scale=None):
-        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-        assert k_block_id.is_contiguous() and lut.is_contiguous()
+    def forward(
+            ctx,
+            q,
+            k,
+            v,
+            sparse_mask,
+            lut,
+            # topk,
+            BLOCK_Q,
+            BLOCK_KV,
+            sm_scale=None):
+        #####################
+        assert BLOCK_Q == 64 or BLOCK_Q == 128
+        assert BLOCK_KV == 64
 
-        # We recommend the following two settings
-        assert BLOCK_M == 64 or BLOCK_M == 128
-        assert BLOCK_N == 64
+        B, H, Lqo, Dqk = q.shape
+        _, _, Lkv, Dvo = v.shape
 
-        B, H, L, D = q.shape
-        if qk_scale is None:
-            qk_scale = D**-0.5
+        # Scale for Q @ K^T
+        if sm_scale is None:
+            sm_scale = Dqk**-0.5
 
-        M_BLOCKS = triton.cdiv(L, BLOCK_M)
+        # Attention output
+        o = torch.empty([B, H, Lqo, Dvo], device=q.device, dtype=q.dtype)
+        # LogSumExp for backward with shape [B, H, Lqo]
+        lse = torch.empty([B, H, Lqo], device=q.device, dtype=torch.float32)
 
-        o_s = torch.empty_like(v)
-        lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+        grid = (_ceil_div(Lqo, BLOCK_Q), H, B)
+        BLOCK_D_QK = triton.next_power_of_2(Dqk)
+        BLOCK_D_VO = triton.next_power_of_2(Dvo)
+        _triton_attn_fwd[grid](q,
+                               q.stride(0),
+                               q.stride(1),
+                               q.stride(2),
+                               q.stride(3),
+                               k,
+                               k.stride(0),
+                               k.stride(1),
+                               k.stride(2),
+                               k.stride(3),
+                               v,
+                               v.stride(0),
+                               v.stride(1),
+                               v.stride(2),
+                               v.stride(3),
+                               lut,
+                               lut.stride(0),
+                               lut.stride(1),
+                               lut.stride(2),
+                               lut.stride(3),
+                               o,
+                               o.stride(0),
+                               o.stride(1),
+                               o.stride(2),
+                               o.stride(3),
+                               lse,
+                               lse.stride(0),
+                               lse.stride(1),
+                               lse.stride(2),
+                               Lqo,
+                               Lkv,
+                               sm_scale,
+                               TOP_K=lut.shape[-1],
+                               BLOCK_D_QK=BLOCK_D_QK,
+                               BLOCK_D_VO=BLOCK_D_VO,
+                               BLOCK_Q=BLOCK_Q,
+                               BLOCK_KV=BLOCK_KV,
+                               num_warps=4 if BLOCK_D_QK == 64 else 8,
+                               num_stages=3)
 
-        grid = (M_BLOCKS, B * H)
-        _attn_fwd[grid](q,
-                        k,
-                        v,
-                        qk_scale,
-                        topk,
-                        lut,
-                        lse,
-                        o_s,
-                        L,
-                        M_BLOCKS,
-                        D,
-                        BLOCK_M,
-                        BLOCK_N,
-                        num_warps=4 if q.shape[-1] == 64 else 8,
-                        num_stages=3)
-
-        ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
-        ctx.qk_scale = qk_scale
-        ctx.topk = topk
-        ctx.BLOCK_M = BLOCK_M
-        ctx.BLOCK_N = BLOCK_N
-        return o_s
+        ctx.save_for_backward(q, k, v, sparse_mask, lut, lse, o)
+        ctx.sm_scale = sm_scale
+        ctx.topk = lut.shape[-1]
+        ctx.BLOCK_M = BLOCK_Q
+        ctx.BLOCK_N = BLOCK_KV
+        return o
 
     @staticmethod
     def backward(ctx, do_s):
-        q, k, v, k_block_id, lut, lse, o_s = ctx.saved_tensors
+        q, k, v, sparse_mask, lut, lse, o_s = ctx.saved_tensors
         do_s = do_s.contiguous()
 
         BLOCK_M, BLOCK_N = ctx.BLOCK_M, ctx.BLOCK_N
@@ -386,7 +559,7 @@ class _attention(torch.autograd.Function):
                            do_s,
                            dq,
                            lut,
-                           ctx.qk_scale,
+                           ctx.sm_scale,
                            ctx.topk,
                            L,
                            M_BLOCKS,
@@ -403,8 +576,8 @@ class _attention(torch.autograd.Function):
                              do_s,
                              dk,
                              dv,
-                             ctx.qk_scale,
-                             k_block_id,
+                             ctx.sm_scale,
+                             sparse_mask,
                              lse,
                              delta_s,
                              L,
@@ -442,13 +615,14 @@ class SparseLinearAttention(torch.nn.Module):
 
         Args:
             head_dim: dimension of each head.
-            topk_ratio: ratio of keys selected for sparse attention, shared across all queries.
+            topk_ratio: ratio of keys selected for sparse attention, shared across all queries. Must be in (0, 1].
             kernel_type: kernel type for linear attention, one of ['elu', 'relu', 'softmax'].
             BLOCK_Q: block size for query.
             BLOCK_KV: block size for key and value.
             use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
         '''
 
+        assert topk_ratio > 0 and topk_ratio <= 1, f'Invalid topk_ratio {topk_ratio}.'
         assert kernel_type in ['elu', 'relu', 'softmax'
                                ], f'Not supported feature map {kernel_type}.'
 
@@ -484,13 +658,12 @@ class SparseLinearAttention(torch.nn.Module):
             torch.nn.init.zeros_(self.proj_l.weight)
             torch.nn.init.zeros_(self.proj_l.bias)
 
-    def forward(self, q, k, v, return_sparsity=False):
+    def forward(self, q, k, v):
         '''
         Args:
             q: queries of shape (B, H, L, D).
             k: keys of shape (B, H, L, D).
             v: values of shape (B, H, L, D).
-            return_sparsity: whether to return the actual sparsity.
         '''
         dtype = q.dtype
 
@@ -499,18 +672,16 @@ class SparseLinearAttention(torch.nn.Module):
         k = k.contiguous()
         v = v.contiguous()
 
-        # Sparse attention
-        sparse_map, lut, real_topk = get_block_map(q,
-                                                   k,
-                                                   topk_ratio=self.topk_ratio,
-                                                   BLKQ=self.BLOCK_Q,
-                                                   BLKK=self.BLOCK_KV)
+        # Sparse prediction
+        # Sparse mask, sparse lookup table
+        sparse_mask, sa_lut = get_sparse_map(q, k, self.topk_ratio,
+                                             self.BLOCK_Q, self.BLOCK_KV)
 
         q = q.to(self.dtype)
         k = k.to(self.dtype)
         v = v.to(self.dtype)
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk,
-                               self.BLOCK_Q, self.BLOCK_KV)
+        o_s = _attention.apply(q, k, v, sparse_mask, sa_lut, self.BLOCK_Q,
+                               self.BLOCK_KV)
 
         # Linear attention
         def linear_attn(q, k, v):
@@ -527,7 +698,4 @@ class SparseLinearAttention(torch.nn.Module):
             o_l = self.proj_l(o_l)
         o = (o_s + o_l).to(dtype)
 
-        if return_sparsity:
-            return o, real_topk / sparse_map.shape[-1]
-        else:
-            return o
+        return o

@@ -1,6 +1,8 @@
 import torch
 from ac4k_kernel.ops import SparseLinearAttention
 
+torch.manual_seed(9567)
+
 attn = SparseLinearAttention(
     128,
     0.2,
@@ -37,3 +39,6 @@ torch.cuda.synchronize()  # Wait for the events to be recorded
 elapsed_time = start_event.elapsed_time(end_event) / repeat
 
 print(f"Average time per attention: {elapsed_time} ms")
+
+print("o[:2,:2,:2,:2]")
+print(o[:2, :2, :2, :2])
