@@ -252,12 +252,9 @@ def _triton_attn_fwd(
         # block sumexp
         se_block = tl.sum(p, 1)
 
-        # block o = p @ v
-        o_block = tl.dot(p.to(v.dtype), v)
-
         # update m/l/o
         scale = tl.math.exp2(m - m_new)
-        o = o * scale[:, None] + o_block
+        o = o * scale[:, None] + tl.dot(p.to(v.dtype), v)
         se = se * scale + se_block
         m = m_new
 
@@ -351,7 +348,7 @@ def _attn_bwd_dq(
 
         k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
         v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
-        qk = tl.dot(q, k.T) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
+        qk = tl.dot(q, k.T) * (qk_scale * 1.4426950408889634)
         p = tl.math.exp2(qk - lse[:, None])
         p = tl.where(n_mask[None, :], p, 0.0)
 
@@ -447,18 +444,15 @@ def _attn_bwd_dkdv(
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(
-            ctx,
-            q,
-            k,
-            v,
-            sparse_mask,
-            lut,
-            # topk,
-            BLOCK_Q,
-            BLOCK_KV,
-            sm_scale=None):
-        #####################
+    def forward(ctx,
+                q,
+                k,
+                v,
+                sparse_mask,
+                lut,
+                BLOCK_Q,
+                BLOCK_KV,
+                sm_scale=None):
         assert BLOCK_Q == 64 or BLOCK_Q == 128
         assert BLOCK_KV == 64
 
