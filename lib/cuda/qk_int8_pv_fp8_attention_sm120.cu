@@ -635,6 +635,8 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
           s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
                 [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 
+      float qk_scale = sm_scale * q_sf_frag * k_sf_frag;
+
 #pragma unroll
       for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
@@ -646,10 +648,11 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
           auto *in_i32 = reinterpret_cast<int32_t *>(s_frag_i32[i][j].data);
           auto *out_f32 = reinterpret_cast<float *>(s_frag[i][j].data);
-          out_f32[0] = __int2float_rz(in_i32[0]);
-          out_f32[1] = __int2float_rz(in_i32[1]);
-          out_f32[2] = __int2float_rz(in_i32[2]);
-          out_f32[3] = __int2float_rz(in_i32[3]);
+
+          out_f32[0] = __int2float_rz(in_i32[0]) * qk_scale;
+          out_f32[1] = __int2float_rz(in_i32[1]) * qk_scale;
+          out_f32[2] = __int2float_rz(in_i32[2]) * qk_scale;
+          out_f32[3] = __int2float_rz(in_i32[3]) * qk_scale;
         }
       }
 
@@ -675,8 +678,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         }
       }
 
-      float qk_scale = sm_scale * q_sf_frag * k_sf_frag;
-
       /// Step 2: max = rowmax(S)
       float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
       float max_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
@@ -689,6 +690,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         for (int j = 0;
              j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
+
           max_new0[i] = fmaxf(max_new0[i], data[0]);
           max_new0[i] = fmaxf(max_new0[i], data[1]);
           max_new1[i] = fmaxf(max_new1[i], data[2]);
@@ -702,9 +704,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
         max_new1[i] =
             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
-
-        max_new0[i] = fmaf(max_new0[i], qk_scale, -Policy::EXP_OFFSET);
-        max_new1[i] = fmaf(max_new1[i], qk_scale, -Policy::EXP_OFFSET);
       } // end loop i
 
       /// Step 3: p = exp(S - max)
@@ -718,10 +717,11 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         for (int j = 0;
              j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
-          p_frag[i][j].data[0] = exp2f(fmaf(data[0], qk_scale, -max_new0[i]));
-          p_frag[i][j].data[1] = exp2f(fmaf(data[1], qk_scale, -max_new0[i]));
-          p_frag[i][j].data[2] = exp2f(fmaf(data[2], qk_scale, -max_new1[i]));
-          p_frag[i][j].data[3] = exp2f(fmaf(data[3], qk_scale, -max_new1[i]));
+
+          p_frag[i][j].data[0] = exp2f(data[0] - max_new0[i]);
+          p_frag[i][j].data[1] = exp2f(data[1] - max_new0[i]);
+          p_frag[i][j].data[2] = exp2f(data[2] - max_new1[i]);
+          p_frag[i][j].data[3] = exp2f(data[3] - max_new1[i]);
         } // end loop j
       } // end loop i
 

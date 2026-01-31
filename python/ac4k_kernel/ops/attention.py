@@ -31,12 +31,12 @@ def _triton_token_quantize(x_ptr, x_b_stride, x_h_stride, x_n_stride,
     x_ptrs = x_ptr + pid_b * x_b_stride + pid_h * x_h_stride + offs_n[:, None] * x_n_stride + offs_d[
         None, :] * x_d_stride
     x = tl.load(x_ptrs, mask=(offs_n[:, None] < n) & (offs_d[None, :] < d))
-    scale = tl.max(tl.abs(x)) / 127
+    scale = tl.max(tl.abs(x)).to(tl.float32) / 127
 
     if scale == 0:
         y = tl.full([BLOCK_N, BLOCK_D], 0, dtype=tl.int8)
     else:
-        y = tl.cast(x / scale, dtype=tl.int8)
+        y = tl.cast(x.to(tl.float32) / scale, dtype=tl.int8)
 
     tl.store(
         scale_ptr + pid_b * scale_b_stride + pid_h * scale_h_stride +
