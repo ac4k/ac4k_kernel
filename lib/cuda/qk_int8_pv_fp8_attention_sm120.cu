@@ -704,6 +704,9 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
         max_new1[i] =
             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
+
+        max_new0[i] -= Policy::EXP_OFFSET;
+        max_new1[i] -= Policy::EXP_OFFSET;
       } // end loop i
 
       /// Step 3: p = exp(S - max)
