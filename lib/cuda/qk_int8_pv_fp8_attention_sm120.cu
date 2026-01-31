@@ -13,6 +13,9 @@
 #include "ac4k_kernel/ops/cuda_ops.h"
 #include "utils.cuh"
 
+constexpr int Q_QUANTIZE_BLOCK_SIZE = 64;
+constexpr int K_QUANTIZE_BLOCK_SIZE = 128;
+
 #define CHECK_TYPE(x, st, m)                                                   \
   TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
@@ -141,14 +144,14 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
   static constexpr int Q_SMEM_OFF = 0;
   static constexpr int K_SMEM_OFF = Q_SMEM_OFF + TILE_Q_BLOCK_SIZE;
   static constexpr int V_SMEM_OFF = K_SMEM_OFF + TILE_K_BLOCK_SIZE * STAGE;
-  static constexpr int Q_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE * STAGE;
-  static constexpr int K_SF_SMEM_OFF = Q_SF_SMEM_OFF + TILE_Q_SF_BLOCK_SIZE;
-  static constexpr int V_SF_SMEM_OFF =
-      K_SF_SMEM_OFF + TILE_K_SF_BLOCK_SIZE * STAGE;
+  // static constexpr int Q_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE *
+  // STAGE; static constexpr int K_SF_SMEM_OFF = Q_SF_SMEM_OFF +
+  // TILE_Q_SF_BLOCK_SIZE; static constexpr int V_SF_SMEM_OFF =
+  //     K_SF_SMEM_OFF + TILE_K_SF_BLOCK_SIZE * STAGE;
+  static constexpr int V_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE * STAGE;
   static constexpr int SMEM_SIZE =
       TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE * STAGE +
-      TILE_V_BLOCK_SIZE * STAGE + TILE_Q_SF_BLOCK_SIZE +
-      TILE_K_SF_BLOCK_SIZE * STAGE + TILE_V_SF_BLOCK_SIZE;
+      TILE_V_BLOCK_SIZE * STAGE + TILE_V_SF_BLOCK_SIZE;
   static __forceinline__ __device__ Q_TYPE *get_q_stage_mem(char *smem,
                                                             int stage) {
     (void)stage;
@@ -164,16 +167,18 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
     return reinterpret_cast<V_TYPE *>(smem + V_SMEM_OFF +
                                       TILE_V_BLOCK_SIZE * stage);
   }
-  static __forceinline__ __device__ Q_SF_TYPE *get_q_sf_stage_mem(char *smem,
-                                                                  int stage) {
-    (void)stage;
-    return reinterpret_cast<Q_SF_TYPE *>(smem + Q_SF_SMEM_OFF);
-  }
-  static __forceinline__ __device__ K_SF_TYPE *get_k_sf_stage_mem(char *smem,
-                                                                  int stage) {
-    return reinterpret_cast<K_SF_TYPE *>(smem + K_SF_SMEM_OFF +
-                                         TILE_K_SF_BLOCK_SIZE * stage);
-  }
+  // static __forceinline__ __device__ Q_SF_TYPE *get_q_sf_stage_mem(char *smem,
+  //                                                                 int stage)
+  //                                                                 {
+  //   (void)stage;
+  //   return reinterpret_cast<Q_SF_TYPE *>(smem + Q_SF_SMEM_OFF);
+  // }
+  // static __forceinline__ __device__ K_SF_TYPE *get_k_sf_stage_mem(char *smem,
+  //                                                                 int stage)
+  //                                                                 {
+  //   return reinterpret_cast<K_SF_TYPE *>(smem + K_SF_SMEM_OFF +
+  //                                        TILE_K_SF_BLOCK_SIZE * stage);
+  // }
   static __forceinline__ __device__ V_SF_TYPE *get_v_sf_stage_mem(char *smem,
                                                                   int stage) {
     (void)stage;
@@ -350,13 +355,14 @@ template <typename Policy>
 __launch_bounds__(Policy::THREAD_NUM, 1) __global__
     void qk_int8_pv_fp8_mha_fwd_sm120_kernel(
         BF16 *__restrict__ O, int64_t o_b_stride, int64_t o_h_stride,
-        int64_t o_n_stride, int64_t o_d_stride, int64_t B, int64_t H,
-        int64_t Nq, int64_t Nkv, int64_t Dqk, int64_t Dv, float sm_scale,
+        int64_t o_n_stride, int64_t o_d_stride, float *__restrict__ Q_SF,
+        int64_t q_sf_b_stride, int64_t q_sf_h_stride, int64_t q_sf_n_stride,
+        float *__restrict__ K_SF, int64_t k_sf_b_stride, int64_t k_sf_h_stride,
+        int64_t k_sf_n_stride, int64_t B, int64_t H, int64_t Nq, int64_t Nkv,
+        int64_t Dqk, int64_t Dv, float sm_scale,
         const __grid_constant__ CUtensorMap q_tensor_map,
         const __grid_constant__ CUtensorMap k_tensor_map,
         const __grid_constant__ CUtensorMap v_tensor_map,
-        const __grid_constant__ CUtensorMap q_sf_tensor_map,
-        const __grid_constant__ CUtensorMap k_sf_tensor_map,
         const __grid_constant__ CUtensorMap v_sf_tensor_map) {
   int block_b = blockIdx.z;                            // batch
   int block_h = blockIdx.y;                            // head
@@ -425,22 +431,23 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       wait(&empty_bar[stage], phase);
       load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
                     &full_bar[stage], block_b, block_h, block_dot_m, 0);
-      load_4d_async(Policy::get_q_sf_stage_mem(smem, stage), &q_sf_tensor_map,
-                    &full_bar[stage], 0, block_b, block_h, block_dot_m);
+      // load_4d_async(Policy::get_q_sf_stage_mem(smem, stage),
+      // &q_sf_tensor_map,
+      //               &full_bar[stage], 0, block_b, block_h, block_dot_m);
       load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
                     &full_bar[stage], block_b, block_h, 0, 0);
-      load_4d_async(Policy::get_k_sf_stage_mem(smem, stage), &k_sf_tensor_map,
-                    &full_bar[stage], 0, block_b, block_h, 0);
+      // load_4d_async(Policy::get_k_sf_stage_mem(smem, stage),
+      // &k_sf_tensor_map,
+      //               &full_bar[stage], 0, block_b, block_h, 0);
       load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
                     &full_bar[stage], block_b, block_h, 0, 0);
       load_4d_async(Policy::get_v_sf_stage_mem(smem, stage), &v_sf_tensor_map,
                     &full_bar[stage], 0, block_b, block_h, 0);
       /// Commit
-      expect_bytes(
-          &full_bar[stage],
-          Policy::TILE_Q_BLOCK_SIZE + Policy::TILE_K_BLOCK_SIZE +
-              Policy::TILE_V_BLOCK_SIZE + Policy::TILE_Q_SF_BLOCK_SIZE +
-              Policy::TILE_K_SF_BLOCK_SIZE + Policy::TILE_V_SF_BLOCK_SIZE);
+      expect_bytes(&full_bar[stage], Policy::TILE_Q_BLOCK_SIZE +
+                                         Policy::TILE_K_BLOCK_SIZE +
+                                         Policy::TILE_V_BLOCK_SIZE +
+                                         Policy::TILE_V_SF_BLOCK_SIZE);
 
       ++stage;
 
@@ -458,15 +465,15 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         /// TMA K/V and K_SF/V_SF
         load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
                       &full_bar[stage], block_b, block_h, dot0_n, 0);
-        load_4d_async(Policy::get_k_sf_stage_mem(smem, stage), &k_sf_tensor_map,
-                      &full_bar[stage], 0, block_b, block_h, dot0_n);
+        // load_4d_async(Policy::get_k_sf_stage_mem(smem, stage),
+        // &k_sf_tensor_map,
+        //               &full_bar[stage], 0, block_b, block_h, dot0_n);
         load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
                       &full_bar[stage], block_b, block_h, 0, dot0_n);
 
         /// Commit
-        expect_bytes(&full_bar[stage], Policy::TILE_K_BLOCK_SIZE +
-                                           Policy::TILE_V_BLOCK_SIZE +
-                                           Policy::TILE_K_SF_BLOCK_SIZE);
+        expect_bytes(&full_bar[stage],
+                     Policy::TILE_K_BLOCK_SIZE + Policy::TILE_V_BLOCK_SIZE);
       }
     }
   } // end if (is_producer)
@@ -495,6 +502,9 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
     AFrag_I8_16x32
         q_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
               [Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K];
+    float q_sf_frag =
+        Q_SF[block_b * q_sf_b_stride + block_h * q_sf_h_stride +
+             (block_n + warp_dot0_m) / Q_QUANTIZE_BLOCK_SIZE * q_sf_n_stride];
     /// max(row max of S=Q @ K)
     float max0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
     float max1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
@@ -571,6 +581,17 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         } // end loop j
       } // end if (dot0_n == 0) leading
 
+      /// Load K_SF
+      // float k_sf_frag[(Policy::TILE_DOT0_WARP_N + K_QUANTIZE_BLOCK_SIZE - 1)
+      // / K_QUANTIZE_BLOCK_SIZE]; #pragma unroll for (int i = 0; i <
+      // Policy::TILE_DOT0_WARP_N; i += K_QUANTIZE_BLOCK_SIZE) {
+      //   k_sf_frag[i / K_QUANTIZE_BLOCK_SIZE] = Q_SF[block_b * k_sf_b_stride +
+      //   block_h * k_sf_h_stride + (warp_dot0_n + i) / K_QUANTIZE_BLOCK_SIZE *
+      //   k_sf_n_stride];
+      // }
+      float k_sf_frag = K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
+                             dot0_n / K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
+
       /// S: I32
       DFrag_I32_16x8
           s_frag_i32[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
@@ -638,6 +659,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       DFrag_F32_16x8
           s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
                 [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
+
 #pragma unroll
       for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
@@ -649,26 +671,10 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
           auto *in_i32 = reinterpret_cast<int32_t *>(s_frag_i32[i][j].data);
           auto *out_f32 = reinterpret_cast<float *>(s_frag[i][j].data);
-
-          int lane_m0 = s_frag[i][j].get_row_with_reg(lane_id, 0);
-          int lane_n0 = s_frag[i][j].get_col_with_reg(lane_id, 0);
-          float q_scale0 = Policy::get_q_sf_stage_mem(
-              smem, stage)[warp_dot0_m + atomic_m + lane_m0];
-          float k_scale0 = Policy::get_k_sf_stage_mem(
-              smem, stage)[warp_dot0_n + atomic_n + lane_n0];
-          out_f32[0] =
-              __int2float_rz(in_i32[0]) * q_scale0 * k_scale0 * sm_scale;
-          float k_scale1 = Policy::get_k_sf_stage_mem(
-              smem, stage)[warp_dot0_n + atomic_n + lane_n0 + 1];
-          out_f32[1] =
-              __int2float_rz(in_i32[1]) * q_scale0 * k_scale1 * sm_scale;
-          int lane_m1 = s_frag[i][j].get_row_with_reg(lane_id, 2);
-          float q_scale1 = Policy::get_q_sf_stage_mem(
-              smem, stage)[warp_dot0_m + atomic_m + lane_m1];
-          out_f32[2] =
-              __int2float_rz(in_i32[2]) * q_scale1 * k_scale0 * sm_scale;
-          out_f32[3] =
-              __int2float_rz(in_i32[3]) * q_scale1 * k_scale1 * sm_scale;
+          out_f32[0] = __int2float_rz(in_i32[0]);
+          out_f32[1] = __int2float_rz(in_i32[1]);
+          out_f32[2] = __int2float_rz(in_i32[2]);
+          out_f32[3] = __int2float_rz(in_i32[3]);
         }
       }
 
@@ -693,6 +699,8 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
           }
         }
       }
+
+      float qk_scale = sm_scale * q_sf_frag * k_sf_frag;
 
       /// Step 2: max = rowmax(S)
       float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
@@ -720,8 +728,8 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         max_new1[i] =
             fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
 
-        max_new0[i] -= Policy::EXP_OFFSET;
-        max_new1[i] -= Policy::EXP_OFFSET;
+        max_new0[i] = fmaf(max_new0[i], qk_scale, -Policy::EXP_OFFSET);
+        max_new1[i] = fmaf(max_new1[i], qk_scale, -Policy::EXP_OFFSET);
       } // end loop i
 
       /// Step 3: p = exp(S - max)
@@ -735,10 +743,10 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         for (int j = 0;
              j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
-          p_frag[i][j].data[0] = exp2f(data[0] - max_new0[i]);
-          p_frag[i][j].data[1] = exp2f(data[1] - max_new0[i]);
-          p_frag[i][j].data[2] = exp2f(data[2] - max_new1[i]);
-          p_frag[i][j].data[3] = exp2f(data[3] - max_new1[i]);
+          p_frag[i][j].data[0] = exp2f(fmaf(data[0], qk_scale, -max_new0[i]));
+          p_frag[i][j].data[1] = exp2f(fmaf(data[1], qk_scale, -max_new0[i]));
+          p_frag[i][j].data[2] = exp2f(fmaf(data[2], qk_scale, -max_new1[i]));
+          p_frag[i][j].data[3] = exp2f(fmaf(data[3], qk_scale, -max_new1[i]));
         } // end loop j
       } // end loop i
 
@@ -763,34 +771,57 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
 
-        // Update l
-        l0[i] = fma(exp2f(max0[i] - max_new0[i]), l0[i], l_new0[i]);
-        l1[i] = fma(exp2f(max1[i] - max_new1[i]), l1[i], l_new1[i]);
+        // // Update l
+        // l0[i] = fmaf(exp2f(max0[i] - max_new0[i]), l0[i], l_new0[i]);
+        // l1[i] = fmaf(exp2f(max1[i] - max_new1[i]), l1[i], l_new1[i]);
       } // end loop i
 
-      /// Step 4: o = expf(max - max_new) * o
-
+      /// max scale
+      float max_scale0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+      float max_scale1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
-#pragma unroll
-        for (int j = 0;
-             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
-          o_frag[i][j].data[0] *= exp2f(max0[i] - max_new0[i]);
-          o_frag[i][j].data[1] *= exp2f(max0[i] - max_new0[i]);
-          o_frag[i][j].data[2] *= exp2f(max1[i] - max_new1[i]);
-          o_frag[i][j].data[3] *= exp2f(max1[i] - max_new1[i]);
-        }
+        max_scale0[i] = exp2f(max0[i] - max_new0[i]);
+        max_scale1[i] = exp2f(max1[i] - max_new1[i]);
       }
 
-      /// Update max
-
+      /// update max and sumexp
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
         max0[i] = max_new0[i];
         max1[i] = max_new1[i];
+        l0[i] = fmaf(l0[i], max_scale0[i], l_new0[i]);
+        l1[i] = fmaf(l1[i], max_scale1[i], l_new1[i]);
       }
+
+      //       /// Step 4: o = expf(max - max_new) * o
+
+      // #pragma unroll
+      //       for (int i = 0; i < Policy::TILE_DOT1_WARP_M /
+      //       Policy::TILE_DOT0_ATOMIC_M;
+      //            ++i) {
+      // #pragma unroll
+      //         for (int j = 0;
+      //              j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
+      //              ++j) {
+      //           o_frag[i][j].data[0] *= exp2f(max0[i] - max_new0[i]);
+      //           o_frag[i][j].data[1] *= exp2f(max0[i] - max_new0[i]);
+      //           o_frag[i][j].data[2] *= exp2f(max1[i] - max_new1[i]);
+      //           o_frag[i][j].data[3] *= exp2f(max1[i] - max_new1[i]);
+      //         }
+      //       }
+
+      //       /// Update max
+
+      // #pragma unroll
+      //       for (int i = 0; i < Policy::TILE_DOT1_WARP_M /
+      //       Policy::TILE_DOT0_ATOMIC_M;
+      //            ++i) {
+      //         max0[i] = max_new0[i];
+      //         max1[i] = max_new1[i];
+      //       }
 
       /// Step 5: o = P @ V
       AFrag_FP8_16x32
@@ -878,12 +909,24 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
           /// update o = o + f32(o_block_f16)
 
-#pragma unroll
-          for (int k = 0; k < o_block_f16.ELES_PER_THREAD; ++k) {
-            __half *in_u16 = reinterpret_cast<__half *>(o_block_f16.data);
-            o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[k] +=
-                __half2float(in_u16[k]);
-          }
+          __half *in_u16 = reinterpret_cast<__half *>(o_block_f16.data);
+          float *o_f32 = o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data;
+          o_f32[0] = fmaf(o_f32[0], max_scale0[dot1_atomic_m_cnt],
+                          __half2float(in_u16[0]));
+          o_f32[1] = fmaf(o_f32[1], max_scale0[dot1_atomic_m_cnt],
+                          __half2float(in_u16[1]));
+          o_f32[2] = fmaf(o_f32[2], max_scale1[dot1_atomic_m_cnt],
+                          __half2float(in_u16[2]));
+          o_f32[3] = fmaf(o_f32[3], max_scale1[dot1_atomic_m_cnt],
+                          __half2float(in_u16[3]));
+
+          // #pragma unroll
+          //           for (int k = 0; k < o_block_f16.ELES_PER_THREAD; ++k) {
+          //             __half *in_u16 = reinterpret_cast<__half
+          //             *>(o_block_f16.data);
+          //             o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[k] +=
+          //                 __half2float(in_u16[k]);
+          //           }
         } // end loop dot1_atomic_n
       } // end loop dot1_atomic_m
 
@@ -1007,9 +1050,8 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
               q_sf.size(0), "==", B);
   TORCH_CHECK(q_sf.size(1) == H, "Meet invalid Q_SF size(1) with ",
               q_sf.size(1), "==", H);
-  TORCH_CHECK(q_sf.size(2) == align_up(Nq, 16),
-              "Meet invalid Q_SF size(2) with ", q_sf.size(2),
-              "==", align_up(Nq, 16));
+  TORCH_CHECK(q_sf.size(2) == ceil_div(Nq, Q_QUANTIZE_BLOCK_SIZE),
+              "Meet invalid Q_SF size(2)");
 
   /// CHECK K & K_SF
   CHECK_INPUT(k, at::ScalarType::Char, "K must be pack to int8 tensor");
@@ -1024,9 +1066,8 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
               k_sf.size(0), "==", B);
   TORCH_CHECK(k_sf.size(1) == H, "Meet invalid K_SF size(1) with ",
               k_sf.size(1), "==", H);
-  TORCH_CHECK(k_sf.size(2) == align_up(Nkv, 16),
-              "Meet invalid K_SF size(2) with ", k_sf.size(2),
-              "==", align_up(Nkv, 16));
+  TORCH_CHECK(k_sf.size(2) == ceil_div(Nkv, K_QUANTIZE_BLOCK_SIZE),
+              "Meet invalid K_SF size(2)");
 
   /// CHECK V & V_SF
   CHECK_INPUT(v, at::ScalarType::Float8_e4m3fn,
@@ -1065,6 +1106,11 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
       /// Policy
       using policy = Policy<HEAD_DIM_QK, HEAD_DIM_V>;
 
+      static_assert(Q_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_M == 0,
+                    "invalid q_quantize_block_size");
+      static_assert(K_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_N == 0,
+                    "invalid k_quantize_block_size");
+
       /// TMA descriptor
       CUtensorMap q_tensor_map = create_4d_tensor_map<
           1, 1, policy::TILE_DOT0_BLOCK_M, policy::TILE_DOT0_BLOCK_K,
@@ -1087,21 +1133,6 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
           reinterpret_cast<const F8E4M3 *>(v.data_ptr()),
           static_cast<uint64_t>(v.size(0)), static_cast<uint64_t>(v.size(1)),
           static_cast<uint64_t>(v.size(2)), static_cast<uint64_t>(v.size(3)));
-
-      CUtensorMap q_sf_tensor_map = create_4d_tensor_map<
-          1, 1, 1, policy::TILE_DOT0_BLOCK_M,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-          reinterpret_cast<const uint32_t *>(q_sf.data_ptr()), 1UL,
-          static_cast<uint64_t>(q_sf.size(0)),
-          static_cast<uint64_t>(q_sf.size(1)),
-          static_cast<uint64_t>(q_sf.size(2)));
-      CUtensorMap k_sf_tensor_map = create_4d_tensor_map<
-          1, 1, 1, policy::TILE_DOT0_BLOCK_N,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-          reinterpret_cast<const uint32_t *>(k_sf.data_ptr()), 1UL,
-          static_cast<uint64_t>(k_sf.size(0)),
-          static_cast<uint64_t>(k_sf.size(1)),
-          static_cast<uint64_t>(k_sf.size(2)));
       CUtensorMap v_sf_tensor_map = create_4d_tensor_map<
           1, 1, 1, policy::TILE_DOT1_BLOCK_N,
           CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
@@ -1128,9 +1159,16 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
           /* o b stride */ o.stride(0),
           /* o h stride */ o.stride(1),
           /* o n stride */ o.stride(2),
-          /* o d stride */ o.stride(3), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
-          q_tensor_map, k_tensor_map, v_tensor_map, q_sf_tensor_map,
-          k_sf_tensor_map, v_sf_tensor_map);
+          /* o d stride */ o.stride(3),
+          reinterpret_cast<float *>(q_sf.data_ptr()),
+          /* q_sf b stride */ q_sf.stride(0),
+          /* q_sf h stride */ q_sf.stride(1),
+          /* q_sf n stride */ q_sf.stride(2),
+          reinterpret_cast<float *>(k_sf.data_ptr()),
+          /* k_sf b stride */ k_sf.stride(0),
+          /* k_sf h stride */ k_sf.stride(1),
+          /* k_sf n stride */ k_sf.stride(2), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
+          q_tensor_map, k_tensor_map, v_tensor_map, v_sf_tensor_map);
     });
   });
 }

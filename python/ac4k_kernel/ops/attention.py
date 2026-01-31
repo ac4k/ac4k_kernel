@@ -3,6 +3,97 @@ from ac4k_kernel.ops import quantize
 from functools import lru_cache
 import math
 import torch
+import triton
+import triton.language as tl
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _align_up(a, b):
+    return _ceil_div(a, b) * b
+
+
+@triton.jit
+def _triton_token_quantize(x_ptr, x_b_stride, x_h_stride, x_n_stride,
+                           x_d_stride, y_ptr, y_b_stride, y_h_stride,
+                           y_n_stride, y_d_stride, scale_ptr, scale_b_stride,
+                           scale_h_stride, scale_n_stride, n, d, do,
+                           BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    x_ptrs = x_ptr + pid_b * x_b_stride + pid_h * x_h_stride + offs_n[:, None] * x_n_stride + offs_d[
+        None, :] * x_d_stride
+    x = tl.load(x_ptrs, mask=(offs_n[:, None] < n) & (offs_d[None, :] < d))
+    scale = tl.max(tl.abs(x)) / 127
+
+    if scale == 0:
+        y = tl.full([BLOCK_N, BLOCK_D], 0, dtype=tl.int8)
+    else:
+        y = tl.cast(x / scale, dtype=tl.int8)
+
+    tl.store(
+        scale_ptr + pid_b * scale_b_stride + pid_h * scale_h_stride +
+        pid_n * scale_n_stride, scale)
+
+    y_ptrs = y_ptr + pid_b * y_b_stride + pid_h * y_h_stride + offs_n[:, None] * y_n_stride + offs_d[
+        None, :] * y_d_stride
+    tl.store(y_ptrs, y, mask=(offs_n[:, None] < n) & (offs_d[None, :] < do))
+
+
+def _int8_quantize(x, layout, dim, BLOCK_SIZE=64):
+    assert BLOCK_SIZE >= 16
+    assert (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0
+    assert layout in ["BNHD", "BHND"], "Unsupported layout: {}".format(layout)
+    if layout == "BNHD":
+        B, N, H, D = x.shape
+        b_stride, n_stride, h_stride, d_stride = x.stride(0), x.stride(
+            1), x.stride(2), x.stride(3)
+        assert dim in [1, 3]
+    else:
+        B, H, N, D = x.shape
+        b_stride, h_stride, n_stride, d_stride = x.stride(0), x.stride(
+            1), x.stride(2), x.stride(3)
+        assert dim in [2, 3]
+
+    scale = torch.empty([B, H, _ceil_div(x.shape[dim], BLOCK_SIZE)],
+                        device=x.device,
+                        dtype=torch.float32)
+    y = torch.empty([B, H, N, _align_up(D, 16)],
+                    device=x.device,
+                    dtype=torch.int8)
+
+    BLOCK_N = BLOCK_SIZE
+    BLOCK_D = triton.next_power_of_2(y.shape[-1])
+    grid = (scale.shape[-1], H, B)
+
+    _triton_token_quantize[grid](x,
+                                 b_stride,
+                                 h_stride,
+                                 n_stride,
+                                 d_stride,
+                                 y,
+                                 y.stride(0),
+                                 y.stride(1),
+                                 y.stride(2),
+                                 y.stride(3),
+                                 scale,
+                                 scale.stride(0),
+                                 scale.stride(1),
+                                 scale.stride(2),
+                                 N,
+                                 D,
+                                 y.shape[-1],
+                                 BLOCK_N=BLOCK_N,
+                                 BLOCK_D=BLOCK_D)
+
+    return y, scale
 
 
 @lru_cache(maxsize=1)
@@ -80,8 +171,10 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
 
     N_dim = 1 if layout == "BNHD" else 2
     k = k - k.mean(dim=N_dim, keepdim=True)
-    q_int8, q_sf = quantize(q, N_dim, 3, precision="int8")
-    k_int8, k_sf = quantize(k, N_dim, 3, precision="int8")
+    # q_int8, q_sf = quantize(q, N_dim, 3, precision="int8")
+    # k_int8, k_sf = quantize(k, N_dim, 3, precision="int8")
+    q_int8, q_sf = _int8_quantize(q, layout, N_dim, BLOCK_SIZE=64)
+    k_int8, k_sf = _int8_quantize(k, layout, N_dim, BLOCK_SIZE=128)
     v_fp8, v_sf = quantize(v,
                            3,
                            N_dim,
