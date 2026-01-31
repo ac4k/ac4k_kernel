@@ -54,3 +54,17 @@ __forceinline__ void DISPATCH_BOOLEAN_VALUES(bool value, auto &&func) {
     func.template operator()<false>();
   }
 }
+
+template <typename T, T... SupportedValues>
+__forceinline__ void DISPATCH_VALUE(T value, auto &&func) {
+  bool found = ((value == SupportedValues) || ...);
+  if (!found) {
+    throw std::invalid_argument("Unsupported value: " +
+                                static_cast<int>(value));
+  }
+
+  ((value == SupportedValues
+        ? (func.template operator()<SupportedValues>(), false)
+        : false) ||
+   ...);
+}

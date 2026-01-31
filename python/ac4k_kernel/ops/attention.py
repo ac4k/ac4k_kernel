@@ -171,10 +171,16 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
 
     N_dim = 1 if layout == "BNHD" else 2
     k = k - k.mean(dim=N_dim, keepdim=True)
-    # q_int8, q_sf = quantize(q, N_dim, 3, precision="int8")
-    # k_int8, k_sf = quantize(k, N_dim, 3, precision="int8")
-    q_int8, q_sf = _int8_quantize(q, layout, N_dim, BLOCK_SIZE=64)
-    k_int8, k_sf = _int8_quantize(k, layout, N_dim, BLOCK_SIZE=128)
+    Q_QUANTIZE_BLOCK_SIZE = 64
+    K_QUANTIZE_BLOCK_SIZE = 128
+    q_int8, q_sf = _int8_quantize(q,
+                                  layout,
+                                  N_dim,
+                                  BLOCK_SIZE=Q_QUANTIZE_BLOCK_SIZE)
+    k_int8, k_sf = _int8_quantize(k,
+                                  layout,
+                                  N_dim,
+                                  BLOCK_SIZE=K_QUANTIZE_BLOCK_SIZE)
     v_fp8, v_sf = quantize(v,
                            3,
                            N_dim,
@@ -192,7 +198,8 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
         out = out.permute(0, 2, 1, 3)
 
     sm_scale = 1 / math.sqrt(Dqk)
-    kernel(out, q_int8, q_sf, k_int8, k_sf, v_fp8, v_sf, sm_scale)
+    kernel(out, q_int8, q_sf, Q_QUANTIZE_BLOCK_SIZE, k_int8, k_sf,
+           K_QUANTIZE_BLOCK_SIZE, v_fp8, v_sf, sm_scale)
 
     # Permute back to origin layout
     if layout == "BNHD":

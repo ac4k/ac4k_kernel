@@ -13,9 +13,6 @@
 #include "ac4k_kernel/ops/cuda_ops.h"
 #include "utils.cuh"
 
-constexpr int Q_QUANTIZE_BLOCK_SIZE = 64;
-constexpr int K_QUANTIZE_BLOCK_SIZE = 128;
-
 #define CHECK_TYPE(x, st, m)                                                   \
   TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
@@ -42,13 +39,22 @@ using INT8 = int8_t;
 
 constexpr int64_t MAX_HEAD_DIM_SIZE = 128;
 
-template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
+template <int HEAD_DIM_QK, int HEAD_DIM_V, int Q_QUANTIZE_BLOCK_SIZE_,
+          int K_QUANTIZE_BLOCK_SIZE_>
+struct Policy {
   using Q_TYPE = INT8;
   using K_TYPE = INT8;
   using V_TYPE = F8E4M3;
   using Q_SF_TYPE = float;
   using K_SF_TYPE = float;
   using V_SF_TYPE = float;
+
+  //===--------------------------------------------------------------------===//
+  // Quantize
+  //===--------------------------------------------------------------------===//
+
+  static constexpr int Q_QUANTIZE_BLOCK_SIZE = Q_QUANTIZE_BLOCK_SIZE_;
+  static constexpr int K_QUANTIZE_BLOCK_SIZE = K_QUANTIZE_BLOCK_SIZE_;
 
   //===--------------------------------------------------------------------===//
   // Define tile size for block level, warp level and atomic level
@@ -144,10 +150,6 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
   static constexpr int Q_SMEM_OFF = 0;
   static constexpr int K_SMEM_OFF = Q_SMEM_OFF + TILE_Q_BLOCK_SIZE;
   static constexpr int V_SMEM_OFF = K_SMEM_OFF + TILE_K_BLOCK_SIZE * STAGE;
-  // static constexpr int Q_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE *
-  // STAGE; static constexpr int K_SF_SMEM_OFF = Q_SF_SMEM_OFF +
-  // TILE_Q_SF_BLOCK_SIZE; static constexpr int V_SF_SMEM_OFF =
-  //     K_SF_SMEM_OFF + TILE_K_SF_BLOCK_SIZE * STAGE;
   static constexpr int V_SF_SMEM_OFF = V_SMEM_OFF + TILE_V_BLOCK_SIZE * STAGE;
   static constexpr int SMEM_SIZE =
       TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE * STAGE +
@@ -167,18 +169,6 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
     return reinterpret_cast<V_TYPE *>(smem + V_SMEM_OFF +
                                       TILE_V_BLOCK_SIZE * stage);
   }
-  // static __forceinline__ __device__ Q_SF_TYPE *get_q_sf_stage_mem(char *smem,
-  //                                                                 int stage)
-  //                                                                 {
-  //   (void)stage;
-  //   return reinterpret_cast<Q_SF_TYPE *>(smem + Q_SF_SMEM_OFF);
-  // }
-  // static __forceinline__ __device__ K_SF_TYPE *get_k_sf_stage_mem(char *smem,
-  //                                                                 int stage)
-  //                                                                 {
-  //   return reinterpret_cast<K_SF_TYPE *>(smem + K_SF_SMEM_OFF +
-  //                                        TILE_K_SF_BLOCK_SIZE * stage);
-  // }
   static __forceinline__ __device__ V_SF_TYPE *get_v_sf_stage_mem(char *smem,
                                                                   int stage) {
     (void)stage;
@@ -431,14 +421,8 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       wait(&empty_bar[stage], phase);
       load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
                     &full_bar[stage], block_b, block_h, block_dot_m, 0);
-      // load_4d_async(Policy::get_q_sf_stage_mem(smem, stage),
-      // &q_sf_tensor_map,
-      //               &full_bar[stage], 0, block_b, block_h, block_dot_m);
       load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
                     &full_bar[stage], block_b, block_h, 0, 0);
-      // load_4d_async(Policy::get_k_sf_stage_mem(smem, stage),
-      // &k_sf_tensor_map,
-      //               &full_bar[stage], 0, block_b, block_h, 0);
       load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
                     &full_bar[stage], block_b, block_h, 0, 0);
       load_4d_async(Policy::get_v_sf_stage_mem(smem, stage), &v_sf_tensor_map,
@@ -465,9 +449,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         /// TMA K/V and K_SF/V_SF
         load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
                       &full_bar[stage], block_b, block_h, dot0_n, 0);
-        // load_4d_async(Policy::get_k_sf_stage_mem(smem, stage),
-        // &k_sf_tensor_map,
-        //               &full_bar[stage], 0, block_b, block_h, dot0_n);
         load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
                       &full_bar[stage], block_b, block_h, 0, dot0_n);
 
@@ -502,9 +483,9 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
     AFrag_I8_16x32
         q_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
               [Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K];
-    float q_sf_frag =
-        Q_SF[block_b * q_sf_b_stride + block_h * q_sf_h_stride +
-             (block_n + warp_dot0_m) / Q_QUANTIZE_BLOCK_SIZE * q_sf_n_stride];
+    float q_sf_frag = Q_SF[block_b * q_sf_b_stride + block_h * q_sf_h_stride +
+                           (block_n + warp_dot0_m) /
+                               Policy::Q_QUANTIZE_BLOCK_SIZE * q_sf_n_stride];
     /// max(row max of S=Q @ K)
     float max0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
     float max1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
@@ -582,15 +563,9 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       } // end if (dot0_n == 0) leading
 
       /// Load K_SF
-      // float k_sf_frag[(Policy::TILE_DOT0_WARP_N + K_QUANTIZE_BLOCK_SIZE - 1)
-      // / K_QUANTIZE_BLOCK_SIZE]; #pragma unroll for (int i = 0; i <
-      // Policy::TILE_DOT0_WARP_N; i += K_QUANTIZE_BLOCK_SIZE) {
-      //   k_sf_frag[i / K_QUANTIZE_BLOCK_SIZE] = Q_SF[block_b * k_sf_b_stride +
-      //   block_h * k_sf_h_stride + (warp_dot0_n + i) / K_QUANTIZE_BLOCK_SIZE *
-      //   k_sf_n_stride];
-      // }
-      float k_sf_frag = K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
-                             dot0_n / K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
+      float k_sf_frag =
+          K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
+               dot0_n / Policy::K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
 
       /// S: I32
       DFrag_I32_16x8
@@ -770,10 +745,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
         l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
-
-        // // Update l
-        // l0[i] = fmaf(exp2f(max0[i] - max_new0[i]), l0[i], l_new0[i]);
-        // l1[i] = fmaf(exp2f(max1[i] - max_new1[i]), l1[i], l_new1[i]);
       } // end loop i
 
       /// max scale
@@ -795,33 +766,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         l0[i] = fmaf(l0[i], max_scale0[i], l_new0[i]);
         l1[i] = fmaf(l1[i], max_scale1[i], l_new1[i]);
       }
-
-      //       /// Step 4: o = expf(max - max_new) * o
-
-      // #pragma unroll
-      //       for (int i = 0; i < Policy::TILE_DOT1_WARP_M /
-      //       Policy::TILE_DOT0_ATOMIC_M;
-      //            ++i) {
-      // #pragma unroll
-      //         for (int j = 0;
-      //              j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
-      //              ++j) {
-      //           o_frag[i][j].data[0] *= exp2f(max0[i] - max_new0[i]);
-      //           o_frag[i][j].data[1] *= exp2f(max0[i] - max_new0[i]);
-      //           o_frag[i][j].data[2] *= exp2f(max1[i] - max_new1[i]);
-      //           o_frag[i][j].data[3] *= exp2f(max1[i] - max_new1[i]);
-      //         }
-      //       }
-
-      //       /// Update max
-
-      // #pragma unroll
-      //       for (int i = 0; i < Policy::TILE_DOT1_WARP_M /
-      //       Policy::TILE_DOT0_ATOMIC_M;
-      //            ++i) {
-      //         max0[i] = max_new0[i];
-      //         max1[i] = max_new1[i];
-      //       }
 
       /// Step 5: o = P @ V
       AFrag_FP8_16x32
@@ -919,14 +863,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
                           __half2float(in_u16[2]));
           o_f32[3] = fmaf(o_f32[3], max_scale1[dot1_atomic_m_cnt],
                           __half2float(in_u16[3]));
-
-          // #pragma unroll
-          //           for (int k = 0; k < o_block_f16.ELES_PER_THREAD; ++k) {
-          //             __half *in_u16 = reinterpret_cast<__half
-          //             *>(o_block_f16.data);
-          //             o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data[k] +=
-          //                 __half2float(in_u16[k]);
-          //           }
         } // end loop dot1_atomic_n
       } // end loop dot1_atomic_m
 
@@ -1030,8 +966,10 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 //===--------------------------------------------------------------------===//
 
 void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
-                                  torch::Tensor &q_sf, torch::Tensor &k,
-                                  torch::Tensor &k_sf, torch::Tensor &v,
+                                  torch::Tensor &q_sf,
+                                  int q_quantize_block_size, torch::Tensor &k,
+                                  torch::Tensor &k_sf,
+                                  int k_quantize_block_size, torch::Tensor &v,
                                   torch::Tensor &v_sf, float sm_scale) {
   /// CHECK Q & Q_SF
   CHECK_INPUT(q, at::ScalarType::Char, "Q must be pack to int8 tensor");
@@ -1050,7 +988,7 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
               q_sf.size(0), "==", B);
   TORCH_CHECK(q_sf.size(1) == H, "Meet invalid Q_SF size(1) with ",
               q_sf.size(1), "==", H);
-  TORCH_CHECK(q_sf.size(2) == ceil_div(Nq, Q_QUANTIZE_BLOCK_SIZE),
+  TORCH_CHECK(q_sf.size(2) == ceil_div(Nq, q_quantize_block_size),
               "Meet invalid Q_SF size(2)");
 
   /// CHECK K & K_SF
@@ -1066,7 +1004,7 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
               k_sf.size(0), "==", B);
   TORCH_CHECK(k_sf.size(1) == H, "Meet invalid K_SF size(1) with ",
               k_sf.size(1), "==", H);
-  TORCH_CHECK(k_sf.size(2) == ceil_div(Nkv, K_QUANTIZE_BLOCK_SIZE),
+  TORCH_CHECK(k_sf.size(2) == ceil_div(Nkv, k_quantize_block_size),
               "Meet invalid K_SF size(2)");
 
   /// CHECK V & V_SF
@@ -1099,78 +1037,92 @@ void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
   TORCH_CHECK(o.size(2) == Nq, "O must have the same sequence length as Q");
   TORCH_CHECK(o.size(3) == Dv, "O must have the same dim as V");
 
-  DISPATCH_HEAD_DIM_SIZES<64,
-                          128>(static_cast<int>(Dqk), [&]<int HEAD_DIM_QK>() {
-    DISPATCH_HEAD_DIM_SIZES<64,
-                            128>(static_cast<int>(Dv), [&]<int HEAD_DIM_V>() {
-      /// Policy
-      using policy = Policy<HEAD_DIM_QK, HEAD_DIM_V>;
+  DISPATCH_VALUE<int, 32,
+                 64>(q_quantize_block_size, [&]<int Q_QUANTIZE_BLOCK_SIZE>() {
+    DISPATCH_VALUE<
+        int, 128>(k_quantize_block_size, [&]<int K_QUANTIZE_BLOCK_SIZE>() {
+      DISPATCH_HEAD_DIM_SIZES<
+          64, 128>(static_cast<int>(Dqk), [&]<int HEAD_DIM_QK>() {
+        DISPATCH_HEAD_DIM_SIZES<
+            64, 128>(static_cast<int>(Dv), [&]<int HEAD_DIM_V>() {
+          /// Policy
+          using policy = Policy<HEAD_DIM_QK, HEAD_DIM_V, Q_QUANTIZE_BLOCK_SIZE,
+                                K_QUANTIZE_BLOCK_SIZE>;
 
-      static_assert(Q_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_M == 0,
-                    "invalid q_quantize_block_size");
-      static_assert(K_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_N == 0,
-                    "invalid k_quantize_block_size");
+          static_assert(Q_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_M == 0,
+                        "invalid q_quantize_block_size");
+          static_assert(K_QUANTIZE_BLOCK_SIZE % policy::TILE_DOT0_WARP_N == 0,
+                        "invalid k_quantize_block_size");
 
-      /// TMA descriptor
-      CUtensorMap q_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_DOT0_BLOCK_M, policy::TILE_DOT0_BLOCK_K,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
-          policy::SWIZZLE_Q>(
-          reinterpret_cast<const uint8_t *>(q.data_ptr()),
-          static_cast<uint64_t>(q.size(0)), static_cast<uint64_t>(q.size(1)),
-          static_cast<uint64_t>(q.size(2)), static_cast<uint64_t>(q.size(3)));
-      CUtensorMap k_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_DOT0_BLOCK_N, policy::TILE_DOT0_BLOCK_K,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
-          policy::SWIZZLE_K>(
-          reinterpret_cast<const uint8_t *>(k.data_ptr()),
-          static_cast<uint64_t>(k.size(0)), static_cast<uint64_t>(k.size(1)),
-          static_cast<uint64_t>(k.size(2)), static_cast<uint64_t>(k.size(3)));
-      CUtensorMap v_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_DOT1_BLOCK_N, policy::TILE_DOT1_BLOCK_K,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, F8E4M3,
-          policy::SWIZZLE_V>(
-          reinterpret_cast<const F8E4M3 *>(v.data_ptr()),
-          static_cast<uint64_t>(v.size(0)), static_cast<uint64_t>(v.size(1)),
-          static_cast<uint64_t>(v.size(2)), static_cast<uint64_t>(v.size(3)));
-      CUtensorMap v_sf_tensor_map = create_4d_tensor_map<
-          1, 1, 1, policy::TILE_DOT1_BLOCK_N,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-          reinterpret_cast<const uint32_t *>(v_sf.data_ptr()), 1UL,
-          static_cast<uint64_t>(v_sf.size(0)),
-          static_cast<uint64_t>(v_sf.size(1)),
-          static_cast<uint64_t>(v_sf.size(2)));
+          /// TMA descriptor
+          CUtensorMap q_tensor_map = create_4d_tensor_map<
+              1, 1, policy::TILE_DOT0_BLOCK_M, policy::TILE_DOT0_BLOCK_K,
+              CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
+              policy::SWIZZLE_Q>(
+              reinterpret_cast<const uint8_t *>(q.data_ptr()),
+              static_cast<uint64_t>(q.size(0)),
+              static_cast<uint64_t>(q.size(1)),
+              static_cast<uint64_t>(q.size(2)),
+              static_cast<uint64_t>(q.size(3)));
+          CUtensorMap k_tensor_map = create_4d_tensor_map<
+              1, 1, policy::TILE_DOT0_BLOCK_N, policy::TILE_DOT0_BLOCK_K,
+              CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, uint8_t,
+              policy::SWIZZLE_K>(
+              reinterpret_cast<const uint8_t *>(k.data_ptr()),
+              static_cast<uint64_t>(k.size(0)),
+              static_cast<uint64_t>(k.size(1)),
+              static_cast<uint64_t>(k.size(2)),
+              static_cast<uint64_t>(k.size(3)));
+          CUtensorMap v_tensor_map = create_4d_tensor_map<
+              1, 1, policy::TILE_DOT1_BLOCK_N, policy::TILE_DOT1_BLOCK_K,
+              CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, F8E4M3,
+              policy::SWIZZLE_V>(reinterpret_cast<const F8E4M3 *>(v.data_ptr()),
+                                 static_cast<uint64_t>(v.size(0)),
+                                 static_cast<uint64_t>(v.size(1)),
+                                 static_cast<uint64_t>(v.size(2)),
+                                 static_cast<uint64_t>(v.size(3)));
+          CUtensorMap v_sf_tensor_map = create_4d_tensor_map<
+              1, 1, 1, policy::TILE_DOT1_BLOCK_N,
+              CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+              reinterpret_cast<const uint32_t *>(v_sf.data_ptr()), 1UL,
+              static_cast<uint64_t>(v_sf.size(0)),
+              static_cast<uint64_t>(v_sf.size(1)),
+              static_cast<uint64_t>(v_sf.size(2)));
 
-      /// Set dynamic shared memory size
-      auto *kernel = qk_int8_pv_fp8_mha_fwd_sm120_kernel<policy>;
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          policy::SMEM_SIZE));
+          /// Set dynamic shared memory size
+          auto *kernel = qk_int8_pv_fp8_mha_fwd_sm120_kernel<policy>;
+          CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+              kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+              policy::SMEM_SIZE));
 
-      /// Get CUDA stream
-      auto stream = at::cuda::getCurrentCUDAStream().stream();
+          /// Get CUDA stream
+          auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-      /// Launch kernel
-      dim3 grid(ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H,
-                B);
-      dim3 block(policy::THREAD_NUM);
-      kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
-          reinterpret_cast<BF16 *>(o.data_ptr()),
-          /* o b stride */ o.stride(0),
-          /* o h stride */ o.stride(1),
-          /* o n stride */ o.stride(2),
-          /* o d stride */ o.stride(3),
-          reinterpret_cast<float *>(q_sf.data_ptr()),
-          /* q_sf b stride */ q_sf.stride(0),
-          /* q_sf h stride */ q_sf.stride(1),
-          /* q_sf n stride */ q_sf.stride(2),
-          reinterpret_cast<float *>(k_sf.data_ptr()),
-          /* k_sf b stride */ k_sf.stride(0),
-          /* k_sf h stride */ k_sf.stride(1),
-          /* k_sf n stride */ k_sf.stride(2), B, H, Nq, Nkv, Dqk, Dv, sm_scale,
-          q_tensor_map, k_tensor_map, v_tensor_map, v_sf_tensor_map);
-    });
-  });
+          /// Launch kernel
+          dim3 grid(
+              ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H,
+              B);
+          dim3 block(policy::THREAD_NUM);
+          kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
+              reinterpret_cast<BF16 *>(o.data_ptr()),
+              /* o b stride */ o.stride(0),
+              /* o h stride */ o.stride(1),
+              /* o n stride */ o.stride(2),
+              /* o d stride */ o.stride(3),
+              reinterpret_cast<float *>(q_sf.data_ptr()),
+              /* q_sf b stride */ q_sf.stride(0),
+              /* q_sf h stride */ q_sf.stride(1),
+              /* q_sf n stride */ q_sf.stride(2),
+              reinterpret_cast<float *>(k_sf.data_ptr()),
+              /* k_sf b stride */ k_sf.stride(0),
+              /* k_sf h stride */ k_sf.stride(1),
+              /* k_sf n stride */ k_sf.stride(2), B, H, Nq, Nkv, Dqk, Dv,
+              sm_scale, q_tensor_map, k_tensor_map, v_tensor_map,
+              v_sf_tensor_map);
+        }); // end of DISPATCH_HEAD_DIM_SIZES HEAD_DIM_V
+      });   // end of DISPATCH_HEAD_DIM_SIZES HEAD_DIM_QK
+    });     // end of DISPATCH_VALUE K_QUANTIZE_BLOCK_SIZE
+  });       // end of DISPATCH_VALUE Q_QUANTIZE_BLOCK_SIZE
 }
 
 } // namespace ac4k

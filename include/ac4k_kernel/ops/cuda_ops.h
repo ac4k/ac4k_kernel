@@ -17,8 +17,10 @@ void nvfp4_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
                          float sm_scale);
 
 void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
-                                  torch::Tensor &q_sf, torch::Tensor &k,
-                                  torch::Tensor &k_sf, torch::Tensor &v,
+                                  torch::Tensor &q_sf,
+                                  int q_quantize_block_size, torch::Tensor &k,
+                                  torch::Tensor &k_sf,
+                                  int k_quantize_block_size, torch::Tensor &v,
                                   torch::Tensor &v_sf, float sm_scale);
 
 //===----------------------------------------------------------------------===//
