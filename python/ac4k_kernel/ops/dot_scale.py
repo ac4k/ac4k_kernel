@@ -1,17 +1,16 @@
+"""
+Dot scale operators for NVFp4 precision.
+
+Provides zero-overhead access to architecture-optimized kernels.
+"""
 import torch
-from functools import lru_cache
+
+# Direct imports - zero runtime dispatch overhead
+from .._cuda_ops import nvfp4_dot_scale as _nvfp4_dot_scale
 
 
-@lru_cache(maxsize=1)
-def _load_cuda_nvfp4_dot_scale():
-    try:
-        from ._cuda_ops import nvfp4_dot_scale_sm120
-        return nvfp4_dot_scale_sm120
-    except ImportError as e:
-        raise ImportError(
-            "CUDA operator 'nvfp4_dot_scale_sm120' failed to load. "
-            "Possible reasons: CUDA not available, or module not compiled."
-        ) from e
+# Direct function reference for zero-overhead access
+nvfp4_dot_scale = _nvfp4_dot_scale
 
 
 class Ac4kDotScaleOp(torch.nn.Module):
@@ -28,15 +27,13 @@ class Ac4kDotScaleOp(torch.nn.Module):
                 b_global_scale,
                 bias,
                 out=None):
-        kernel = _load_cuda_nvfp4_dot_scale()
-
         if (bias is not None) and (bias.ndim == 1):
             bias = bias.reshape(1, -1)
 
         if out is None:
             m, n = a.shape[0], b.shape[0]
             out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-        kernel(out, a, a_scale, a_global_scale, b, b_scale, b_global_scale,
+        _nvfp4_dot_scale(out, a, a_scale, a_global_scale, b, b_scale, b_global_scale,
                bias)
 
         return out

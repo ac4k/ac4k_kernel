@@ -1,6 +1,17 @@
+"""
+3D Rotary Position Embedding (RoPE) operators.
+
+Provides zero-overhead access to architecture-optimized kernels.
+"""
 from typing import Optional
 import torch
-from . import _cuda_ops
+
+# Direct imports - zero runtime dispatch overhead
+from .._cuda_ops import rope_3d_apply as _rope_3d_apply
+
+
+# Direct function reference for zero-overhead access
+rope_3d_apply_kernel = _rope_3d_apply
 
 
 class Ac4kRoPEOp(torch.nn.Module):
@@ -13,7 +24,7 @@ class Ac4kRoPEOp(torch.nn.Module):
             output = torch.empty_like(x)
 
         # Call the CUDA implementation
-        _cuda_ops.rope_3d_apply(x, grid_sizes, freqs, output)
+        _rope_3d_apply(x, grid_sizes, freqs, output)
 
         return output
 
