@@ -684,10 +684,11 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 #pragma unroll
       for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
-        max_new0[i] = max0[i];
-        max_new1[i] = max1[i];
+        auto *data = reinterpret_cast<float *>(s_frag[i][0].data);
+        max_new0[i] = fmaxf(data[0], data[1]);
+        max_new1[i] = fmaxf(data[2], data[3]);
 #pragma unroll
-        for (int j = 0;
+        for (int j = 1;
              j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
           auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
 
@@ -707,6 +708,9 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
         max_new0[i] -= Policy::EXP_OFFSET;
         max_new1[i] -= Policy::EXP_OFFSET;
+
+        max_new0[i] = fmaxf(max_new0[i], max0[i]);
+        max_new1[i] = fmaxf(max_new1[i], max1[i]);
       } // end loop i
 
       /// Step 3: p = exp(S - max)
