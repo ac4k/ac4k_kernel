@@ -1,25 +1,24 @@
-"""
-AC4K Kernel Operators - Zero-overhead dispatch at import time.
+"""AC4K Kernel Operators - Zero-overhead dispatch at import time.
 
 All operators are compiled for the detected architecture at install time.
 """
-from .dot_scale import dot_scale, nvfp4_dot_scale
-from .quant import quantize, nvfp4_quantize, fp8_quantize, int8_quantize
-from .attention import attention, nvfp4_mha_fwd, qk_int8_pv_fp8_mha_fwd
-from .rope_3d import rope_3d_apply, rope_3d_apply_kernel
+from .linear import linear, linear_nvfp4
+from .quant import quantize, quantize_nvfp4, quantize_fp8, quantize_int8
+from .attention import attention, mha_nvfp4_fwd, mha_int8_x_fp8_fwd
+from .rope_3d import rope3d, rope3d_kernel
 
 __all__ = [
     # High-level APIs
     "attention",
     "quantize",
-    "rope_3d_apply",
-    "dot_scale",
+    "linear",
+    "rope3d",
     # Direct kernel access (zero-overhead)
-    "nvfp4_mha_fwd",
-    "qk_int8_pv_fp8_mha_fwd",
-    "nvfp4_quantize",
-    "fp8_quantize",
-    "int8_quantize",
-    "nvfp4_dot_scale",
-    "rope_3d_apply_kernel",
+    "mha_nvfp4_fwd",
+    "mha_int8_x_fp8_fwd",
+    "quantize_nvfp4",
+    "quantize_fp8",
+    "quantize_int8",
+    "linear_nvfp4",
+    "rope3d_kernel",
 ]

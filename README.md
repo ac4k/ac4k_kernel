@@ -13,16 +13,52 @@ ac4k_kernel is a high-performance kernel library for AI applications, designed t
 
 ## Installation
 
-### Install from source
+### Prerequisites
 
-```
-git clone git@github.com:ac4k/ac4k_kernel.git
-cd ac4k_kernel
+Install build dependencies for fastest compilation:
+
+```bash
 pip install -r requirements.txt
 
-# Install in development mode (editable install)
-pip install -e . --no-build-isolation
+# Recommended: ccache for caching (dramatically speeds up recompilation)
+# Ubuntu/Debian
+sudo apt install ccache
 ```
+
+### Install from source
+
+```bash
+git clone git@github.com:ac4k/ac4k_kernel.git
+cd ac4k_kernel
+
+# Install (auto-detects GPU architecture)
+pip install -e . --no-build-isolation
+
+# Specify architecture explicitly (no GPU required at build time)
+AC4K_CUDA_ARCH=sm120 pip install -e . --no-build-isolation
+```
+
+### Rebuild after C++/CUDA changes
+
+When modifying C++/CUDA code during development, use this faster command instead of re-running pip:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+> Note: Python code changes take effect immediately (editable install). Only C++/CUDA changes require rebuilding.
+
+### Build acceleration
+
+The build system automatically applies these optimizations when available:
+
+| Optimization | Effect | How to enable |
+|---|---|---|
+| **Ninja** | Parallel file-level compilation | `pip install ninja` |
+| **ccache** | Caches object files across rebuilds | `apt install ccache` |
+| **MAX_JOBS** | Controls parallel compilation jobs | `MAX_JOBS=N pip install ...` (default: half CPU cores) |
+| **nvcc --threads** | Intra-file parallelism for CUDA compilation | Automatic |
+| **Single-arch build** | Only compiles target GPU architecture | Automatic via `-arch=sm_XXXa` |
 
 ## Contribution Guidelines
 

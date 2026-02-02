@@ -9,9 +9,9 @@ import triton.language as tl
 
 # Direct imports - zero runtime dispatch overhead
 from .._cuda_ops import (
-    nvfp4_quantize as _nvfp4_quantize,
-    fp8_quantize as _fp8_quantize,
-    int8_quantize as _int8_quantize,
+    quantize_nvfp4 as _quantize_nvfp4,
+    quantize_fp8 as _quantize_fp8,
+    quantize_int8 as _quantize_int8,
 )
 
 
@@ -57,9 +57,9 @@ def _global_scale(x: torch.Tensor, max_scale: float) -> torch.Tensor:
 
 
 # Direct function references for zero-overhead access
-nvfp4_quantize = _nvfp4_quantize
-fp8_quantize = _fp8_quantize
-int8_quantize = _int8_quantize
+quantize_nvfp4 = _quantize_nvfp4
+quantize_fp8 = _quantize_fp8
+quantize_int8 = _quantize_int8
 
 
 class Ac4kQuantizeOp(torch.nn.Module):
@@ -96,7 +96,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
         # Quantize to fp8e4m3
         if precision == "fp8e4m3":
-            quantize_kernel = _fp8_quantize
+            quantize_kernel = _quantize_fp8
 
             CROSS_DIM_ALIGN_SIZE = 16
             REDUCE_DIM_ALIGN_SIZE = 16
@@ -145,7 +145,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
             return output, sf
         elif precision == "int8":
-            quantize_kernel = _int8_quantize
+            quantize_kernel = _quantize_int8
 
             CROSS_DIM_ALIGN_SIZE = 16
             REDUCE_DIM_ALIGN_SIZE = 16
@@ -194,7 +194,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
             return output, sf
         else:
-            quantize_kernel = _nvfp4_quantize
+            quantize_kernel = _quantize_nvfp4
 
             BLOCK_SIZE = 16
             NVFP4_ELES_PER_BYTE = 2

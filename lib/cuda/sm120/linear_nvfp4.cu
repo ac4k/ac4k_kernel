@@ -6,7 +6,7 @@
 #include <mma.h>
 #include <torch/all.h>
 
-#include "ac4k_kernel/ops/cuda_ops.h"
+#include "ac4k_kernel/ops.h"
 #include "utils.cuh"
 
 #define CHECK_TYPE(x, st, m)                                                   \
@@ -121,9 +121,9 @@ struct Policy {
   //===--------------------------------------------------------------------===//
 
   static constexpr CUtensorMapSwizzle SWIZZLE_A =
-      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+      sm120::get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
   static constexpr CUtensorMapSwizzle SWIZZLE_B =
-      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+      sm120::get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
 };
 
 //===----------------------------------------------------------------------===//
@@ -526,7 +526,7 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
                            : "r"(b_addr));
 
               /// Apply mma
-              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+              sm120::mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
                   c_frag[atomic_m_cnt][atomic_n_cnt].data, a_frag.data,
                   b_frag.data, sfa0, sfb0);
             } // end loop atomic_n
@@ -700,12 +700,12 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
   } // end if consumer
 }
 
-void nvfp4_dot_scale_sm120(torch::Tensor &D, torch::Tensor const &A,
-                           torch::Tensor const &A_sf,
-                           torch::Tensor const &A_global_scale,
-                           torch::Tensor const &B, torch::Tensor const &B_sf,
-                           torch::Tensor const &B_global_scale,
-                           c10::optional<torch::Tensor> const &bias) {
+void linear_nvfp4(torch::Tensor &D, torch::Tensor const &A,
+                  torch::Tensor const &A_sf,
+                  torch::Tensor const &A_global_scale,
+                  torch::Tensor const &B, torch::Tensor const &B_sf,
+                  torch::Tensor const &B_global_scale,
+                  c10::optional<torch::Tensor> const &bias) {
   /// Check D
   TORCH_CHECK(D.dim() == 2, "d must be a 2d matrix");
   auto const M = D.sizes()[0];

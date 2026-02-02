@@ -9,6 +9,9 @@ python/ac4k_kernel*.egg-info/
 
 python/ac4k_kernel/ops/_cuda_ops.*.so
 
+# Shared libraries
+*.so
+
 # Python caches
 __pycache__/
 *.py[cod]

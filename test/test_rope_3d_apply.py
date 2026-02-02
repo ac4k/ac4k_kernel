@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from ac4k_kernel.ops import rope_3d_apply
+from ac4k_kernel.ops import rope3d
 
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
@@ -82,7 +82,7 @@ def test_rope_3d_apply():
     # Run CUDA implementation
     print("\nRunning CUDA implementation...")
     try:
-        result_cuda = rope_3d_apply(x, grid_sizes, freqs, output)
+        result_cuda = rope3d(x, grid_sizes, freqs, output)
         print("✓ CUDA implementation completed successfully")
     except Exception as e:
         print(f"✗ CUDA implementation failed: {e}")

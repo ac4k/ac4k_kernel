@@ -3,7 +3,7 @@
 
 #include <pybind11/pybind11.h>
 
-#include "ac4k_kernel/ops/cuda_ops.h"
+#include "ac4k_kernel/ops.h"
 
 //===----------------------------------------------------------------------===//
 // Compile-time Architecture Selection
@@ -46,8 +46,8 @@ PYBIND11_MODULE(_cuda_ops, m) {
   //-------------------------------------------------------------------------
   // Attention Operators
   //-------------------------------------------------------------------------
-  m.def("nvfp4_mha_fwd", &ac4k::nvfp4_mha_fwd_sm120,
-        "NVFP4 Multi-Head Attention Forward\n\n"
+  m.def("mha_nvfp4_fwd", &ac4k::mha_nvfp4_fwd,
+        "Multi-Head Attention Forward (NVFP4)\n\n"
         "Args:\n"
         "    o: Output tensor [B, H, N, D], bfloat16\n"
         "    q, q_sf, q_global_scale: Quantized query\n"
@@ -55,13 +55,13 @@ PYBIND11_MODULE(_cuda_ops, m) {
         "    v, v_sf, v_global_scale: Quantized value\n"
         "    sm_scale: Softmax scale factor");
 
-  m.def("qk_int8_pv_fp8_mha_fwd", &ac4k::qk_int8_pv_fp8_mha_fwd_sm120,
-        "INT8-QK FP8-PV Multi-Head Attention Forward");
+  m.def("mha_int8_x_fp8_fwd", &ac4k::mha_int8_x_fp8_fwd,
+        "Multi-Head Attention Forward (QK=INT8, PV=FP8)");
 
   //-------------------------------------------------------------------------
   // Quantization Operators
   //-------------------------------------------------------------------------
-  m.def("nvfp4_quantize", &ac4k::nvfp4_quantize_sm120,
+  m.def("quantize_nvfp4", &ac4k::quantize_nvfp4,
         "Quantize bfloat16 tensor to NVFP4 format\n\n"
         "Args:\n"
         "    out: Output tensor (nvfp4 packed)\n"
@@ -71,43 +71,27 @@ PYBIND11_MODULE(_cuda_ops, m) {
         "    cross_dim, reduce_dim: Dimension indices\n"
         "    swizzle: Enable memory swizzle");
 
-  m.def("fp8_quantize", &ac4k::fp8_quantize_sm120,
+  m.def("quantize_fp8", &ac4k::quantize_fp8,
         "Quantize bfloat16 tensor to FP8 format");
 
-  m.def("int8_quantize", &ac4k::int8_quantize_sm120,
+  m.def("quantize_int8", &ac4k::quantize_int8,
         "Quantize bfloat16 tensor to INT8 format");
 
   //-------------------------------------------------------------------------
-  // GEMM / Dot Operators
+  // Linear Operators
   //-------------------------------------------------------------------------
-  m.def("nvfp4_dot_scale", &ac4k::nvfp4_dot_scale_sm120,
-        "NVFP4 Dot Product with Scaling\n\n"
-        "D = A @ B.T with block-wise scaling");
+  m.def("linear_nvfp4", &ac4k::linear_nvfp4,
+        "NVFP4 Linear (fully-connected layer)\n\n"
+        "y = x @ weight.T + bias");
 
   //-------------------------------------------------------------------------
-  // Position Encoding Operators
+  // RoPE Operators
   //-------------------------------------------------------------------------
-  m.def("rope_3d_apply", &ac4k::rope_3d_apply,
-        "Apply 3D Rotary Position Embedding\n\n"
+  m.def("rope3d", &ac4k::rope3d,
+        "3D Rotary Position Embedding\n\n"
         "Args:\n"
         "    x: Input tensor [B, S, N, D], bfloat16\n"
         "    grid_sizes: Grid sizes [B, 3], int32\n"
         "    freqs: Frequency table [max_pos, C], complex128\n"
         "    output: Output tensor [B, S, N, D], bfloat16");
-
-  //-------------------------------------------------------------------------
-  // Legacy API (with explicit arch suffix, for compatibility)
-  //-------------------------------------------------------------------------
-  m.def("nvfp4_mha_fwd_sm120", &ac4k::nvfp4_mha_fwd_sm120,
-        "[Legacy] Use nvfp4_mha_fwd instead");
-  m.def("qk_int8_pv_fp8_mha_fwd_sm120", &ac4k::qk_int8_pv_fp8_mha_fwd_sm120,
-        "[Legacy] Use qk_int8_pv_fp8_mha_fwd instead");
-  m.def("nvfp4_quantize_sm120", &ac4k::nvfp4_quantize_sm120,
-        "[Legacy] Use nvfp4_quantize instead");
-  m.def("fp8_quantize_sm120", &ac4k::fp8_quantize_sm120,
-        "[Legacy] Use fp8_quantize instead");
-  m.def("int8_quantize_sm120", &ac4k::int8_quantize_sm120,
-        "[Legacy] Use int8_quantize instead");
-  m.def("nvfp4_dot_scale_sm120", &ac4k::nvfp4_dot_scale_sm120,
-        "[Legacy] Use nvfp4_dot_scale instead");
 }

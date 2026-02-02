@@ -19,12 +19,12 @@
                           ┌─────────────────────────────┐
                           │      Python API Layer       │
                           │  ac4k_kernel.ops.*          │
-                          │  (直接调用，无 dispatch)     │
+                          │  (直接调用，无 dispatch)      │
                           └─────────────┬───────────────┘
                                         │
                           ┌─────────────▼───────────────┐
                           │    _cuda_ops / _rocm_ops    │
-                          │    (编译时确定唯一后端)       │
+                          │    (编译时确定唯一后端)        │
                           └─────────────┬───────────────┘
                                         │
               ┌─────────────────────────┼─────────────────────────┐
@@ -47,34 +47,31 @@
 ```
 ac4k_kernel/
 ├── include/ac4k_kernel/
-│   ├── common/
-│   │   └── types.h              # 公共类型定义
-│   └── ops/
-│       ├── cuda_ops.h           # CUDA 算子声明
-│       └── rocm_ops.h           # ROCm 算子声明
+│   ├── ops.h                    # 统一算子接口（backend/arch 无关）
+│   └── types.h                  # 公共类型定义
 │
 ├── lib/
 │   ├── cuda/
 │   │   ├── common/              # CUDA 通用工具 (traits, math, etc.)
 │   │   │   ├── traits.cuh
 │   │   │   ├── math.cuh
+│   │   │   ├── dispatch.cuh
 │   │   │   └── utils.cuh
 │   │   ├── sm120/               # RTX 5090 专用
-│   │   │   ├── mma.cuh          # SM120 MMA 指令
-│   │   │   ├── tma.cuh          # SM120 TMA
-│   │   │   ├── attention.cu
-│   │   │   ├── quantize.cu
-│   │   │   └── ...
-│   │   ├── sm100/               # B200/B100 专用
-│   │   └── sm90a/               # H100/H200 专用
+│   │   │   ├── mma.cuh          # namespace ac4k::sm120, MMA 指令
+│   │   │   ├── register.cuh     # namespace ac4k::sm120, 寄存器管理
+│   │   │   ├── tma.cuh          # namespace ac4k::sm120, TMA
+│   │   │   └── *.cu             # 实现 namespace ac4k 中的公共 API
+│   │   ├── sm100/               # B200/B100 专用（计划中）
+│   │   └── sm90a/               # H100/H200 专用（计划中）
 │   │
 │   ├── rocm/
 │   │   ├── common/              # ROCm 通用工具
-│   │   ├── gfx942/              # MI300X 专用
-│   │   └── gfx90a/              # MI250X 专用
+│   │   ├── gfx942/              # MI300X 专用（计划中）
+│   │   └── gfx90a/              # MI250X 专用（计划中）
 │   │
 │   ├── cuda_bindings.cc         # CUDA pybind
-│   └── rocm_bindings.cc         # ROCm pybind
+│   └── rocm_bindings.cc         # ROCm pybind（计划中）
 │
 ├── python/ac4k_kernel/
 │   ├── __init__.py
@@ -189,29 +186,21 @@ def get_extension():
 
 ```cpp
 // lib/cuda_bindings.cc
+// 公共 API 在 namespace ac4k 中，编译时只构建一个 arch，无符号冲突
+// arch 内部 helpers 通过 namespace ac4k::sm120 等隔离
 
 #include <pybind11/pybind11.h>
-
-// 编译时选择架构实现
-#if defined(AC4K_ARCH_SM120)
-  #include "cuda/sm120/ops.h"
-  namespace impl = ac4k::cuda::sm120;
-#elif defined(AC4K_ARCH_SM100)
-  #include "cuda/sm100/ops.h"
-  namespace impl = ac4k::cuda::sm100;
-#elif defined(AC4K_ARCH_SM90A)
-  #include "cuda/sm90a/ops.h"
-  namespace impl = ac4k::cuda::sm90a;
-#endif
+#include "ac4k_kernel/ops.h"
 
 PYBIND11_MODULE(_cuda_ops, m) {
-    // 直接绑定，无间接层
-    m.def("nvfp4_mha_fwd", &impl::nvfp4_mha_fwd);
-    m.def("nvfp4_quantize", &impl::nvfp4_quantize);
-    m.def("fp8_quantize", &impl::fp8_quantize);
+    // 直接绑定 namespace ac4k 中的函数，零间接层
+    m.def("mha_nvfp4_fwd", &ac4k::mha_nvfp4_fwd);
+    m.def("mha_int8_x_fp8_fwd", &ac4k::mha_int8_x_fp8_fwd);
+    m.def("quantize_nvfp4", &ac4k::quantize_nvfp4);
+    m.def("quantize_fp8", &ac4k::quantize_fp8);
     // ...
-    
-    m.attr("__arch__") = impl::kArchName;
+
+    m.attr("__arch__") = kArchName;
     m.attr("__backend__") = "cuda";
 }
 ```
@@ -226,12 +215,12 @@ __version__ = "0.1.0"
 # 直接导入编译好的后端（无运行时判断）
 try:
     from ._cuda_ops import __arch__, __backend__
-    from ._cuda_ops import nvfp4_mha_fwd, nvfp4_quantize, fp8_quantize
+    from ._cuda_ops import mha_nvfp4_fwd, mha_int8_x_fp8_fwd
+    from ._cuda_ops import quantize_nvfp4, quantize_fp8, quantize_int8
     _backend = "cuda"
 except ImportError:
     try:
         from ._rocm_ops import __arch__, __backend__
-        from ._rocm_ops import fp8_mha_fwd, fp8_quantize
         _backend = "rocm"
     except ImportError:
         raise ImportError("No backend available. Install with CUDA or ROCm.")
@@ -246,28 +235,19 @@ def get_arch() -> str:
 ```python
 # python/ac4k_kernel/ops/attention.py
 
-import torch
-from .. import _backend
-
-if _backend == "cuda":
-    from .._cuda_ops import nvfp4_mha_fwd, qk_int8_pv_fp8_mha_fwd
-elif _backend == "rocm":
-    from .._rocm_ops import fp8_mha_fwd
+from .._cuda_ops import mha_nvfp4_fwd, mha_int8_x_fp8_fwd
 
 
 def attention(q, k, v, *, precision="nvfp4", **kwargs):
     """
     高性能 Attention
-    
+
     precision 选择 kernel 实现，不是架构分发（零开销）
     """
-    if _backend == "cuda":
-        if precision == "nvfp4":
-            return _nvfp4_attention(q, k, v, **kwargs)
-        elif precision == "int8_fp8":
-            return _int8_fp8_attention(q, k, v, **kwargs)
-    elif _backend == "rocm":
-        return _rocm_fp8_attention(q, k, v, **kwargs)
+    if precision == "nvfp4":
+        return _nvfp4_attention(q, k, v, **kwargs)
+    elif precision == "int8+fp8e4m3":
+        return _int8_x_fp8_attention(q, k, v, **kwargs)
 ```
 
 ---
@@ -280,8 +260,6 @@ def attention(q, k, v, *, precision="nvfp4", **kwargs):
 |------|-----|-------|-----|-----|---------|
 | SM120 | RTX 5090 | ✅ | ✅ | ✅ | 消费级推理 |
 | SM100 | B200/B100 | ✅ | ✅ | ✅ | 数据中心训练/推理 |
-| SM90a | H100/H200 | ❌ | ✅ | ✅ | 数据中心训练/推理 |
-| SM89 | RTX 4090 | ❌ | ✅ | ❌ | 消费级推理 |
 
 ### ROCm
 
@@ -321,7 +299,7 @@ def attention(q, k, v, *, precision="nvfp4", **kwargs):
   开销: ~250ns/call
 
 AC4K 编译时分发:
-  attention() → _cuda_ops.nvfp4_mha_fwd() → kernel
+  attention() → _cuda_ops.mha_nvfp4_fwd() → kernel
   开销: ~100ns/call (Python 函数调用本身)
 ```
 
@@ -345,12 +323,42 @@ AC4K_BACKEND=cuda pip install .
 AC4K_BACKEND=rocm pip install .
 
 # 指定架构
-AC4K_CUDA_ARCH=sm100 pip install .
+AC4K_CUDA_ARCH=sm120 pip install .
 AC4K_ROCM_ARCH=gfx90a pip install .
 
 # 开发模式
-pip install -e . -v
+pip install -e . --no-build-isolation
 ```
+
+### 编译加速
+
+构建系统自动检测并启用以下加速手段：
+
+| 加速手段 | 作用 | 启用方式 |
+|---------|------|---------|
+| **Ninja** | 文件级并行编译（替代 make） | `pip install ninja` |
+| **ccache** | 缓存编译产物，加速重编译 | `apt install ccache` |
+| **MAX_JOBS** | 控制并行编译任务数 | `MAX_JOBS=N pip install ...`（默认：CPU 核数的一半） |
+| **nvcc --threads** | nvcc 内部并行（PTX→SASS） | 自动启用 |
+| **-pipe** | 编译器使用管道替代临时文件 | 自动启用 |
+| **单架构编译** | 只编译目标 GPU 架构，禁用 BuildExtension 的 gencode 注入 | 自动（通过 `-arch=sm_XXXa`） |
+
+```bash
+# 首次编译
+MAX_JOBS=$(nproc) pip install -e . --no-build-isolation
+
+# 后续重编译（ccache 命中，未修改文件近乎瞬时）
+pip install -e . --no-build-isolation
+```
+
+### 环境变量
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `AC4K_BACKEND` | 强制指定后端 | `cuda` / `rocm` |
+| `AC4K_CUDA_ARCH` | 强制指定 CUDA 架构 | `sm120` / `sm100` |
+| `AC4K_ROCM_ARCH` | 强制指定 ROCm 架构 | `gfx942` / `gfx90a` |
+| `MAX_JOBS` | 并行编译任务数 | `32` |
 
 ---
 
@@ -372,17 +380,56 @@ pip install -e . -v
 
 ---
 
+## 算子命名规范
+
+### C++ / pybind 层：`{op}_{precision}[_{dir}]`
+
+| 组成 | 说明 | 示例 |
+|------|------|------|
+| `{op}` | 算子类型 | `mha`, `quantize`, `gemm`, `rope3d` |
+| `{precision}` | 数据精度 | `nvfp4`, `fp8`, `int8` |
+| `{dir}` | 方向（可选） | `fwd`, `bwd` |
+
+**混合精度**：不同阶段使用不同精度时，用 `_x_` 分隔：
+
+```
+mha_int8_x_fp8_fwd
+     │      │    │
+     op  QK阶段  PV阶段  方向
+```
+
+### 完整命名映射
+
+| C++ / pybind 名称 | Python 高级 API | 说明 |
+|---|---|---|
+| `mha_nvfp4_fwd` | `attention(precision="nvfp4")` | NVFP4 全精度 MHA |
+| `mha_int8_x_fp8_fwd` | `attention(precision="int8+fp8e4m3")` | QK=INT8, PV=FP8 混合精度 MHA |
+| `quantize_nvfp4` | `quantize(precision="nvfp4")` | BF16 → NVFP4 |
+| `quantize_fp8` | `quantize(precision="fp8e4m3")` | BF16 → FP8 |
+| `quantize_int8` | `quantize(precision="int8")` | BF16 → INT8 |
+| `gemm_nvfp4` | `gemm()` | NVFP4 GEMM |
+| `rope3d` | `rope3d()` | 3D RoPE（无精度/方向后缀） |
+
+### 设计理由
+
+- **op 在前**：按操作类型分组，IDE 自动补全时 `mha_` 列出所有 attention 变体
+- **precision 在中**：描述"用什么精度做"，不是"在哪个架构上做"
+- **`_x_` 分隔符**：混合精度时标注不同计算阶段的精度，比 `qk_int8_pv_fp8` 更简洁
+- **Python 统一入口**：用户只需记住 `attention()`、`quantize()` 等高级 API，precision 作为参数传入
+
+---
+
 ## 算子列表
 
-| 算子 | CUDA SM120 | CUDA SM90a | ROCm GFX942 |
-|------|------------|------------|-------------|
-| Attention (NVFP4) | ✅ | ❌ | ❌ |
-| Attention (FP8) | ✅ | 📋 | 📋 |
-| Attention (INT8) | ✅ | 📋 | 📋 |
-| Quantize (NVFP4) | ✅ | ❌ | ❌ |
-| Quantize (FP8) | ✅ | 📋 | 📋 |
-| Quantize (INT8) | ✅ | 📋 | 📋 |
-| RoPE 3D | ✅ | 📋 | 📋 |
-| GEMM | ✅ | 📋 | 📋 |
+| 算子 | CUDA SM120 | CUDA SM100 |
+|------|------------|------------|
+| Attention (NVFP4) | ✅ | 📋 |
+| Attention (FP8) | ✅ | 📋 |
+| Attention (INT8) | ✅ | 📋 |
+| Quantize (NVFP4) | ✅ | 📋 |
+| Quantize (FP8) | ✅ | 📋 |
+| Quantize (INT8) | ✅ | 📋 |
+| RoPE 3D | ✅ | 📋 |
+| Linear (NVFP4) | ✅ | 📋 |
 
-✅ 已实现 | 📋 计划中 | ❌ 不支持
+✅ 已实现 | 📋 计划中

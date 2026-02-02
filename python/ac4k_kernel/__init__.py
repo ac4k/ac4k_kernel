@@ -21,16 +21,16 @@ try:
         __arch__,
         __backend__,
         # Attention
-        nvfp4_mha_fwd,
-        qk_int8_pv_fp8_mha_fwd,
+        mha_nvfp4_fwd,
+        mha_int8_x_fp8_fwd,
         # Quantize
-        nvfp4_quantize,
-        fp8_quantize,
-        int8_quantize,
-        # Dot
-        nvfp4_dot_scale,
+        quantize_nvfp4,
+        quantize_fp8,
+        quantize_int8,
+        # Linear
+        linear_nvfp4,
         # RoPE
-        rope_3d_apply,
+        rope3d,
     )
     _backend = __backend__
     _arch = __arch__
@@ -84,11 +84,11 @@ __all__ = [
     "get_arch",
     "get_info",
     # Operators (if CUDA)
-    "nvfp4_mha_fwd",
-    "qk_int8_pv_fp8_mha_fwd",
-    "nvfp4_quantize",
-    "fp8_quantize",
-    "int8_quantize",
-    "nvfp4_dot_scale",
-    "rope_3d_apply",
+    "mha_nvfp4_fwd",
+    "mha_int8_x_fp8_fwd",
+    "quantize_nvfp4",
+    "quantize_fp8",
+    "quantize_int8",
+    "linear_nvfp4",
+    "rope3d",
 ]

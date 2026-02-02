@@ -9,7 +9,7 @@ import torch
 from .quant import quantize
 
 # Direct imports - no lazy loading, no runtime dispatch
-from .._cuda_ops import nvfp4_mha_fwd, qk_int8_pv_fp8_mha_fwd
+from .._cuda_ops import mha_nvfp4_fwd, mha_int8_x_fp8_fwd
 
 
 def _nvfp4_attention(q, k, v, layout, out=None):
@@ -38,7 +38,7 @@ def _nvfp4_attention(q, k, v, layout, out=None):
         out = out.permute(0, 2, 1, 3)
 
     sm_scale = 1 / math.sqrt(Dqk)
-    nvfp4_mha_fwd(out, q_fp4, q_sf, q_alpha, k_fp4, k_sf, k_alpha, 
+    mha_nvfp4_fwd(out, q_fp4, q_sf, q_alpha, k_fp4, k_sf, k_alpha,
                   v_fp4, v_sf, v_alpha, sm_scale)
 
     # Permute back to origin layout
@@ -48,8 +48,8 @@ def _nvfp4_attention(q, k, v, layout, out=None):
     return out
 
 
-def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
-    """INT8-QK FP8-PV precision attention implementation"""
+def _int8_x_fp8_attention(q, k, v, layout, out=None):
+    """INT8(QK) x FP8(PV) mixed-precision attention implementation"""
     assert layout in ["BNHD", "BHND"], f"Unsupported layout: {layout}"
 
     B, Dqk = q.shape[0], q.shape[-1]
@@ -75,7 +75,7 @@ def _qk_int8_pv_fp8_attention(q, k, v, layout, out=None):
         out = out.permute(0, 2, 1, 3)
 
     sm_scale = 1 / math.sqrt(Dqk)
-    qk_int8_pv_fp8_mha_fwd(out, q_int8, q_sf, k_int8, k_sf, v_fp8, v_sf, sm_scale)
+    mha_int8_x_fp8_fwd(out, q_int8, q_sf, k_int8, k_sf, v_fp8, v_sf, sm_scale)
 
     # Permute back to origin layout
     if layout == "BNHD":
@@ -95,9 +95,9 @@ def attention(
 ) -> torch.Tensor:
     """
     High-performance Multi-Head Attention
-    
+
     Zero-overhead dispatch - kernel is selected at compile time.
-    
+
     Args:
         q: Query tensor [B, N, H, D] or [B, H, N, D], bfloat16
         k: Key tensor [B, N, H, D] or [B, H, N, D], bfloat16
@@ -105,10 +105,10 @@ def attention(
         layout: "BNHD" or "BHND"
         precision: "nvfp4" or "int8+fp8e4m3"
         out: Optional pre-allocated output tensor
-        
+
     Returns:
         Output tensor [B, N, H, D] or [B, H, N, D], bfloat16
-        
+
     Note:
         - Head dimension D must be <= 128
         - Architecture-specific optimization is selected at install time
@@ -118,19 +118,19 @@ def attention(
     assert v.dtype == torch.bfloat16, "v dtype must be bfloat16"
     assert layout in ["BNHD", "BHND"], f"Unsupported layout: {layout}"
     assert precision in ["nvfp4", "int8+fp8e4m3"], f"Unsupported precision: {precision}"
-    
+
     if out is not None:
         assert out.dtype == torch.bfloat16, "out dtype must be bfloat16"
 
     if precision == "nvfp4":
         return _nvfp4_attention(q, k, v, layout, out=out)
     else:
-        return _qk_int8_pv_fp8_attention(q, k, v, layout, out=out)
+        return _int8_x_fp8_attention(q, k, v, layout, out=out)
 
 
 # Direct kernel exports for maximum performance
 __all__ = [
     "attention",
-    "nvfp4_mha_fwd",
-    "qk_int8_pv_fp8_mha_fwd",
+    "mha_nvfp4_fwd",
+    "mha_int8_x_fp8_fwd",
 ]

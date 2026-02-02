@@ -10,7 +10,7 @@
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 
-#include "ac4k_kernel/ops/cuda_ops.h"
+#include "ac4k_kernel/ops.h"
 #include "utils.cuh"
 
 #define CHECK_TYPE(x, st, m)                                                   \
@@ -128,11 +128,11 @@ template <int HEAD_DIM_QK, int HEAD_DIM_V> struct Policy {
   //===--------------------------------------------------------------------===//
 
   static constexpr CUtensorMapSwizzle SWIZZLE_Q =
-      get_swizzle<TILE_DOT0_BLOCK_K, sizeof(Q_TYPE)>();
+      sm120::get_swizzle<TILE_DOT0_BLOCK_K, sizeof(Q_TYPE)>();
   static constexpr CUtensorMapSwizzle SWIZZLE_K =
-      get_swizzle<TILE_DOT0_BLOCK_K, sizeof(K_TYPE)>();
+      sm120::get_swizzle<TILE_DOT0_BLOCK_K, sizeof(K_TYPE)>();
   static constexpr CUtensorMapSwizzle SWIZZLE_V =
-      get_swizzle<TILE_DOT1_BLOCK_K, sizeof(V_TYPE)>();
+      sm120::get_swizzle<TILE_DOT1_BLOCK_K, sizeof(V_TYPE)>();
 
   //===--------------------------------------------------------------------===//
   // Shared memory layout
@@ -414,7 +414,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
   //===--------------------------------------------------------------------===//
 
   if (is_producer) {
-    reg_dealloc<24>();
+    sm120::reg_dealloc<24>();
     if (tid == Policy::CONSUMER_THREAD_NUM) {
       int stage = 0;
       int phase = 0;
@@ -476,7 +476,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
   //===--------------------------------------------------------------------===//
 
   else {
-    reg_alloc<240>();
+    sm120::reg_alloc<240>();
     if (lane_id == 0) {
 #pragma unroll
       for (int i = 0; i < Policy::STAGE; ++i) {
@@ -617,14 +617,14 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
             /// Dot0: Q @ V
             if (dot0_k == 0) {
               /// Init with zeor
-              mma_sync_m16n8k32_row_col_i8i8i32<MMAAccumulateMode::kInit>(
+              sm120::mma_sync_m16n8k32_row_col_i8i8i32<sm120::MMAAccumulateMode::kInit>(
                   reinterpret_cast<int32_t *>(
                       s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
                   q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
                   k_frag.data);
             } else {
               /// Inplace s_frag
-              mma_sync_m16n8k32_row_col_i8i8i32(
+              sm120::mma_sync_m16n8k32_row_col_i8i8i32(
                   reinterpret_cast<int32_t *>(
                       s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
                   q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
@@ -894,11 +894,11 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
             /// Dot1: P @ V
             if (dot1_atomic_k == 0) {
-              mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
+              sm120::mma_sync_m16n8k32_row_col_fp8fp8f16<sm120::MMAAccumulateMode::kInit>(
                   o_f16[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data,
                   p_fp8_frag.data, v_frag.data);
             } else {
-              mma_sync_m16n8k32_row_col_fp8fp8f16(
+              sm120::mma_sync_m16n8k32_row_col_fp8fp8f16(
                   o_f16[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data,
                   p_fp8_frag.data, v_frag.data);
             }
@@ -1021,7 +1021,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 // Dqk             : Head dim size for Q and K
 //===--------------------------------------------------------------------===//
 
-void qk_int8_pv_fp8_mha_fwd_sm120(torch::Tensor &o, torch::Tensor &q,
+void mha_int8_x_fp8_fwd(torch::Tensor &o, torch::Tensor &q,
                                   torch::Tensor &q_sf, torch::Tensor &k,
                                   torch::Tensor &k_sf, torch::Tensor &v,
                                   torch::Tensor &v_sf, float sm_scale) {
