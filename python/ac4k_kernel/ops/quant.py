@@ -1,7 +1,18 @@
+"""
+Quantization operators for ac4k_kernel.
+
+Supports NVFp4, FP8, and INT8 quantization with zero-overhead dispatch.
+"""
 import torch
-from functools import lru_cache
 import triton
 import triton.language as tl
+
+# Direct imports - zero runtime dispatch overhead
+from .._cuda_ops import (
+    quantize_nvfp4 as _quantize_nvfp4,
+    quantize_fp8 as _quantize_fp8,
+    quantize_int8 as _quantize_int8,
+)
 
 
 @triton.autotune(
@@ -45,40 +56,10 @@ def _global_scale(x: torch.Tensor, max_scale: float) -> torch.Tensor:
     return out
 
 
-@lru_cache(maxsize=1)
-def _load_cuda_nvfp4_quantize():
-    try:
-        from ._cuda_ops import nvfp4_quantize_sm120
-        return nvfp4_quantize_sm120
-    except ImportError as e:
-        raise ImportError(
-            "CUDA operator 'nvfp4_quantize_sm120' failed to load. "
-            "Possible reasons: CUDA not available, or module not compiled."
-        ) from e
-
-
-@lru_cache(maxsize=1)
-def _load_cuda_fp8_quantize():
-    try:
-        from ._cuda_ops import fp8_quantize_sm120
-        return fp8_quantize_sm120
-    except ImportError as e:
-        raise ImportError(
-            "CUDA operator 'fp8_quantize_sm120' failed to load. "
-            "Possible reasons: CUDA not available, or module not compiled."
-        ) from e
-
-
-@lru_cache(maxsize=1)
-def _load_cuda_i8_quantize():
-    try:
-        from ._cuda_ops import int8_quantize_sm120
-        return int8_quantize_sm120
-    except ImportError as e:
-        raise ImportError(
-            "CUDA operator 'int8_quantize_sm120' failed to load. "
-            "Possible reasons: CUDA not available, or module not compiled."
-        ) from e
+# Direct function references for zero-overhead access
+quantize_nvfp4 = _quantize_nvfp4
+quantize_fp8 = _quantize_fp8
+quantize_int8 = _quantize_int8
 
 
 class Ac4kQuantizeOp(torch.nn.Module):
@@ -115,7 +96,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
         # Quantize to fp8e4m3
         if precision == "fp8e4m3":
-            quantize_kernel = _load_cuda_fp8_quantize()
+            quantize_kernel = _quantize_fp8
 
             CROSS_DIM_ALIGN_SIZE = 16
             REDUCE_DIM_ALIGN_SIZE = 16
@@ -164,7 +145,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
             return output, sf
         elif precision == "int8":
-            quantize_kernel = _load_cuda_i8_quantize()
+            quantize_kernel = _quantize_int8
 
             CROSS_DIM_ALIGN_SIZE = 16
             REDUCE_DIM_ALIGN_SIZE = 16
@@ -213,7 +194,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
 
             return output, sf
         else:
-            quantize_kernel = _load_cuda_nvfp4_quantize()
+            quantize_kernel = _quantize_nvfp4
 
             BLOCK_SIZE = 16
             NVFP4_ELES_PER_BYTE = 2

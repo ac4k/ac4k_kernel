@@ -13,7 +13,7 @@
 #include <torch/all.h>
 #include <vector>
 
-#include "ac4k_kernel/ops/cuda_ops.h"
+#include "ac4k_kernel/ops.h"
 #include "utils.cuh"
 
 #define CHECK_TYPE(x, st, m)                                                   \
@@ -172,7 +172,7 @@ __global__ void int8_quantize_sm120_kernel(
 ///
 /// SF layout
 /// [xx, xx, cross_dim_align] x F32
-void int8_quantize_sm120(torch::Tensor &out, torch::Tensor &sf,
+void quantize_int8(torch::Tensor &out, torch::Tensor &sf,
                          torch::Tensor const &in,
                          torch::Tensor const &scale_max, uint32_t cross_dim,
                          uint32_t reduce_dim) {

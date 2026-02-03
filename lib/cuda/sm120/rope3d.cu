@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
-#include "ac4k_kernel/ops/cuda_ops.h"
+#include "ac4k_kernel/ops.h"
 #include "utils.cuh"
 
 #define CHECK_TYPE(x, st, m)                                                   \
@@ -130,7 +130,7 @@ __global__ void rope_3d_apply_kernel(
 
 namespace ac4k {
 
-void rope_3d_apply(const torch::Tensor& x,           // [B, S, N, D], bfloat16
+void rope3d(const torch::Tensor& x,           // [B, S, N, D], bfloat16
                    const torch::Tensor& grid_sizes,  // [B, 3], int32
                    const torch::Tensor& freqs,       // [max_pos, C], complex128
                    torch::Tensor& output)            // [B, S, N, D], bfloat16

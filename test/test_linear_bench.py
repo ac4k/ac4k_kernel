@@ -1,6 +1,7 @@
 import torch
+import random
 
-from ac4k_kernel.ops import quantize, dot_scale
+from ac4k_kernel.ops import quantize, linear
 
 
 def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
@@ -74,8 +75,8 @@ def get_torch_results(a_fp4,
                       b_global_scale,
                       m,
                       n,
-                      dtype,
                       block_size,
+                      o_dtype=None,
                       bias=None):
     assert a_fp4.dtype == torch.uint8
     assert b_fp4.dtype == torch.uint8
@@ -100,28 +101,40 @@ def get_torch_results(a_fp4,
     if bias is not None:
         out += bias
 
-    return out.to(dtype)
+    if o_dtype is None:
+        return out.to(torch.bfloat16)
+
+    return out.to(o_dtype)
 
 
 @torch.inference_mode()
-def test_dot_scale_performance(
-    dtype: torch.dtype,
-    shape: tuple[int, int, int],
-    test_runs: int = 10,
-    warmup_runs: int = 5,
-) -> None:
-    print("test dot scale: ", shape)
+def test_linear(dtype, shape, bias_type=None, o_dtype=None) -> None:
+    print("test linear shape:{} dtype:{} bias_type:{} o_dtype:{}".format(
+        shape, dtype, bias_type, o_dtype))
 
     m, n, k = shape
     block_size = 16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
     b = torch.randn((n, k), dtype=dtype, device="cuda")
-    bias = None
+    if bias_type is None:
+        bias = None
+    else:
+        bias = torch.randn((1, n), dtype=bias_type, device="cuda")
+
+    out = None
+    if o_dtype is not None:
+        out = torch.randn((m, n), dtype=o_dtype, device="cuda")
 
     a_fp4, a_sf, a_global_scale = quantize(a, 0, 1)
     b_fp4, b_sf, b_global_scale = quantize(b, 0, 1)
-    out = dot_scale(a_fp4, a_sf, a_global_scale, b_fp4, b_sf, b_global_scale,
-                    bias)
+    out = linear(a_fp4,
+                    a_sf,
+                    a_global_scale,
+                    b_fp4,
+                    b_sf,
+                    b_global_scale,
+                    bias=bias,
+                    out=out)
 
     # ref
     expected_out = get_torch_results(a_fp4,
@@ -132,72 +145,62 @@ def test_dot_scale_performance(
                                      1 / b_global_scale,
                                      m,
                                      n,
-                                     dtype,
                                      block_size,
+                                     o_dtype=o_dtype,
                                      bias=bias)
 
     torch.testing.assert_close(out, expected_out, atol=1e-2, rtol=1e-2)
+    print("test passed\n")
 
-    # Create CUDA events for timing
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
 
-    print("Warming up...")
-    for _ in range(warmup_runs):
-        dot_scale(a_fp4,
-                  a_sf,
-                  a_global_scale,
-                  b_fp4,
-                  b_sf,
-                  b_global_scale,
-                  bias=bias,
-                  out=out)
-    torch.cuda.synchronize()  # Make sure the warmup is done
-
-    # Test performance: measure the time taken for multiple runs
-    print(f"Testing {test_runs} runs...")
-    start_event.record()
-    for _ in range(test_runs):
-        dot_scale(a_fp4,
-                  a_sf,
-                  a_global_scale,
-                  b_fp4,
-                  b_sf,
-                  b_global_scale,
-                  bias=bias,
-                  out=out)
-    end_event.record()
-
-    # Synchronize and calculate the average time taken
-    torch.cuda.synchronize()
-    total_time_ms = start_event.elapsed_time(end_event)
-    avg_time_ms = total_time_ms / test_runs
-    throughput_tflops = (m * n * k * 2) / (avg_time_ms * 1e-3) / 1e12
-
-    # Print the results
-    print("=" * 50)
-    print(f"test config: m={m}, n={n}, k={k}")
-    print(f"total time: {total_time_ms:.2f} ms")
-    print(f"avg time: {avg_time_ms:.4f} ms")
-    print(f"throughput: {throughput_tflops:.2f} TFLOPS")
-    print("=" * 50)
-    print("\n")
+def test_random(times):
+    for _ in range(times):
+        M, N, K = random.randint(2, 555), random.randint(2,
+                                                         555), random.randint(
+                                                             2, 555)
+        test_linear(torch.bfloat16, (M, N, K))
 
 
 if __name__ == "__main__":
-    torch.manual_seed(345)
-    test_dot_scale_performance(torch.bfloat16, (8192, 8192, 8192),
-                               test_runs=20,
-                               warmup_runs=5)
-    test_dot_scale_performance(torch.bfloat16, (75600, 5120, 5120),
-                               test_runs=20,
-                               warmup_runs=5)
-    test_dot_scale_performance(torch.bfloat16, (75600, 13824, 5120),
-                               test_runs=20,
-                               warmup_runs=5)
-    test_dot_scale_performance(torch.bfloat16, (75600, 5120, 13824 // 2),
-                               test_runs=20,
-                               warmup_runs=5)
-    test_dot_scale_performance(torch.bfloat16, (75600, 5120, 13824),
-                               test_runs=20,
-                               warmup_runs=5)
+    torch.manual_seed(9567)
+    random.seed(9567)
+    test_linear(torch.bfloat16, (128, 128, 128))
+    test_linear(torch.bfloat16, (10, 512, 512))
+    test_linear(torch.bfloat16, (1024, 1024, 384))
+    test_linear(torch.bfloat16, (130, 384, 256))
+    test_linear(torch.bfloat16, (666, 768, 512))
+    test_linear(torch.bfloat16, (123, 321, 256))
+    test_linear(torch.bfloat16, (10, 15, 512))
+    test_linear(torch.bfloat16, (8192, 8192, 8192))
+    test_linear(torch.bfloat16, (1, 4, 256))
+    test_linear(torch.bfloat16, (64, 64, 128))
+    test_linear(torch.bfloat16, (12, 23, 55))
+    test_linear(torch.bfloat16, (12, 23, 5), o_dtype=torch.float32)
+    test_linear(torch.bfloat16, (1, 2, 50),
+                   o_dtype=torch.float16,
+                   bias_type=torch.bfloat16)
+    test_linear(torch.bfloat16, (1, 2, 50),
+                   o_dtype=torch.float16,
+                   bias_type=torch.float16)
+    test_linear(torch.bfloat16, (2, 3, 51),
+                   o_dtype=torch.float16,
+                   bias_type=torch.float32)
+    test_linear(torch.bfloat16, (3, 2, 50),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.bfloat16)
+    test_linear(torch.bfloat16, (4, 2, 50),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.float16)
+    test_linear(torch.bfloat16, (5, 3, 51),
+                   o_dtype=torch.bfloat16,
+                   bias_type=torch.float32)
+    test_linear(torch.bfloat16, (1, 21, 50),
+                   o_dtype=torch.float32,
+                   bias_type=torch.bfloat16)
+    test_linear(torch.bfloat16, (1, 22, 50),
+                   o_dtype=torch.float32,
+                   bias_type=torch.float16)
+    test_linear(torch.bfloat16, (2, 33, 51),
+                   o_dtype=torch.float32,
+                   bias_type=torch.float32)
+    test_random(20)

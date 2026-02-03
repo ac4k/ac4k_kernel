@@ -3,7 +3,7 @@
 #include <cuda.h>
 #include <mma.h>
 
-namespace ac4k {
+namespace ac4k::sm120 {
 
 enum class MMAAccumulateMode {
   kInit = 0U,
@@ -105,4 +105,4 @@ mma_sync_m16n8k32_row_col_i8i8i32(int32_t *C_I32, uint32_t *A, uint32_t *B) {
   }
 }
 
-} // namespace ac4k
+} // namespace ac4k::sm120

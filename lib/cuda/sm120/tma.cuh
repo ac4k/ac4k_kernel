@@ -2,7 +2,7 @@
 
 #include <cuda.h>
 
-namespace ac4k {
+namespace ac4k::sm120 {
 
 //===----------------------------------------------------------------------===//
 // Swizzle
@@ -19,4 +19,4 @@ __forceinline__ constexpr CUtensorMapSwizzle get_swizzle() {
   }
 }
 
-} // namespace ac4k
+} // namespace ac4k::sm120
