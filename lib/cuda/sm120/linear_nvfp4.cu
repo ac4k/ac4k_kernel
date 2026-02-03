@@ -22,15 +22,17 @@
 
 namespace ac4k {
 
+using namespace sm120;
+
 using NVFP4x2 = uint8_t;
 using E4M3 = uint8_t;
 using E4M3x4 = uint32_t;
 constexpr int ELES_PER_NVFP4x2 = 2;
 constexpr int BLOCK_SIZE = 16;
 
-template <int TILE_BLOCK_M_, int TILE_BLOCK_N_, int TILE_BLOCK_K_,
-          int TILE_WARP_M_, int TILE_WARP_N_, int TILE_WARP_K_,
-          int GROUP_SIZE_M_ = 16>
+template <typename D_TYPE, int TILE_BLOCK_M_, int TILE_BLOCK_N_,
+          int TILE_BLOCK_K_, int TILE_WARP_M_, int TILE_WARP_N_,
+          int TILE_WARP_K_, bool ASYNC_STORE_, int GROUP_SIZE_M_ = 16>
 struct Policy {
   //===--------------------------------------------------------------------===//
   // Global memory
@@ -73,16 +75,37 @@ struct Policy {
   static const int STAGE = 2;
 
   //===--------------------------------------------------------------------===//
+  // Async store
+  //===--------------------------------------------------------------------===//
+
+  static const bool ASYNC_STORE = ASYNC_STORE_;
+
+  //===--------------------------------------------------------------------===//
+  // Consumer & Producer
+  //===--------------------------------------------------------------------===//
+
+  static const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
+  static const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
+  static const int CONSUMER_WARP_NUM = WARP_M_NUM * WARP_N_NUM;
+  static const int PRODUCER_WARP_NUM = 1;
+  static const int CONSUMER_THREAD_NUM = CONSUMER_WARP_NUM * 32;
+  static const int PRODUCER_THREAD_NUM = PRODUCER_WARP_NUM * 32;
+  static const int TOTAL_THREAD_NUM = CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM;
+
+  //===--------------------------------------------------------------------===//
   // Shared memory
   //===--------------------------------------------------------------------===//
 
-  static const int SMEM_SIZE = (TILE_BLOCK_A_SIZE + TILE_BLOCK_B_SIZE +
-                                TILE_BLOCK_A_SF_SIZE + TILE_BLOCK_B_SF_SIZE) *
-                               STAGE;
+  static const int SMEM_SIZE =
+      (TILE_BLOCK_A_SIZE + TILE_BLOCK_B_SIZE + TILE_BLOCK_A_SF_SIZE +
+       TILE_BLOCK_B_SF_SIZE) *
+          STAGE +
+      (ASYNC_STORE ? 8 * TILE_WARP_N * sizeof(D_TYPE) * CONSUMER_WARP_NUM : 0);
   static const int A_SMEM_OFF = 0;
   static const int B_SMEM_OFF = A_SMEM_OFF + TILE_BLOCK_A_SIZE * STAGE;
   static const int A_SF_SMEM_OFF = B_SMEM_OFF + TILE_BLOCK_B_SIZE * STAGE;
   static const int B_SF_SMEM_OFF = A_SF_SMEM_OFF + TILE_BLOCK_A_SF_SIZE * STAGE;
+  static const int D_SMEM_OFF = B_SF_SMEM_OFF + TILE_BLOCK_B_SF_SIZE * STAGE;
   static __forceinline__ __device__ NVFP4x2 *get_a_stage_mem(char *smem,
                                                              int stage) {
     return reinterpret_cast<NVFP4x2 *>(smem + A_SMEM_OFF +
@@ -103,27 +126,20 @@ struct Policy {
     return reinterpret_cast<E4M3x4 *>(smem + B_SF_SMEM_OFF +
                                       TILE_BLOCK_B_SF_SIZE * stage);
   }
-
-  //===--------------------------------------------------------------------===//
-  // Consumer & Producer
-  //===--------------------------------------------------------------------===//
-
-  static const int WARP_M_NUM = TILE_BLOCK_M / TILE_WARP_M;
-  static const int WARP_N_NUM = TILE_BLOCK_N / TILE_WARP_N;
-  static const int CONSUMER_WARP_NUM = WARP_M_NUM * WARP_N_NUM;
-  static const int PRODUCER_WARP_NUM = 1;
-  static const int CONSUMER_THREAD_NUM = CONSUMER_WARP_NUM * 32;
-  static const int PRODUCER_THREAD_NUM = PRODUCER_WARP_NUM * 32;
-  static const int TOTAL_THREAD_NUM = CONSUMER_THREAD_NUM + PRODUCER_THREAD_NUM;
+  static __forceinline__ __device__ D_TYPE *get_d_stage_mem(char *smem) {
+    return reinterpret_cast<D_TYPE *>(smem + D_SMEM_OFF);
+  }
 
   //===--------------------------------------------------------------------===//
   // Swizzle
   //===--------------------------------------------------------------------===//
 
   static constexpr CUtensorMapSwizzle SWIZZLE_A =
-      sm120::get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
   static constexpr CUtensorMapSwizzle SWIZZLE_B =
-      sm120::get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+      get_swizzle<TILE_BLOCK_K / ELES_PER_NVFP4x2, sizeof(NVFP4x2)>();
+  static constexpr CUtensorMapSwizzle SWIZZLE_D =
+      get_swizzle<TILE_WARP_N, sizeof(D_TYPE)>();
 };
 
 //===----------------------------------------------------------------------===//
@@ -174,6 +190,21 @@ load_4d_async(void *dst, void const *const tma_map, uint64_t *bar, int off0,
                :
                : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(off3),
                  "r"(off2), "r"(off1), "r"(off0)
+               : "memory");
+}
+
+__device__ static __forceinline__ void store_4d_async(void *src,
+                                                      void const *const tma_map,
+                                                      int off0, int off1,
+                                                      int off2, int off3) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(tma_map);
+  uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+  asm volatile("cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
+               " [%0, {%2, %3, %4, %5}], [%1];"
+               :
+               : "l"(tma_ptr), "r"(src_ptr), "r"(off3), "r"(off2), "r"(off1),
+                 "r"(off0)
                : "memory");
 }
 
@@ -305,16 +336,16 @@ __device__ static __forceinline__ int2 get_program_id(int M, int N) {
 
 template <at::ScalarType D_AT_TYPE, at::ScalarType BIAS_AT_TYPE,
           typename Policy>
-__launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
-    void nvfp4_dot_scale_sm120_kernel(
-        typename AtDataTraits<D_AT_TYPE>::Type *__restrict__ D,
-        const float *__restrict__ A_global_scale,
-        const float *__restrict__ B_global_scale,
-        const typename AtDataTraits<BIAS_AT_TYPE>::Type *__restrict__ bias,
-        int M, int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
-        const __grid_constant__ CUtensorMap b_tensor_map,
-        const __grid_constant__ CUtensorMap a_sf_tensor_map,
-        const __grid_constant__ CUtensorMap b_sf_tensor_map) {
+__launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__ void linear_nvfp4_kernel(
+    typename AtDataTraits<D_AT_TYPE>::Type *__restrict__ D,
+    const float *__restrict__ A_global_scale,
+    const float *__restrict__ B_global_scale,
+    const typename AtDataTraits<BIAS_AT_TYPE>::Type *__restrict__ bias, int M,
+    int N, int K, const __grid_constant__ CUtensorMap a_tensor_map,
+    const __grid_constant__ CUtensorMap b_tensor_map,
+    const __grid_constant__ CUtensorMap a_sf_tensor_map,
+    const __grid_constant__ CUtensorMap b_sf_tensor_map,
+    const __grid_constant__ CUtensorMap d_tensor_map) {
   using D_TYPE = typename AtDataTraits<D_AT_TYPE>::Type;
   using D_TYPEx2 = typename AtDataTraits<D_AT_TYPE>::Typex2;
 
@@ -417,7 +448,8 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
 
     /// Each thread has a copy of this tile
     AFrag_NVFP4_16x64 a_frag;
-    BFrag_NVFP4_64x8 b_frag;
+    BFrag_NVFP4_64x8 b_frag[Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N];
+    uint32_t sfb0[Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N];
     DFrag_F32_16x8 c_frag[Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M]
                          [Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N];
 
@@ -495,40 +527,44 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
                  ++atomic_n_cnt) {
               int atomic_n = atomic_n_cnt * Policy::TILE_ATOMIC_N;
 
-              /// SF B
-              uint32_t sfb0 = 0;
-              {
-                int row = warp_n + atomic_n + (lane_id / 4);
-                int col = warp_k + atomic_k;
-                sfb0 = Policy::get_b_sf_stage_mem(
-                    smem, stage)[col / 64 * Policy::TILE_BLOCK_N + row];
+              if (atomic_m_cnt == 0) {
+                /// SF B
+                {
+                  int row = warp_n + atomic_n + (lane_id / 4);
+                  int col = warp_k + atomic_k;
+                  sfb0[atomic_n_cnt] = Policy::get_b_sf_stage_mem(
+                      smem, stage)[col / 64 * Policy::TILE_BLOCK_N + row];
+                }
+
+                /// Load shared to fragment for B operand
+                {
+                  int *b_regs = (int *)b_frag[atomic_n_cnt].data;
+                  int b_shared_row = warp_n + atomic_n + (lane_id % 8);
+                  int b_shared_col =
+                      (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
+                      ELES_PER_NVFP4x2;
+                  int b_shared_row_swiz =
+                      SwizzleIndexMap<Policy::SWIZZLE_B>::get_row(
+                          b_shared_row, b_shared_col, sizeof(NVFP4x2));
+                  int b_shared_col_swiz =
+                      SwizzleIndexMap<Policy::SWIZZLE_B>::get_col(
+                          b_shared_row, b_shared_col, sizeof(NVFP4x2));
+                  uint32_t b_addr = __cvta_generic_to_shared(
+                      Policy::get_b_stage_mem(smem, stage) +
+                      b_shared_row_swiz * Policy::TILE_BLOCK_K /
+                          ELES_PER_NVFP4x2 +
+                      b_shared_col_swiz);
+                  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                               "{%0, %1}, [%2];"
+                               : "=r"(b_regs[0]), "=r"(b_regs[1])
+                               : "r"(b_addr));
+                }
               }
 
-              /// Load shared to fragment for B operand
-              int *b_regs = (int *)b_frag.data;
-              int b_shared_row = warp_n + atomic_n + (lane_id % 8);
-              int b_shared_col =
-                  (warp_k + atomic_k + ((lane_id % 16) / 8) * 32) /
-                  ELES_PER_NVFP4x2;
-              int b_shared_row_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_B>::get_row(
-                      b_shared_row, b_shared_col, sizeof(NVFP4x2));
-              int b_shared_col_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_B>::get_col(
-                      b_shared_row, b_shared_col, sizeof(NVFP4x2));
-              uint32_t b_addr = __cvta_generic_to_shared(
-                  Policy::get_b_stage_mem(smem, stage) +
-                  b_shared_row_swiz * Policy::TILE_BLOCK_K / ELES_PER_NVFP4x2 +
-                  b_shared_col_swiz);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-                           "{%0, %1}, [%2];"
-                           : "=r"(b_regs[0]), "=r"(b_regs[1])
-                           : "r"(b_addr));
-
               /// Apply mma
-              sm120::mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
+              mma_sync_m16n8k64_row_col_nvfp4nvfp4f32(
                   c_frag[atomic_m_cnt][atomic_n_cnt].data, a_frag.data,
-                  b_frag.data, sfa0, sfb0);
+                  b_frag[atomic_n_cnt].data, sfa0, sfb0[atomic_n_cnt]);
             } // end loop atomic_n
           } // end loop atomic_m
         } // end loop atomic_k
@@ -600,58 +636,72 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
     // Write back to D
     //===------------------------------------------------------------------===//
 
-    if (/* out-of-bound check */ block_m + Policy::TILE_BLOCK_M <= M &&
-        /* out-of-bound check */ block_n + Policy::TILE_BLOCK_N <= N &&
-        /* align 2 check */ (N % 2) == 0) {
-
+    /// Store result by tma
+    if constexpr (Policy::ASYNC_STORE) {
 #pragma unroll
       for (int atomic_m_cnt = 0;
            atomic_m_cnt < Policy::TILE_WARP_M / Policy::TILE_ATOMIC_M;
            ++atomic_m_cnt) {
 #pragma unroll
-        for (int atomic_n_cnt = 0;
-             atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
-             ++atomic_n_cnt) {
-          D_TYPEx2 out;
-          auto *outx2 = reinterpret_cast<D_TYPE *>(&out);
-          {
-            outx2[0] = f32_to_fpoint<D_TYPE>(
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[0]);
-            outx2[1] = f32_to_fpoint<D_TYPE>(
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[1]);
+        for (int i = 0; i < 2; ++i) {
+          // stmatrix
+          D_TYPE *d_smem_ptr =
+              Policy::get_d_stage_mem(smem) + warp_id * 8 * Policy::TILE_WARP_N;
 
-            int thread_m =
-                atomic_m_cnt * Policy::TILE_ATOMIC_M +
-                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 0);
-            int m = block_m + warp_m + thread_m;
-            int thread_n =
-                atomic_n_cnt * Policy::TILE_ATOMIC_N +
-                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 0);
-            int n = block_n + warp_n + thread_n;
-            *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
+#pragma unroll
+          for (int atomic_n_cnt = 0;
+               atomic_n_cnt < Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N;
+               atomic_n_cnt += 4) {
+            static_assert((Policy::TILE_WARP_N / Policy::TILE_ATOMIC_N) % 4 ==
+                              0,
+                          "atomic_n_cnt must be multiple of 4");
+            D_TYPEx2 outx2[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              auto *outx1 = reinterpret_cast<D_TYPE *>(&outx2[j]);
+              outx1[0] = f32_to_fpoint<D_TYPE>(
+                  c_frag[atomic_m_cnt][atomic_n_cnt + j].data[i * 2]);
+              outx1[1] = f32_to_fpoint<D_TYPE>(
+                  c_frag[atomic_m_cnt][atomic_n_cnt + j].data[i * 2 + 1]);
+            }
+
+            int *regs = (int *)outx2;
+            int shared_m = (lane_id % 8);
+            int shared_n =
+                atomic_n_cnt * Policy::TILE_ATOMIC_N + (lane_id / 8) * 8;
+            int shared_m_swiz = SwizzleIndexMap<Policy::SWIZZLE_D>::get_row(
+                shared_m, shared_n, sizeof(D_TYPE));
+            int shared_n_swiz = SwizzleIndexMap<Policy::SWIZZLE_D>::get_col(
+                shared_m, shared_n, sizeof(D_TYPE));
+            uint32_t d_addr = __cvta_generic_to_shared(
+                d_smem_ptr + shared_m_swiz * Policy::TILE_WARP_N +
+                shared_n_swiz);
+            /// Wait tma done
+            if (atomic_n_cnt == 0) {
+              asm volatile("cp.async.bulk.wait_group 0;");
+            }
+            asm volatile(
+                "stmatrix.sync.aligned.m8n8.x4.b16 [%0], {%1, %2, %3, %4};\n" ::
+                    "r"(d_addr),
+                "r"(regs[0]), "r"(regs[1]), "r"(regs[2]), "r"(regs[3]));
+          } // end loop atomic_n_cnt
+
+          cuda::device::experimental::fence_proxy_async_shared_cta();
+          if (lane_id == 0) {
+            store_4d_async(d_smem_ptr, &d_tensor_map, 0, 0,
+                           block_m + warp_m +
+                               atomic_m_cnt * Policy::TILE_ATOMIC_M + i * 8,
+                           block_n + warp_n);
+            asm volatile("cp.async.bulk.commit_group;");
           }
-
-          {
-            outx2[0] = f32_to_fpoint<D_TYPE>(
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[2]);
-            outx2[1] = f32_to_fpoint<D_TYPE>(
-                c_frag[atomic_m_cnt][atomic_n_cnt].data[3]);
-
-            int thread_m =
-                atomic_m_cnt * Policy::TILE_ATOMIC_M +
-                c_frag[atomic_m_cnt][atomic_n_cnt].get_row_with_reg(lane_id, 2);
-            int m = block_m + warp_m + thread_m;
-            int thread_n =
-                atomic_n_cnt * Policy::TILE_ATOMIC_N +
-                c_frag[atomic_m_cnt][atomic_n_cnt].get_col_with_reg(lane_id, 2);
-            int n = block_n + warp_n + thread_n;
-            *reinterpret_cast<D_TYPEx2 *>(D + m * N + n) = out;
-          }
-        } // end loop atomic_n_cnt
+        } // end loop i
       } // end loop atomic_m_cnt
-    } else {
-      // Meet out-of-range
 
+      asm volatile("cp.async.bulk.wait_group 0;");
+    }
+
+    /// Store result by thread itself
+    else {
       // Check warp
       if (block_m + warp_m >= M || block_n + warp_n >= N) {
         return;
@@ -702,8 +752,8 @@ __launch_bounds__(Policy::TOTAL_THREAD_NUM) __global__
 
 void linear_nvfp4(torch::Tensor &D, torch::Tensor const &A,
                   torch::Tensor const &A_sf,
-                  torch::Tensor const &A_global_scale,
-                  torch::Tensor const &B, torch::Tensor const &B_sf,
+                  torch::Tensor const &A_global_scale, torch::Tensor const &B,
+                  torch::Tensor const &B_sf,
                   torch::Tensor const &B_global_scale,
                   c10::optional<torch::Tensor> const &bias) {
   /// Check D
@@ -758,70 +808,94 @@ void linear_nvfp4(torch::Tensor &D, torch::Tensor const &A,
   DISPATCH_AT_TENSOR_TYPES<
       at::ScalarType::BFloat16, at::ScalarType::Half,
       at::ScalarType::Float>(D.scalar_type(), [&]<at::ScalarType D_AT_TYPE>() {
+    using D_T = typename AtDataTraits<D_AT_TYPE>::Type;
     /// Dispatch bias
     auto bias_type = bias.has_value() ? bias.value().scalar_type() : D_AT_TYPE;
     DISPATCH_AT_TENSOR_TYPES<
         at::ScalarType::BFloat16, at::ScalarType::Half,
         at::ScalarType::Float>(bias_type, [&]<at::ScalarType BIAS_AT_TYPE>() {
-      using D_T = typename AtDataTraits<D_AT_TYPE>::Type;
       using BIAS_T = typename AtDataTraits<BIAS_AT_TYPE>::Type;
-      using policy = Policy<128, 128, 128 * 2, 32, 64, 64, 8>;
 
-      /// Grid & Block dim3
-      dim3 grid(ceil_div(N, policy::TILE_BLOCK_N) *
-                ceil_div(M, policy::TILE_BLOCK_M));
-      dim3 block(policy::TOTAL_THREAD_NUM);
+      DISPATCH_BOOLEAN_VALUES<true, false>(
+          (D_AT_TYPE == at::ScalarType::BFloat16 ||
+           D_AT_TYPE == at::ScalarType::Half) &&
+              ((D.size(1) * sizeof(D_T)) % 16 == 0),
+          [&]<bool ASYNC_STORE>() {
+            using policy =
+                Policy<D_T, 128, 128, 128 * 2, 32, 64, 64, ASYNC_STORE, 8>;
 
-      /// Get CUDA stream
-      auto stream = at::cuda::getCurrentCUDAStream().stream();
+            /// Grid & Block dim3
+            dim3 grid(ceil_div(N, policy::TILE_BLOCK_N) *
+                      ceil_div(M, policy::TILE_BLOCK_M));
+            dim3 block(policy::TOTAL_THREAD_NUM);
 
-      /// Set dynamic shared memory size
-      auto *kernel =
-          nvfp4_dot_scale_sm120_kernel<D_AT_TYPE, BIAS_AT_TYPE, policy>;
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          policy::SMEM_SIZE));
+            /// Get CUDA stream
+            auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-      /// TMA descriptor
-      CUtensorMap a_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_BLOCK_M, policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
-          policy::SWIZZLE_A>(reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
-                             static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-                             static_cast<uint64_t>(A.size(0)),
-                             static_cast<uint64_t>(A.size(1)));
-      CUtensorMap b_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_BLOCK_N, policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
-          policy::SWIZZLE_B>(reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
-                             static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-                             static_cast<uint64_t>(B.size(0)),
-                             static_cast<uint64_t>(B.size(1)));
-      CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4), policy::TILE_BLOCK_M,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-          reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(A_sf.size(0)),
-          static_cast<uint64_t>(A_sf.size(1)));
-      CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
-          1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4), policy::TILE_BLOCK_N,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
-          reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
-          static_cast<uint64_t>(1), static_cast<uint64_t>(1),
-          static_cast<uint64_t>(B_sf.size(0)),
-          static_cast<uint64_t>(B_sf.size(1)));
+            /// Set dynamic shared memory size
+            auto *kernel = linear_nvfp4_kernel<D_AT_TYPE, BIAS_AT_TYPE, policy>;
+            CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                policy::SMEM_SIZE));
 
-      /// Launch kernel
-      kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
-          reinterpret_cast<D_T *>(D.data_ptr()),
-          reinterpret_cast<const float *>(A_global_scale.data_ptr()),
-          reinterpret_cast<const float *>(B_global_scale.data_ptr()),
-          bias.has_value()
-              ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
-              : nullptr,
-          M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map,
-          b_sf_tensor_map);
+            /// TMA descriptor
+            CUtensorMap a_tensor_map = create_4d_tensor_map<
+                1, 1, policy::TILE_BLOCK_M,
+                policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
+                policy::SWIZZLE_A>(
+                reinterpret_cast<const NVFP4x2 *>(A.data_ptr()),
+                static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                static_cast<uint64_t>(A.size(0)),
+                static_cast<uint64_t>(A.size(1)));
+            CUtensorMap b_tensor_map = create_4d_tensor_map<
+                1, 1, policy::TILE_BLOCK_N,
+                policy::TILE_BLOCK_K / ELES_PER_NVFP4x2,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, NVFP4x2,
+                policy::SWIZZLE_B>(
+                reinterpret_cast<const NVFP4x2 *>(B.data_ptr()),
+                static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                static_cast<uint64_t>(B.size(0)),
+                static_cast<uint64_t>(B.size(1)));
+            CUtensorMap a_sf_tensor_map = create_4d_tensor_map<
+                1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4),
+                policy::TILE_BLOCK_M,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+                reinterpret_cast<const uint32_t *>(A_sf.data_ptr()),
+                static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                static_cast<uint64_t>(A_sf.size(0)),
+                static_cast<uint64_t>(A_sf.size(1)));
+            CUtensorMap b_sf_tensor_map = create_4d_tensor_map<
+                1, 1, policy::TILE_BLOCK_K / (BLOCK_SIZE * 4),
+                policy::TILE_BLOCK_N,
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32, uint32_t>(
+                reinterpret_cast<const uint32_t *>(B_sf.data_ptr()),
+                static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                static_cast<uint64_t>(B_sf.size(0)),
+                static_cast<uint64_t>(B_sf.size(1)));
+            CUtensorMap d_tensor_map;
+            if (ASYNC_STORE) {
+              d_tensor_map = create_4d_tensor_map<
+                  1, 1, 8, policy::TILE_WARP_N,
+                  CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT16, D_T,
+                  policy::SWIZZLE_D>(
+                  reinterpret_cast<const D_T *>(D.data_ptr()),
+                  static_cast<uint64_t>(1), static_cast<uint64_t>(1),
+                  static_cast<uint64_t>(D.size(0)),
+                  static_cast<uint64_t>(D.size(1)));
+            }
+
+            /// Launch kernel
+            kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
+                reinterpret_cast<D_T *>(D.data_ptr()),
+                reinterpret_cast<const float *>(A_global_scale.data_ptr()),
+                reinterpret_cast<const float *>(B_global_scale.data_ptr()),
+                bias.has_value()
+                    ? reinterpret_cast<const BIAS_T *>(bias.value().data_ptr())
+                    : nullptr,
+                M, N, K, a_tensor_map, b_tensor_map, a_sf_tensor_map,
+                b_sf_tensor_map, d_tensor_map);
+          });
     });
   });
 }
