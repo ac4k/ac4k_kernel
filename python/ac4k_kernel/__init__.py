@@ -48,21 +48,19 @@ except ImportError:
         pass
 
 if _backend is None:
-    raise ImportError(
-        "AC4K Kernel: No backend available.\n"
-        "Please install with CUDA or ROCm support:\n"
-        "  pip install . (auto-detect)\n"
-        "  AC4K_BACKEND=cuda pip install .\n"
-        "  AC4K_BACKEND=rocm pip install ."
-    )
+    raise ImportError("AC4K Kernel: No backend available.\n"
+                      "Please install with CUDA or ROCm support:\n"
+                      "  pip install . (auto-detect)\n"
+                      "  AC4K_BACKEND=cuda pip install .\n"
+                      "  AC4K_BACKEND=rocm pip install .")
 
 
-def get_backend() -> str:
+def get_backend() -> str | None:
     """Return the compiled backend ('cuda' or 'rocm')"""
     return _backend
 
 
-def get_arch() -> str:
+def get_arch() -> str | None:
     """Return the compiled architecture (e.g., 'sm120', 'gfx942')"""
     return _arch
 
