@@ -9,17 +9,10 @@ import triton
 import triton.language as tl
 
 from .quant import quantize
+from .utils import ceil_div, align_up
 
 # Direct imports - no lazy loading, no runtime dispatch
 from .._cuda_ops import mha_nvfp4_fwd, mha_int8_x_fp8_fwd
-
-
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _align_up(a, b):
-    return _ceil_div(a, b) * b
 
 
 @triton.jit
@@ -72,10 +65,10 @@ def _int8_quantize(x, layout, dim, type="token", BLOCK_SIZE=64, HDIM_ALIGN=16):
             1), x.stride(2), x.stride(3)
         assert dim in [2, 3]
 
-    scale = torch.empty([B, H, _ceil_div(x.shape[dim], BLOCK_SIZE)],
+    scale = torch.empty([B, H, ceil_div(x.shape[dim], BLOCK_SIZE)],
                         device=x.device,
                         dtype=torch.float32)
-    y = torch.empty([B, H, N, _align_up(D, HDIM_ALIGN)],
+    y = torch.empty([B, H, N, align_up(D, HDIM_ALIGN)],
                     device=x.device,
                     dtype=torch.int8)
 

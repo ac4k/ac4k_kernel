@@ -3,6 +3,9 @@ Quantization operators for ac4k_kernel.
 
 Supports NVFp4, FP8, and INT8 quantization with zero-overhead dispatch.
 """
+
+from .utils import align_up
+
 import torch
 import triton
 import triton.language as tl
@@ -67,14 +70,6 @@ class Ac4kQuantizeOp(torch.nn.Module):
     def __init__(self):
         super(Ac4kQuantizeOp, self).__init__()
 
-    @staticmethod
-    def ceil_div(x, y):
-        return (x + y - 1) // y
-
-    @staticmethod
-    def align_up(x, y):
-        return Ac4kQuantizeOp.ceil_div(x, y) * y
-
     def forward(self,
                 input: torch.Tensor,
                 cross_dim,
@@ -112,8 +107,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
                     output_shape.append(input_shape[i])
             output_shape.append(input_shape[cross_dim])
             output_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[reduce_dim],
-                                        REDUCE_DIM_ALIGN_SIZE))
+                align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE))
             # sf
             # sf layout: [xx, xx, cross_dim_align] x f32
             sf_shape = []
@@ -121,8 +115,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
                 if i != cross_dim and i != reduce_dim:
                     sf_shape.append(input_shape[i])
             sf_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[cross_dim],
-                                        CROSS_DIM_ALIGN_SIZE))
+                align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
 
             # alloc buffer for output and sf
             if output is None:
@@ -161,8 +154,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
                     output_shape.append(input_shape[i])
             output_shape.append(input_shape[cross_dim])
             output_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[reduce_dim],
-                                        REDUCE_DIM_ALIGN_SIZE))
+                align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE))
             # sf
             # sf layout: [xx, xx, cross_dim_align] x f32
             sf_shape = []
@@ -170,8 +162,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
                 if i != cross_dim and i != reduce_dim:
                     sf_shape.append(input_shape[i])
             sf_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[cross_dim],
-                                        CROSS_DIM_ALIGN_SIZE))
+                align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
 
             # alloc buffer for output and sf
             if output is None:
@@ -218,8 +209,7 @@ class Ac4kQuantizeOp(torch.nn.Module):
                     output_shape.append(input_shape[i])
             output_shape.append(input_shape[cross_dim])
             output_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[reduce_dim],
-                                        REDUCE_DIM_ALIGN_SIZE) //
+                align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
                 NVFP4_ELES_PER_BYTE)
             # sf
             # sf layout: [xx, xx, reduce_dim_align / 64, cross_dim_align, 4] x f8
@@ -228,12 +218,10 @@ class Ac4kQuantizeOp(torch.nn.Module):
                 if i != cross_dim and i != reduce_dim:
                     sf_shape.append(input_shape[i])
             sf_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[reduce_dim],
-                                        REDUCE_DIM_ALIGN_SIZE) //
+                align_up(input_shape[reduce_dim], REDUCE_DIM_ALIGN_SIZE) //
                 (BLOCK_SIZE * PACK_SF))
             sf_shape.append(
-                Ac4kQuantizeOp.align_up(input_shape[cross_dim],
-                                        CROSS_DIM_ALIGN_SIZE))
+                align_up(input_shape[cross_dim], CROSS_DIM_ALIGN_SIZE))
             sf_shape.append(4)
 
             # alloc buffer for output and sf
