@@ -156,9 +156,7 @@ struct Policy {
   static constexpr int SMEM_SIZE =
       TILE_Q_BLOCK_SIZE + TILE_K_BLOCK_SIZE * STAGE +
       TILE_V_BLOCK_SIZE * STAGE + TILE_V_SF_BLOCK_SIZE;
-  static __forceinline__ __device__ Q_TYPE *get_q_stage_mem(char *smem,
-                                                            int stage) {
-    (void)stage;
+  static __forceinline__ __device__ Q_TYPE *get_q_stage_mem(char *smem) {
     return reinterpret_cast<Q_TYPE *>(smem + Q_SMEM_OFF);
   }
   static __forceinline__ __device__ K_TYPE *get_k_stage_mem(char *smem,
@@ -421,7 +419,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
       /// Acquire
       wait(&empty_bar[stage], phase);
-      load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
+      load_4d_async(Policy::get_q_stage_mem(smem), &q_tensor_map,
                     &full_bar[stage], block_b, block_h, block_dot_m, 0);
       load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
                     &full_bar[stage], block_b, block_h, 0, 0);
@@ -474,9 +472,6 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       }
     }
 
-    /// Scale for softmax
-    sm_scale = sm_scale * LOG2E_F;
-
     //===------------------------------------------------------------------===//
     // Define fragment
     //===------------------------------------------------------------------===//
@@ -520,62 +515,27 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       }
     }
 
-    for (int dot0_n = 0, stage = 0, phase = 0; dot0_n < DOT0_N;
-         dot0_n += Policy::TILE_DOT0_BLOCK_N, ++stage) {
-      if (stage == Policy::STAGE) {
-        stage = 0;
-        phase ^= 1;
-      }
-
-      block_dot0_n = dot0_n;
+    auto step = [&](int n_kv_iter, int stage, int phase, const auto &load_q,
+                    const auto &mask_oob) {
+      int n_kv = n_kv_iter * Policy::TILE_DOT0_BLOCK_N;
 
       /// Wait
       wait(&full_bar[stage], phase);
 
-      if (dot0_n == 0) {
-        /// Load shared to fragment for Q/Q_SF operand
-
-#pragma unroll
-        for (int i = 0;
-             i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M; ++i) {
-#pragma unroll
-          for (int j = 0;
-               j < Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K; ++j) {
-            /// Q
-            int *q_regs = (int *)q_frag[i][j].data;
-            int q_shared_row =
-                warp_dot0_m + i * Policy::TILE_DOT0_ATOMIC_M + (lane_id % 16);
-            int q_shared_col =
-                (j * Policy::TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
-            int q_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_row(
-                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
-            int q_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_col(
-                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
-            uint32_t q_addr = __cvta_generic_to_shared(
-                Policy::get_q_stage_mem(smem, stage) +
-                q_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
-                q_shared_col_swiz);
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-                         "{%0, %1, %2, %3}, [%4];"
-                         : "=r"(q_regs[0]), "=r"(q_regs[1]), "=r"(q_regs[2]),
-                           "=r"(q_regs[3])
-                         : "r"(q_addr));
-          } // end loop i
-        } // end loop j
-      } // end if (dot0_n == 0) leading
+      /// Load Q
+      load_q();
 
       /// Load K_SF
       float k_sf_frag =
           K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
-               dot0_n / Policy::K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
+               n_kv / Policy::K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
 
       /// S: I32
       DFrag_I32_16x8
           s_frag_i32[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
                     [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 
-      /// Step 0: S = Q @ K
-
+      /// S = Q @ K
 #pragma unroll
       for (int dot0_k = 0; dot0_k < Policy::TILE_DOT0_BLOCK_K;
            dot0_k += Policy::TILE_DOT0_ATOMIC_K) {
@@ -636,9 +596,8 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       DFrag_F32_16x8
           s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
                 [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
-
-      float qk_scale = sm_scale * q_sf_frag * k_sf_frag;
-
+      float qk_scale = sm_scale * LOG2E_F * q_sf_frag * k_sf_frag;
+      // float qk_scale = sm_scale * LOG2E_F;
 #pragma unroll
       for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
            ++i) {
@@ -658,29 +617,10 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         }
       }
 
-      /// mask to inf
-      if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
-#pragma unroll
-        for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
-             dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
-          int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
-#pragma unroll
-          for (int k = 0; k < s_frag[0][j].REGISTERS_PER_THREAD; ++k) {
-            int thread_n = s_frag[0][j].get_col_with_reg(lane_id, k);
-            if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
-#pragma unroll
-              for (int dot0_atomic_m = 0;
-                   dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
-                   dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
-                int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
-                s_frag[i][j].data[k] = -INFINITY;
-              }
-            }
-          }
-        }
-      }
+      /// Mask to -inf if out of bound
+      mask_oob(s_frag, n_kv);
 
-      /// Step 2: max = rowmax(S)
+      /// Row-max
       float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
       float max_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
@@ -715,7 +655,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         max_new1[i] = fmaxf(max_new1[i], max1[i]);
       } // end loop i
 
-      /// Step 3: p = exp(S - max)
+      /// p = exp(S - max)
       DFrag_F32_16x8
           p_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
                 [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
@@ -734,7 +674,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
         } // end loop j
       } // end loop i
 
-      /// Step 4: l = sum(p)
+      /// l = sum(p)
       float l_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
       float l_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
@@ -879,7 +819,93 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
       if (lane_id == 0) {
         arrive(&empty_bar[stage], 1);
       }
-    } // end loop dot0_n/dot1_k
+    };
+
+    /// Load Q
+    auto load_q = [&]() {
+    /// Load shared to fragment for Q/Q_SF operand
+#pragma unroll
+      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+           ++i) {
+#pragma unroll
+        for (int j = 0;
+             j < Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K; ++j) {
+          /// Q
+          int *q_regs = (int *)q_frag[i][j].data;
+          int q_shared_row =
+              warp_dot0_m + i * Policy::TILE_DOT0_ATOMIC_M + (lane_id % 16);
+          int q_shared_col =
+              (j * Policy::TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
+          int q_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_row(
+              q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
+          int q_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_col(
+              q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
+          uint32_t q_addr = __cvta_generic_to_shared(
+              Policy::get_q_stage_mem(smem) +
+              q_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
+              q_shared_col_swiz);
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                       "{%0, %1, %2, %3}, [%4];"
+                       : "=r"(q_regs[0]), "=r"(q_regs[1]), "=r"(q_regs[2]),
+                         "=r"(q_regs[3])
+                       : "r"(q_addr));
+        } // end loop i
+      } // end loop j
+    };
+    /// Mask to -inf if out of bound
+    auto mask_oob =
+        [&](DFrag_F32_16x8(
+                &s_frags)[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                         [Policy::TILE_DOT0_WARP_N /
+                          Policy::TILE_DOT0_ATOMIC_N],
+            int n_kv) {
+          if (n_kv + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
+#pragma unroll
+            for (int dot0_atomic_n = 0;
+                 dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
+                 dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+              int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+#pragma unroll
+              for (int k = 0; k < s_frags[0][j].REGISTERS_PER_THREAD; ++k) {
+                int thread_n = s_frags[0][j].get_col_with_reg(lane_id, k);
+                if (dot0_atomic_n + thread_n + n_kv >= DOT0_N) {
+#pragma unroll
+                  for (int dot0_atomic_m = 0;
+                       dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+                       dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+                    int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
+                    s_frags[i][j].data[k] = -INFINITY;
+                  }
+                }
+              }
+            }
+          }
+        };
+
+    int iter_num = ceil_div(DOT0_N, Policy::TILE_DOT0_BLOCK_N);
+
+    /// First step
+    int stage = 0;
+    int phase = 0;
+    step(0, stage, phase, load_q, [](const auto &, int) {});
+
+    if (++stage == Policy::STAGE) {
+      stage = 0;
+      phase ^= 1;
+    }
+
+    /// Middle loop steps
+    for (int n_kv_iter = 1; n_kv_iter < iter_num - 1; ++n_kv_iter) {
+      step(n_kv_iter, stage, phase, []() {}, [](const auto &, int) {});
+
+      if (++stage == Policy::STAGE) {
+        stage = 0;
+        phase ^= 1;
+      }
+    }
+
+    /// Last step
+    step(iter_num - 1, stage, phase, []() {}, mask_oob);
 
     //===------------------------------------------------------------------===//
     // Epilogue
