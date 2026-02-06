@@ -344,7 +344,7 @@ convert_to_fp8(const DFrag_F32_16x8 (&p_f32_in)[N0][N1],
 }
 
 template <typename Policy>
-__launch_bounds__(Policy::THREAD_NUM, 1) __global__
+__launch_bounds__(Policy::CONSUMER_THREAD_NUM, 1) __global__
     void mha_int8_x_fp8_fwd_kernel(
         BF16 *__restrict__ O, int64_t o_b_stride, int64_t o_h_stride,
         int64_t o_n_stride, int64_t o_d_stride, float *__restrict__ Q_SF,
@@ -397,7 +397,7 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
 
   __shared__ __align__(8) uint64_t empty_bar[Policy::STAGE];
   __shared__ __align__(8) uint64_t full_bar[Policy::STAGE];
-  if (is_producer && lane_id == 0) {
+  if (tid == 0) {
 #pragma unroll
     for (int i = 0; i < Policy::STAGE; ++i) {
       init_barrier(&empty_bar[i], Policy::CONSUMER_WARP_NUM);
@@ -407,559 +407,539 @@ __launch_bounds__(Policy::THREAD_NUM, 1) __global__
   asm volatile("barrier.cluster.arrive;\n" : :);
   asm volatile("barrier.cluster.wait;\n" : :);
 
-  //===--------------------------------------------------------------------===//
-  // Producer
-  //===--------------------------------------------------------------------===//
+  //////////////////////////////////////////////////////////////////////////////
 
-  if (is_producer) {
-    reg_dealloc<24>();
-    if (tid == Policy::CONSUMER_THREAD_NUM) {
-      int stage = 0;
-      int phase = 0;
-
-      /// Leading TMA Q/K/V and Q_SF/K_SF/V_SF
-
-      /// Acquire
-      wait(&empty_bar[stage], phase);
-      load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
-                    &full_bar[stage], block_b, block_h, block_dot_m, 0);
-      load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
-                    &full_bar[stage], block_b, block_h, 0, 0);
-      load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
-                    &full_bar[stage], block_b, block_h, 0, 0);
-      load_4d_async(Policy::get_v_sf_stage_mem(smem, stage), &v_sf_tensor_map,
-                    &full_bar[stage], 0, block_b, block_h, 0);
-      /// Commit
-      expect_bytes(&full_bar[stage], Policy::TILE_Q_BLOCK_SIZE +
-                                         Policy::TILE_K_BLOCK_SIZE +
-                                         Policy::TILE_V_BLOCK_SIZE +
-                                         Policy::TILE_V_SF_BLOCK_SIZE);
-
-      ++stage;
-
-      /// Next
-      for (int dot0_n = Policy::TILE_DOT0_BLOCK_N; dot0_n < DOT0_N;
-           dot0_n += Policy::TILE_DOT0_BLOCK_N, ++stage) {
-        if (stage == Policy::STAGE) {
-          stage = 0;
-          phase ^= 1;
-        }
-
-        /// Acquire
-        wait(&empty_bar[stage], phase);
-
-        /// TMA K/V and K_SF/V_SF
-        load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
-                      &full_bar[stage], block_b, block_h, dot0_n, 0);
-        load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
-                      &full_bar[stage], block_b, block_h, 0, dot0_n);
-
-        /// Commit
-        expect_bytes(&full_bar[stage],
-                     Policy::TILE_K_BLOCK_SIZE + Policy::TILE_V_BLOCK_SIZE);
-      }
-    }
-  } // end if (is_producer)
-
-  //===--------------------------------------------------------------------===//
-  // Consumer
-  //===--------------------------------------------------------------------===//
-
-  else {
-    reg_alloc<240>();
-    if (lane_id == 0) {
+  /// Q
+  AFrag_I8_16x32 q_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                       [Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K];
+  /// Q scale factor
+  float q_sf_frag = Q_SF[block_b * q_sf_b_stride + block_h * q_sf_h_stride +
+                         (block_n + warp_dot0_m) /
+                             Policy::Q_QUANTIZE_BLOCK_SIZE * q_sf_n_stride];
+  /// row-max
+  float max0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+  float max1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+  /// row-sum-exp
+  float l0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+  float l1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < Policy::STAGE; ++i) {
-        arrive(&empty_bar[i], 1);
+  for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+       ++i) {
+    max0[i] = -INFINITY;
+    max1[i] = -INFINITY;
+    l0[i] = 0.0f;
+    l1[i] = 0.0f;
+  }
+
+  /// o
+  DFrag_F32_16x8 o_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+                       [Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N];
+#pragma unroll
+  for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+       ++i) {
+#pragma unroll
+    for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+         ++j) {
+#pragma unroll
+      for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
+        /// Clear o fragment
+        o_frag[i][j].data[k] = 0.0f;
       }
     }
+  }
 
-    /// Scale for softmax
-    sm_scale = sm_scale * LOG2E_F;
+  if (lane_id == 0) {
+#pragma unroll
+    for (int i = 0; i < Policy::STAGE; ++i) {
+      arrive(&empty_bar[i], 1);
+    }
+  }
 
-    //===------------------------------------------------------------------===//
-    // Define fragment
-    //===------------------------------------------------------------------===//
+  int stage = 0;
+  int phase = 0;
+  int stage_fetch = 0;
+  int phase_fetch = 0;
 
-    /// Q
-    AFrag_I8_16x32
-        q_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
-              [Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K];
-    float q_sf_frag = Q_SF[block_b * q_sf_b_stride + block_h * q_sf_h_stride +
-                           (block_n + warp_dot0_m) /
-                               Policy::Q_QUANTIZE_BLOCK_SIZE * q_sf_n_stride];
-    /// max(row max of S=Q @ K)
-    float max0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-    float max1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-    /// l（sum of exp)
-    float l0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-    float l1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+  auto update_mbar = [](auto &stage, auto &phase) {
+    if (++stage == Policy::STAGE) {
+      stage = 0;
+      phase ^= 1;
+    }
+  };
+
+  /// TMA Q
+  if (tid == 0) {
+    auto &stage = stage_fetch;
+    auto &phase = phase_fetch;
+    wait(&empty_bar[stage], phase);
+    load_4d_async(Policy::get_q_stage_mem(smem, stage), &q_tensor_map,
+                  &full_bar[stage], block_b, block_h, block_dot_m, 0);
+    load_4d_async(Policy::get_v_sf_stage_mem(smem, stage), &v_sf_tensor_map,
+                  &full_bar[stage], 0, block_b, block_h, 0);
+    /// Commit
+    expect_bytes(&full_bar[stage],
+                 Policy::TILE_Q_BLOCK_SIZE + Policy::TILE_V_SF_BLOCK_SIZE);
+
+    update_mbar(stage, phase);
+  }
+
+  /// Load Q
+  {
+    wait(&full_bar[stage], phase);
+
 #pragma unroll
     for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
          ++i) {
-      max0[i] = -INFINITY;
-      max1[i] = -INFINITY;
-      l0[i] = 0.0f;
-      l1[i] = 0.0f;
-    }
-    /// o: P @ V
-    DFrag_F32_16x8
-        o_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
-              [Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N];
 #pragma unroll
-    for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
-         ++i) {
-#pragma unroll
-      for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+      for (int j = 0; j < Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K;
            ++j) {
-#pragma unroll
-        for (int k = 0; k < o_frag[i][j].REGISTERS_PER_THREAD; ++k) {
-          /// Clear o fragment
-          o_frag[i][j].data[k] = 0.0f;
-        }
-      }
+        /// Q
+        int *q_regs = (int *)q_frag[i][j].data;
+        int q_shared_row =
+            warp_dot0_m + i * Policy::TILE_DOT0_ATOMIC_M + (lane_id % 16);
+        int q_shared_col =
+            (j * Policy::TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
+        int q_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_row(
+            q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
+        int q_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_col(
+            q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
+        uint32_t q_addr = __cvta_generic_to_shared(
+            Policy::get_q_stage_mem(smem, stage) +
+            q_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K + q_shared_col_swiz);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                     "{%0, %1, %2, %3}, [%4];"
+                     : "=r"(q_regs[0]), "=r"(q_regs[1]), "=r"(q_regs[2]),
+                       "=r"(q_regs[3])
+                     : "r"(q_addr));
+      } // end loop i
+    } // end loop j
+
+    /// Release
+    if (lane_id == 0) {
+      arrive(&empty_bar[stage], 1);
     }
 
-    for (int dot0_n = 0, stage = 0, phase = 0; dot0_n < DOT0_N;
-         dot0_n += Policy::TILE_DOT0_BLOCK_N, ++stage) {
-      if (stage == Policy::STAGE) {
-        stage = 0;
-        phase ^= 1;
-      }
+    update_mbar(stage, phase);
+  }
 
-      block_dot0_n = dot0_n;
+  for (int dot0_n = 0, dot0_n_fetch = 0; dot0_n < DOT0_N;
+       dot0_n += Policy::TILE_DOT0_BLOCK_N) {
+    for (; tid == 0 && dot0_n_fetch < DOT0_N &&
+           dot0_n_fetch < (dot0_n + Policy::STAGE * Policy::TILE_DOT0_BLOCK_N);
+         dot0_n_fetch += Policy::TILE_DOT0_BLOCK_N) {
+      auto &stage = stage_fetch;
+      auto &phase = phase_fetch;
 
-      /// Wait
-      wait(&full_bar[stage], phase);
+      /// Acquire
+      wait(&empty_bar[stage], phase);
 
-      if (dot0_n == 0) {
-        /// Load shared to fragment for Q/Q_SF operand
+      /// TMA K/V
+      load_4d_async(Policy::get_k_stage_mem(smem, stage), &k_tensor_map,
+                    &full_bar[stage], block_b, block_h, dot0_n_fetch, 0);
+      load_4d_async(Policy::get_v_stage_mem(smem, stage), &v_tensor_map,
+                    &full_bar[stage], block_b, block_h, 0, dot0_n_fetch);
 
-#pragma unroll
-        for (int i = 0;
-             i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M; ++i) {
-#pragma unroll
-          for (int j = 0;
-               j < Policy::TILE_DOT0_WARP_K / Policy::TILE_DOT0_ATOMIC_K; ++j) {
-            /// Q
-            int *q_regs = (int *)q_frag[i][j].data;
-            int q_shared_row =
-                warp_dot0_m + i * Policy::TILE_DOT0_ATOMIC_M + (lane_id % 16);
-            int q_shared_col =
-                (j * Policy::TILE_DOT0_ATOMIC_K + (lane_id / 16) * 16);
-            int q_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_row(
-                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
-            int q_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_Q>::get_col(
-                q_shared_row, q_shared_col, sizeof(typename Policy::Q_TYPE));
-            uint32_t q_addr = __cvta_generic_to_shared(
-                Policy::get_q_stage_mem(smem, stage) +
-                q_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
-                q_shared_col_swiz);
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-                         "{%0, %1, %2, %3}, [%4];"
-                         : "=r"(q_regs[0]), "=r"(q_regs[1]), "=r"(q_regs[2]),
-                           "=r"(q_regs[3])
-                         : "r"(q_addr));
-          } // end loop i
-        } // end loop j
-      } // end if (dot0_n == 0) leading
+      /// Commit
+      expect_bytes(&full_bar[stage],
+                   Policy::TILE_K_BLOCK_SIZE + Policy::TILE_V_BLOCK_SIZE);
 
-      /// Load K_SF
-      float k_sf_frag =
-          K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
-               dot0_n / Policy::K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
+      update_mbar(stage, phase);
+    }
 
-      /// S: I32
-      DFrag_I32_16x8
-          s_frag_i32[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
-                    [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
+    // float qk_scale = sm_scale * LOG2E_F * q_sf_frag * k_sf_frag;
 
-      /// Step 0: S = Q @ K
+    block_dot0_n = dot0_n;
+
+    /// Wait
+    wait(&full_bar[stage], phase);
+
+    /// Load K_SF
+    float k_sf_frag =
+        K_SF[block_b * k_sf_b_stride + block_h * k_sf_h_stride +
+             dot0_n / Policy::K_QUANTIZE_BLOCK_SIZE * k_sf_n_stride];
+
+    /// S: I32
+    DFrag_I32_16x8
+        s_frag_i32[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+                  [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
+
+    /// Step 0: S = Q @ K
 
 #pragma unroll
-      for (int dot0_k = 0; dot0_k < Policy::TILE_DOT0_BLOCK_K;
-           dot0_k += Policy::TILE_DOT0_ATOMIC_K) {
-        int dot0_atomic_k_cnt = dot0_k / Policy::TILE_DOT0_ATOMIC_K;
+    for (int dot0_k = 0; dot0_k < Policy::TILE_DOT0_BLOCK_K;
+         dot0_k += Policy::TILE_DOT0_ATOMIC_K) {
+      int dot0_atomic_k_cnt = dot0_k / Policy::TILE_DOT0_ATOMIC_K;
 #pragma unroll
-        for (int dot0_atomic_m = 0; dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
-             dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
-          int dot0_atomic_m_cnt = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
-#pragma unroll
-          for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
-               dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
-            int dot0_atomic_n_cnt = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
-            /// Load K
-            BFrag_I8_32x8 k_frag;
-            {
-              int *k_regs = (int *)k_frag.data;
-              int k_shared_row = warp_dot0_n + dot0_atomic_n + (lane_id % 8);
-              int k_shared_col = dot0_k + ((lane_id % 16) / 8) * 16;
-              int k_shared_row_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_K>::get_row(
-                      k_shared_row, k_shared_col,
-                      sizeof(typename Policy::K_TYPE));
-              int k_shared_col_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_K>::get_col(
-                      k_shared_row, k_shared_col,
-                      sizeof(typename Policy::K_TYPE));
-              uint32_t k_addr = __cvta_generic_to_shared(
-                  Policy::get_k_stage_mem(smem, stage) +
-                  k_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
-                  k_shared_col_swiz);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-                           "{%0, %1}, [%2];"
-                           : "=r"(k_regs[0]), "=r"(k_regs[1])
-                           : "r"(k_addr));
-            }
-
-            /// Dot0: Q @ V
-            if (dot0_k == 0) {
-              /// Init with zeor
-              mma_sync_m16n8k32_row_col_i8i8i32<MMAAccumulateMode::kInit>(
-                  reinterpret_cast<int32_t *>(
-                      s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
-                  k_frag.data);
-            } else {
-              /// Inplace s_frag
-              mma_sync_m16n8k32_row_col_i8i8i32(
-                  reinterpret_cast<int32_t *>(
-                      s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
-                  q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data,
-                  k_frag.data);
-            }
-          } // end loop dot0_atomic_n
-        } // end loop dot0_atomic_m
-      } // end loop dot0_k
-
-      /// Convert s_frag_i32 to float
-      DFrag_F32_16x8
-          s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
-                [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
-
-      float qk_scale = sm_scale * q_sf_frag * k_sf_frag;
-
-#pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
-        int atomic_m = i * Policy::TILE_DOT0_ATOMIC_M;
-#pragma unroll
-        for (int j = 0;
-             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
-          int atomic_n = j * Policy::TILE_DOT0_ATOMIC_N;
-
-          auto *in_i32 = reinterpret_cast<int32_t *>(s_frag_i32[i][j].data);
-          auto *out_f32 = reinterpret_cast<float *>(s_frag[i][j].data);
-
-          out_f32[0] = __int2float_rz(in_i32[0]) * qk_scale;
-          out_f32[1] = __int2float_rz(in_i32[1]) * qk_scale;
-          out_f32[2] = __int2float_rz(in_i32[2]) * qk_scale;
-          out_f32[3] = __int2float_rz(in_i32[3]) * qk_scale;
-        }
-      }
-
-      /// mask to inf
-      if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
+      for (int dot0_atomic_m = 0; dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+           dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+        int dot0_atomic_m_cnt = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
 #pragma unroll
         for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
              dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
-          int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+          int dot0_atomic_n_cnt = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+          /// Load K
+          BFrag_I8_32x8 k_frag;
+          {
+            int *k_regs = (int *)k_frag.data;
+            int k_shared_row = warp_dot0_n + dot0_atomic_n + (lane_id % 8);
+            int k_shared_col = dot0_k + ((lane_id % 16) / 8) * 16;
+            int k_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_K>::get_row(
+                k_shared_row, k_shared_col, sizeof(typename Policy::K_TYPE));
+            int k_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_K>::get_col(
+                k_shared_row, k_shared_col, sizeof(typename Policy::K_TYPE));
+            uint32_t k_addr = __cvta_generic_to_shared(
+                Policy::get_k_stage_mem(smem, stage) +
+                k_shared_row_swiz * Policy::TILE_DOT0_BLOCK_K +
+                k_shared_col_swiz);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                         "{%0, %1}, [%2];"
+                         : "=r"(k_regs[0]), "=r"(k_regs[1])
+                         : "r"(k_addr));
+          }
+
+          /// Dot0: Q @ V
+          if (dot0_k == 0) {
+            /// Init with zeor
+            mma_sync_m16n8k32_row_col_i8i8i32<MMAAccumulateMode::kInit>(
+                reinterpret_cast<int32_t *>(
+                    s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data, k_frag.data);
+          } else {
+            /// Inplace s_frag
+            mma_sync_m16n8k32_row_col_i8i8i32(
+                reinterpret_cast<int32_t *>(
+                    s_frag_i32[dot0_atomic_m_cnt][dot0_atomic_n_cnt].data),
+                q_frag[dot0_atomic_m_cnt][dot0_atomic_k_cnt].data, k_frag.data);
+          }
+        } // end loop dot0_atomic_n
+      } // end loop dot0_atomic_m
+    } // end loop dot0_k
+
+    /// Convert s_frag_i32 to float
+    DFrag_F32_16x8
+        s_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+              [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
+
+    float qk_scale = sm_scale * LOG2E_F * q_sf_frag * k_sf_frag;
+
 #pragma unroll
-          for (int k = 0; k < s_frag[0][j].REGISTERS_PER_THREAD; ++k) {
-            int thread_n = s_frag[0][j].get_col_with_reg(lane_id, k);
-            if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
+      int atomic_m = i * Policy::TILE_DOT0_ATOMIC_M;
 #pragma unroll
-              for (int dot0_atomic_m = 0;
-                   dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
-                   dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
-                int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
-                s_frag[i][j].data[k] = -INFINITY;
-              }
+      for (int j = 0; j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
+           ++j) {
+        int atomic_n = j * Policy::TILE_DOT0_ATOMIC_N;
+
+        auto *in_i32 = reinterpret_cast<int32_t *>(s_frag_i32[i][j].data);
+        auto *out_f32 = reinterpret_cast<float *>(s_frag[i][j].data);
+
+        out_f32[0] = __int2float_rz(in_i32[0]) * qk_scale;
+        out_f32[1] = __int2float_rz(in_i32[1]) * qk_scale;
+        out_f32[2] = __int2float_rz(in_i32[2]) * qk_scale;
+        out_f32[3] = __int2float_rz(in_i32[3]) * qk_scale;
+      }
+    }
+
+    /// mask to inf
+    if (dot0_n + Policy::TILE_DOT0_BLOCK_N > DOT0_N) {
+#pragma unroll
+      for (int dot0_atomic_n = 0; dot0_atomic_n < Policy::TILE_DOT0_WARP_N;
+           dot0_atomic_n += Policy::TILE_DOT0_ATOMIC_N) {
+        int j = dot0_atomic_n / Policy::TILE_DOT0_ATOMIC_N;
+#pragma unroll
+        for (int k = 0; k < s_frag[0][j].REGISTERS_PER_THREAD; ++k) {
+          int thread_n = s_frag[0][j].get_col_with_reg(lane_id, k);
+          if (dot0_atomic_n + thread_n + dot0_n >= DOT0_N) {
+#pragma unroll
+            for (int dot0_atomic_m = 0;
+                 dot0_atomic_m < Policy::TILE_DOT0_WARP_M;
+                 dot0_atomic_m += Policy::TILE_DOT0_ATOMIC_M) {
+              int i = dot0_atomic_m / Policy::TILE_DOT0_ATOMIC_M;
+              s_frag[i][j].data[k] = -INFINITY;
             }
           }
         }
       }
+    }
 
-      /// Step 2: max = rowmax(S)
-      float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-      float max_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    /// Step 2: max = rowmax(S)
+    float max_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    float max_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
-        auto *data = reinterpret_cast<float *>(s_frag[i][0].data);
-        max_new0[i] = fmaxf(data[0], data[1]);
-        max_new1[i] = fmaxf(data[2], data[3]);
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
+      auto *data = reinterpret_cast<float *>(s_frag[i][0].data);
+      max_new0[i] = fmaxf(data[0], data[1]);
+      max_new1[i] = fmaxf(data[2], data[3]);
 #pragma unroll
-        for (int j = 1;
-             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
-          auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
+      for (int j = 1; j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
+           ++j) {
+        auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
 
-          max_new0[i] = fmaxf(max_new0[i], data[0]);
-          max_new0[i] = fmaxf(max_new0[i], data[1]);
-          max_new1[i] = fmaxf(max_new1[i], data[2]);
-          max_new1[i] = fmaxf(max_new1[i], data[3]);
-        } // end loop j
-        max_new0[i] =
-            fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
-        max_new0[i] =
-            fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2), max_new0[i]);
-        max_new1[i] =
-            fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
-        max_new1[i] =
-            fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
+        max_new0[i] = fmaxf(max_new0[i], data[0]);
+        max_new0[i] = fmaxf(max_new0[i], data[1]);
+        max_new1[i] = fmaxf(max_new1[i], data[2]);
+        max_new1[i] = fmaxf(max_new1[i], data[3]);
+      } // end loop j
+      max_new0[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 1), max_new0[i]);
+      max_new0[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new0[i], 2), max_new0[i]);
+      max_new1[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 1), max_new1[i]);
+      max_new1[i] =
+          fmaxf(__shfl_xor_sync(0xffffffff, max_new1[i], 2), max_new1[i]);
 
-        max_new0[i] -= Policy::EXP_OFFSET;
-        max_new1[i] -= Policy::EXP_OFFSET;
+      max_new0[i] -= Policy::EXP_OFFSET;
+      max_new1[i] -= Policy::EXP_OFFSET;
 
-        max_new0[i] = fmaxf(max_new0[i], max0[i]);
-        max_new1[i] = fmaxf(max_new1[i], max1[i]);
-      } // end loop i
+      max_new0[i] = fmaxf(max_new0[i], max0[i]);
+      max_new1[i] = fmaxf(max_new1[i], max1[i]);
+    } // end loop i
 
-      /// Step 3: p = exp(S - max)
-      DFrag_F32_16x8
-          p_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
-                [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
+    /// Step 3: p = exp(S - max)
+    DFrag_F32_16x8
+        p_frag[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M]
+              [Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N];
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
 #pragma unroll
-        for (int j = 0;
-             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
-          auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
+      for (int j = 0; j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
+           ++j) {
+        auto *data = reinterpret_cast<float *>(s_frag[i][j].data);
 
-          p_frag[i][j].data[0] = exp2f(data[0] - max_new0[i]);
-          p_frag[i][j].data[1] = exp2f(data[1] - max_new0[i]);
-          p_frag[i][j].data[2] = exp2f(data[2] - max_new1[i]);
-          p_frag[i][j].data[3] = exp2f(data[3] - max_new1[i]);
-        } // end loop j
-      } // end loop i
+        p_frag[i][j].data[0] = exp2f(data[0] - max_new0[i]);
+        p_frag[i][j].data[1] = exp2f(data[1] - max_new0[i]);
+        p_frag[i][j].data[2] = exp2f(data[2] - max_new1[i]);
+        p_frag[i][j].data[3] = exp2f(data[3] - max_new1[i]);
+      } // end loop j
+    } // end loop i
 
-      /// Step 4: l = sum(p)
-      float l_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-      float l_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    /// Step 4: l = sum(p)
+    float l_new0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    float l_new1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
-        l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
-        l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
+      l_new0[i] = p_frag[i][0].data[0] + p_frag[i][0].data[1];
+      l_new1[i] = p_frag[i][0].data[2] + p_frag[i][0].data[3];
 #pragma unroll
-        for (int j = 1;
-             j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N; ++j) {
-          l_new0[i] += p_frag[i][j].data[0];
-          l_new0[i] += p_frag[i][j].data[1];
-          l_new1[i] += p_frag[i][j].data[2];
-          l_new1[i] += p_frag[i][j].data[3];
-        } // end loop j
-        l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 1);
-        l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
-        l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
-        l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
-      } // end loop i
+      for (int j = 1; j < Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N;
+           ++j) {
+        l_new0[i] += p_frag[i][j].data[0];
+        l_new0[i] += p_frag[i][j].data[1];
+        l_new1[i] += p_frag[i][j].data[2];
+        l_new1[i] += p_frag[i][j].data[3];
+      } // end loop j
+      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 1);
+      l_new0[i] += __shfl_xor_sync(0xffffffff, l_new0[i], 2);
+      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 1);
+      l_new1[i] += __shfl_xor_sync(0xffffffff, l_new1[i], 2);
+    } // end loop i
 
-      /// max scale
-      float max_scale0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
-      float max_scale1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    /// max scale
+    float max_scale0[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
+    float max_scale1[Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M];
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
-        max_scale0[i] = exp2f(max0[i] - max_new0[i]);
-        max_scale1[i] = exp2f(max1[i] - max_new1[i]);
-      }
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
+      max_scale0[i] = exp2f(max0[i] - max_new0[i]);
+      max_scale1[i] = exp2f(max1[i] - max_new1[i]);
+    }
 
-      /// update max and sumexp
+    /// update max and sumexp
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
-           ++i) {
-        max0[i] = max_new0[i];
-        max1[i] = max_new1[i];
-        l0[i] = fmaf(l0[i], max_scale0[i], l_new0[i]);
-        l1[i] = fmaf(l1[i], max_scale1[i], l_new1[i]);
-      }
+    for (int i = 0; i < Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M;
+         ++i) {
+      max0[i] = max_new0[i];
+      max1[i] = max_new1[i];
+      l0[i] = fmaf(l0[i], max_scale0[i], l_new0[i]);
+      l1[i] = fmaf(l1[i], max_scale1[i], l_new1[i]);
+    }
 
-      /// Step 5: o = P @ V
-      AFrag_FP8_16x32
-          p_fp8_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
-                    [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
-      BFrag_FP8_32x8
-          v_frag[Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N]
-                [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
-
-#pragma unroll
-      for (int dot1_atomic_m = 0; dot1_atomic_m < Policy::TILE_DOT1_WARP_M;
-           dot1_atomic_m += Policy::TILE_DOT1_ATOMIC_M) {
-        int dot1_atomic_m_cnt = dot1_atomic_m / Policy::TILE_DOT1_ATOMIC_M;
+    /// Step 5: o = P @ V
+    AFrag_FP8_16x32
+        p_fp8_frag[Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M]
+                  [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
+    BFrag_FP8_32x8
+        v_frag[Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N]
+              [Policy::TILE_DOT1_WARP_K / Policy::TILE_DOT1_ATOMIC_K];
 
 #pragma unroll
-        for (int dot1_atomic_n = 0; dot1_atomic_n < Policy::TILE_DOT1_WARP_N;
-             dot1_atomic_n += Policy::TILE_DOT1_ATOMIC_N) {
-          int dot1_atomic_n_cnt = dot1_atomic_n / Policy::TILE_DOT1_ATOMIC_N;
-
-          DFrag_F16_16x8 o_block_f16;
+    for (int dot1_atomic_m = 0; dot1_atomic_m < Policy::TILE_DOT1_WARP_M;
+         dot1_atomic_m += Policy::TILE_DOT1_ATOMIC_M) {
+      int dot1_atomic_m_cnt = dot1_atomic_m / Policy::TILE_DOT1_ATOMIC_M;
 
 #pragma unroll
-          for (int dot1_atomic_k = 0; dot1_atomic_k < Policy::TILE_DOT1_BLOCK_K;
-               dot1_atomic_k += Policy::TILE_DOT1_ATOMIC_K) {
-            int dot1_atomic_k_cnt = dot1_atomic_k / Policy::TILE_DOT1_ATOMIC_K;
+      for (int dot1_atomic_n = 0; dot1_atomic_n < Policy::TILE_DOT1_WARP_N;
+           dot1_atomic_n += Policy::TILE_DOT1_ATOMIC_N) {
+        int dot1_atomic_n_cnt = dot1_atomic_n / Policy::TILE_DOT1_ATOMIC_N;
 
-            /// quantize P from f32 to fp8e4m3
-            if (dot1_atomic_n == 0) {
-              AFrag_FP8_16x32(&p_fp8_frag_v1)[1][1] =
-                  reinterpret_cast<AFrag_FP8_16x32(&)[1][1]>(
-                      p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt]);
-              constexpr int SIZE0 =
-                  Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M *
-                  Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N / 4;
-              constexpr int SIZE1 = 4;
-              DFrag_F32_16x8(&p_frag_v4)[SIZE0][SIZE1] =
-                  reinterpret_cast<DFrag_F32_16x8(&)[SIZE0][SIZE1]>(p_frag);
-              DFrag_F32_16x8(&p_frag_v4_this)[1][4] =
-                  reinterpret_cast<DFrag_F32_16x8(&)[1][4]>(
-                      p_frag_v4[(dot1_atomic_m / Policy::TILE_DOT0_ATOMIC_M *
-                                     Policy::TILE_DOT0_WARP_N /
-                                     Policy::TILE_DOT0_ATOMIC_N +
-                                 dot1_atomic_k / Policy::TILE_DOT0_ATOMIC_N) /
-                                4]);
-              convert_to_fp8(p_frag_v4_this, p_fp8_frag_v1);
-            }
+        DFrag_F16_16x8 o_block_f16;
 
-            /// load v
-            if (dot1_atomic_m == 0) {
-              int *v_regs =
-                  (int *)v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data;
-              int v_shared_row = warp_dot1_n + dot1_atomic_n + (lane_id % 8);
-              int v_shared_col = dot1_atomic_k + ((lane_id % 16) / 8) * 16;
-              int v_shared_row_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_V>::get_row(
-                      v_shared_row, v_shared_col,
-                      sizeof(typename Policy::V_TYPE));
-              int v_shared_col_swiz =
-                  SwizzleIndexMap<Policy::SWIZZLE_V>::get_col(
-                      v_shared_row, v_shared_col,
-                      sizeof(typename Policy::V_TYPE));
-              uint32_t v_addr = __cvta_generic_to_shared(
-                  Policy::get_v_stage_mem(smem, stage) +
-                  v_shared_row_swiz * Policy::TILE_DOT1_BLOCK_K +
-                  v_shared_col_swiz);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-                           "{%0, %1}, [%2];"
-                           : "=r"(v_regs[0]), "=r"(v_regs[1])
-                           : "r"(v_addr));
-            }
+#pragma unroll
+        for (int dot1_atomic_k = 0; dot1_atomic_k < Policy::TILE_DOT1_BLOCK_K;
+             dot1_atomic_k += Policy::TILE_DOT1_ATOMIC_K) {
+          int dot1_atomic_k_cnt = dot1_atomic_k / Policy::TILE_DOT1_ATOMIC_K;
 
-            /// P @ V
-            if (dot1_atomic_k == 0) {
-              mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
-                  o_block_f16.data,
-                  p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
-                  v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data);
-            } else {
-              mma_sync_m16n8k32_row_col_fp8fp8f16(
-                  o_block_f16.data,
-                  p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
-                  v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data);
-            }
-          } // end loop dot1_atomic_k
+          /// quantize P from f32 to fp8e4m3
+          if (dot1_atomic_n == 0) {
+            AFrag_FP8_16x32(&p_fp8_frag_v1)[1][1] =
+                reinterpret_cast<AFrag_FP8_16x32(&)[1][1]>(
+                    p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt]);
+            constexpr int SIZE0 =
+                Policy::TILE_DOT0_WARP_M / Policy::TILE_DOT0_ATOMIC_M *
+                Policy::TILE_DOT0_WARP_N / Policy::TILE_DOT0_ATOMIC_N / 4;
+            constexpr int SIZE1 = 4;
+            DFrag_F32_16x8(&p_frag_v4)[SIZE0][SIZE1] =
+                reinterpret_cast<DFrag_F32_16x8(&)[SIZE0][SIZE1]>(p_frag);
+            DFrag_F32_16x8(&p_frag_v4_this)[1][4] =
+                reinterpret_cast<DFrag_F32_16x8(&)[1][4]>(
+                    p_frag_v4[(dot1_atomic_m / Policy::TILE_DOT0_ATOMIC_M *
+                                   Policy::TILE_DOT0_WARP_N /
+                                   Policy::TILE_DOT0_ATOMIC_N +
+                               dot1_atomic_k / Policy::TILE_DOT0_ATOMIC_N) /
+                              4]);
+            convert_to_fp8(p_frag_v4_this, p_fp8_frag_v1);
+          }
 
-          /// update o = o + f32(o_block_f16)
+          /// load v
+          if (dot1_atomic_m == 0) {
+            int *v_regs =
+                (int *)v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data;
+            int v_shared_row = warp_dot1_n + dot1_atomic_n + (lane_id % 8);
+            int v_shared_col = dot1_atomic_k + ((lane_id % 16) / 8) * 16;
+            int v_shared_row_swiz = SwizzleIndexMap<Policy::SWIZZLE_V>::get_row(
+                v_shared_row, v_shared_col, sizeof(typename Policy::V_TYPE));
+            int v_shared_col_swiz = SwizzleIndexMap<Policy::SWIZZLE_V>::get_col(
+                v_shared_row, v_shared_col, sizeof(typename Policy::V_TYPE));
+            uint32_t v_addr = __cvta_generic_to_shared(
+                Policy::get_v_stage_mem(smem, stage) +
+                v_shared_row_swiz * Policy::TILE_DOT1_BLOCK_K +
+                v_shared_col_swiz);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                         "{%0, %1}, [%2];"
+                         : "=r"(v_regs[0]), "=r"(v_regs[1])
+                         : "r"(v_addr));
+          }
 
-          __half *in_u16 = reinterpret_cast<__half *>(o_block_f16.data);
-          float *o_f32 = o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data;
-          o_f32[0] = fmaf(o_f32[0], max_scale0[dot1_atomic_m_cnt],
-                          __half2float(in_u16[0]));
-          o_f32[1] = fmaf(o_f32[1], max_scale0[dot1_atomic_m_cnt],
-                          __half2float(in_u16[1]));
-          o_f32[2] = fmaf(o_f32[2], max_scale1[dot1_atomic_m_cnt],
-                          __half2float(in_u16[2]));
-          o_f32[3] = fmaf(o_f32[3], max_scale1[dot1_atomic_m_cnt],
-                          __half2float(in_u16[3]));
-        } // end loop dot1_atomic_n
-      } // end loop dot1_atomic_m
+          /// P @ V
+          if (dot1_atomic_k == 0) {
+            mma_sync_m16n8k32_row_col_fp8fp8f16<MMAAccumulateMode::kInit>(
+                o_block_f16.data,
+                p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
+                v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data);
+          } else {
+            mma_sync_m16n8k32_row_col_fp8fp8f16(
+                o_block_f16.data,
+                p_fp8_frag[dot1_atomic_m_cnt][dot1_atomic_k_cnt].data,
+                v_frag[dot1_atomic_n_cnt][dot1_atomic_k_cnt].data);
+          }
+        } // end loop dot1_atomic_k
 
-      /// Release
-      if (lane_id == 0) {
-        arrive(&empty_bar[stage], 1);
-      }
-    } // end loop dot0_n/dot1_k
+        /// update o = o + f32(o_block_f16)
 
-    //===------------------------------------------------------------------===//
-    // Epilogue
-    //===------------------------------------------------------------------===//
+        __half *in_u16 = reinterpret_cast<__half *>(o_block_f16.data);
+        float *o_f32 = o_frag[dot1_atomic_m_cnt][dot1_atomic_n_cnt].data;
+        o_f32[0] = fmaf(o_f32[0], max_scale0[dot1_atomic_m_cnt],
+                        __half2float(in_u16[0]));
+        o_f32[1] = fmaf(o_f32[1], max_scale0[dot1_atomic_m_cnt],
+                        __half2float(in_u16[1]));
+        o_f32[2] = fmaf(o_f32[2], max_scale1[dot1_atomic_m_cnt],
+                        __half2float(in_u16[2]));
+        o_f32[3] = fmaf(o_f32[3], max_scale1[dot1_atomic_m_cnt],
+                        __half2float(in_u16[3]));
+      } // end loop dot1_atomic_n
+    } // end loop dot1_atomic_m
 
-    /// step 8: o = o / l * v_scale
+    /// Release
+    if (lane_id == 0) {
+      arrive(&empty_bar[stage], 1);
+    }
 
+    update_mbar(stage, phase);
+  }
+
+  //===------------------------------------------------------------------===//
+  // Epilogue
+  //===------------------------------------------------------------------===//
+
+  /// step 8: o = o / l * v_scale
+
+#pragma unroll
+  for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+       ++i) {
+    float scale0 = 1.0f / l0[i];
+    float scale1 = 1.0f / l1[i];
+
+#pragma unroll
+    for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+         ++j) {
+      int thread_n = (lane_id % 4) * 2;
+      int n = warp_dot1_n + j * Policy::TILE_DOT1_ATOMIC_N + thread_n;
+      float v_scale0 = Policy::get_v_sf_stage_mem(smem, 0)[n];
+      float v_scale1 = Policy::get_v_sf_stage_mem(smem, 0)[n + 1];
+      o_frag[i][j].data[0] *= scale0 * v_scale0;
+      o_frag[i][j].data[1] *= scale0 * v_scale1;
+      o_frag[i][j].data[2] *= scale1 * v_scale0;
+      o_frag[i][j].data[3] *= scale1 * v_scale1;
+    }
+  }
+
+  /// Step 9: Write back to O
+
+  if (block_dot_m + warp_dot0_m + Policy::TILE_DOT0_WARP_M <= Nq &&
+      block_dot_n + warp_dot0_n + Policy::TILE_DOT1_WARP_N <= Dv) {
 #pragma unroll
     for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
          ++i) {
-      float scale0 = 1.0f / l0[i];
-      float scale1 = 1.0f / l1[i];
-
 #pragma unroll
       for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
            ++j) {
-        int thread_n = (lane_id % 4) * 2;
-        int n = warp_dot1_n + j * Policy::TILE_DOT1_ATOMIC_N + thread_n;
-        float v_scale0 = Policy::get_v_sf_stage_mem(smem, 0)[n];
-        float v_scale1 = Policy::get_v_sf_stage_mem(smem, 0)[n + 1];
-        o_frag[i][j].data[0] *= scale0 * v_scale0;
-        o_frag[i][j].data[1] *= scale0 * v_scale1;
-        o_frag[i][j].data[2] *= scale1 * v_scale0;
-        o_frag[i][j].data[3] *= scale1 * v_scale1;
+#pragma unroll
+        for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+          int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
+                         o_frag[i][j].get_row_with_reg(lane_id, idx);
+          // map m to O's N(seq)
+          int m = block_dot_m + warp_dot1_m + thread_m;
+          int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
+                         o_frag[i][j].get_col_with_reg(lane_id, idx);
+          // map n to O's D(emb)
+          int n = block_dot_n + warp_dot1_n + thread_n;
+          auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
+                         block_h * o_h_stride + n * o_d_stride;
+          *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
+        }
       }
     }
-
-    /// Step 9: Write back to O
-
-    if (block_dot_m + warp_dot0_m + Policy::TILE_DOT0_WARP_M <= Nq &&
-        block_dot_n + warp_dot0_n + Policy::TILE_DOT1_WARP_N <= Dv) {
+  } else {
 #pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
-           ++i) {
+    for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
+         ++i) {
 #pragma unroll
-        for (int j = 0;
-             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N; ++j) {
+      for (int j = 0; j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N;
+           ++j) {
 #pragma unroll
-          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-            int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
-                           o_frag[i][j].get_row_with_reg(lane_id, idx);
-            // map m to O's N(seq)
-            int m = block_dot_m + warp_dot1_m + thread_m;
-            int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
-                           o_frag[i][j].get_col_with_reg(lane_id, idx);
-            // map n to O's D(emb)
-            int n = block_dot_n + warp_dot1_n + thread_n;
+        for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
+          int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
+                         o_frag[i][j].get_row_with_reg(lane_id, idx);
+          // map m to O's N(seq)
+          int m = block_dot_m + warp_dot1_m + thread_m;
+          int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
+                         o_frag[i][j].get_col_with_reg(lane_id, idx);
+          // map n to O's D(emb)
+          int n = block_dot_n + warp_dot1_n + thread_n;
+          if (m < Nq && n < Dv) {
             auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
                            block_h * o_h_stride + n * o_d_stride;
             *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
           }
         }
       }
-    } else {
-#pragma unroll
-      for (int i = 0; i < Policy::TILE_DOT1_WARP_M / Policy::TILE_DOT1_ATOMIC_M;
-           ++i) {
-#pragma unroll
-        for (int j = 0;
-             j < Policy::TILE_DOT1_WARP_N / Policy::TILE_DOT1_ATOMIC_N; ++j) {
-#pragma unroll
-          for (int idx = 0; idx < o_frag[i][j].REGISTERS_PER_THREAD; ++idx) {
-            int thread_m = i * Policy::TILE_DOT1_ATOMIC_M +
-                           o_frag[i][j].get_row_with_reg(lane_id, idx);
-            // map m to O's N(seq)
-            int m = block_dot_m + warp_dot1_m + thread_m;
-            int thread_n = j * Policy::TILE_DOT1_ATOMIC_N +
-                           o_frag[i][j].get_col_with_reg(lane_id, idx);
-            // map n to O's D(emb)
-            int n = block_dot_n + warp_dot1_n + thread_n;
-            if (m < Nq && n < Dv) {
-              auto *o_tile = O + block_b * o_b_stride + m * o_n_stride +
-                             block_h * o_h_stride + n * o_d_stride;
-              *o_tile = __float2bfloat16_rn(o_frag[i][j].data[idx]);
-            }
-          }
-        }
-      }
     }
-  } // end if(is_consumer)
+  }
 } // end mha_int8_x_fp8_fwd_kernel
 
 //===--------------------------------------------------------------------===//
@@ -1111,7 +1091,7 @@ void mha_int8_x_fp8_fwd(torch::Tensor &o, torch::Tensor &q, torch::Tensor &q_sf,
           dim3 grid(
               ceil_div(Nq, static_cast<int64_t>(policy::TILE_DOT_BLOCK_M)), H,
               B);
-          dim3 block(policy::THREAD_NUM);
+          dim3 block(policy::CONSUMER_THREAD_NUM);
           kernel<<<grid, block, policy::SMEM_SIZE, stream>>>(
               reinterpret_cast<BF16 *>(o.data_ptr()),
               /* o b stride */ o.stride(0),
